@@ -1,4 +1,5 @@
-fastapi
-uvicorn
-pybit
+fastapi==0.121.1
+uvicorn==0.22.0
+pybit==5.13.0
+requests==2.31.0
 python-telegram-bot==20.3
