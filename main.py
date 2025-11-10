@@ -28,7 +28,7 @@ bot = Bot(token=TELEGRAM_TOKEN)
 # --- Bybit клиент ---
 BYBIT_ENDPOINT = "https://api-testnet.bybit.com" if BYBIT_TESTNET else "https://api.bybit.com"
 client = HTTP(
-    BYBIT_ENDPOINT,
+    endpoint=BYBIT_ENDPOINT,
     api_key=BYBIT_API_KEY,
     api_secret=BYBIT_API_SECRET
 )
@@ -67,21 +67,32 @@ async def open_position(signal, amount=None, symbol=SYMBOL):
     global last_trade_info
     size = float(amount) if amount else TRADE_USD
     try:
+        # Устанавливаем левередж один раз
+        client.set_leverage(symbol=symbol, leverage=LEVERAGE)
+
         # Получаем текущие позиции
         positions = client.get_positions(symbol=symbol)["result"]["list"]
 
-        # Закрываем существующие позиции
+        # Закрываем все существующие позиции
         for pos in positions:
-            if float(pos["size"]) > 0:
-                client.set_leverage(symbol=symbol, leverage=LEVERAGE)
-                client.close_position(symbol=symbol, side="Buy" if pos["side"]=="Sell" else "Sell")
+            pos_size = float(pos["size"])
+            if pos_size != 0:
+                side_to_close = "Sell" if pos["side"].lower() == "Buy".lower() else "Buy"
+                client.place_active_order(
+                    symbol=symbol,
+                    side=side_to_close,
+                    order_type="Market",
+                    qty=abs(pos_size),
+                    time_in_force="GoodTillCancel",
+                    reduce_only=True
+                )
+                logger.info(f"Closed existing position: {side_to_close} {abs(pos_size)} {symbol}")
 
         # Открываем новую позицию
-        side = "Buy" if signal == "buy" else "Sell"
-        client.set_leverage(symbol=symbol, leverage=LEVERAGE)
+        order_side = "Buy" if signal == "buy" else "Sell"
         client.place_active_order(
             symbol=symbol,
-            side=side,
+            side=order_side,
             order_type="Market",
             qty=size,
             time_in_force="GoodTillCancel"
