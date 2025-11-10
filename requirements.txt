@@ -1,7 +1,6 @@
-fastapi==0.102.0
-uvicorn[standard]==0.23.2
-pybit==5.13.0
-python-dotenv>=1.0.0
-requests>=2.31.0
-
+fastapi
+uvicorn
+pybit
+python-telegram-bot==20.3
+httpx
 
