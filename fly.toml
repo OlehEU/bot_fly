@@ -4,7 +4,7 @@
 #
 
 app = 'bot-fly-b7iqvq'
-primary_region = 'iad'
+primary_region = 'fra'
 
 [build]
 
