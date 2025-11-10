@@ -1,20 +1,25 @@
-# Используем официальный образ Python
+# --- 1. Используем официальный Python 3.12 slim ---
 FROM python:3.12-slim
 
-# Устанавливаем рабочую директорию
+# --- 2. Устанавливаем зависимости для сборки и системы ---
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- 3. Создаем рабочую директорию ---
 WORKDIR /app
 
-# Копируем файл зависимостей
+# --- 4. Копируем файлы проекта ---
 COPY requirements.txt .
+COPY main.py .
 
-# Обновляем pip и устанавливаем зависимости
-RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
+# --- 5. Устанавливаем Python зависимости ---
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем весь код приложения
-COPY . .
+# --- 6. Экспонируем порт FastAPI (Fly автоматически пробрасывает 8080) ---
+EXPOSE 8080
 
-# Fly.io назначает порт через переменную окружения PORT
-ENV PORT=8080
-
-# Команда запуска приложения
+# --- 7. Команда запуска ---
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+
