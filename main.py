@@ -54,9 +54,10 @@ def calculate_qty(usd_amount: float, symbol: str = SYMBOL) -> float:
 
 def check_balance(required_usd: float = 0) -> float:
     try:
+        # ВАЖНО: Для UTA используем "UNIFIED"
         balance = client.get_wallet_balance(accountType="UNIFIED", coin="USDT")
         available = float(balance["result"]["list"][0]["coin"][0]["walletBalance"])
-        logger.info(f"Баланс USDT: {available}")
+        logger.info(f"Баланс USDT (UTA): {available}")
         return available
     except Exception as e:
         logger.error(f"Ошибка проверки баланса: {e}")
@@ -257,3 +258,4 @@ async def webhook(request: Request):
 
     asyncio.create_task(open_position(signal, amount, symbol))
     return {"status": "ok", "message": f"{signal} сигнал принят"}
+
