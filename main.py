@@ -2,7 +2,8 @@ import os
 import json
 import asyncio
 import logging
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Response
+from fastapi.responses import HTMLResponse  # ← ВОТ ЭТОГО НЕ БЫЛО!
 from telegram import Bot
 from pybit.unified_trading import HTTP
 
@@ -14,10 +15,10 @@ BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 TRADE_USD = float(os.getenv("TRADE_USD", 25))
 SYMBOL = os.getenv("SYMBOL", "SOLUSDT")
 MIN_PROFIT_USDT = float(os.getenv("MIN_PROFIT_USDT", 0.1))
-BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "False").lower() == "true"  # ПО УМОЛЧАНИЮ: False
-TRADE_TYPE = os.getenv("TRADE_TYPE", "linear")  # linear = фьючерсы
+BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "False").lower() == "true"
+TRADE_TYPE = os.getenv("TRADE_TYPE", "linear")  # ФЬЮЧЕРСЫ
 LEVERAGE = int(os.getenv("LEVERAGE", 10))
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # ОБЯЗАТЕЛЬНО!
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 # === Логирование ===
 logging.basicConfig(level=logging.INFO)
@@ -26,11 +27,11 @@ logger = logging.getLogger("bybit-bot")
 # === Telegram ===
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# === Bybit client — MAINNET + ФЬЮЧЕРСЫ ===
+# === Bybit client ===
 client = HTTP(
     api_key=BYBIT_API_KEY,
     api_secret=BYBIT_API_SECRET,
-    testnet=BYBIT_TESTNET  # False = mainnet
+    testnet=BYBIT_TESTNET
 )
 
 # === FastAPI ===
@@ -53,7 +54,7 @@ def check_balance(required_usd: float = 0) -> float:
     try:
         balance = client.get_wallet_balance(accountType="UNIFIED", coin="USDT")
         available = float(balance["result"]["list"][0]["coin"][0]["walletBalance"])
-        logger.info(f"Баланс USDT (UTA): {available}")
+        logger.info(f"Баланс USDT: {available}")
         return available
     except Exception as e:
         logger.error(f"Ошибка проверки баланса: {e}")
@@ -64,14 +65,7 @@ def check_balance(required_usd: float = 0) -> float:
 async def startup_notify():
     try:
         env = "Тестнет" if BYBIT_TESTNET else "Продакшн"
-        msg = (
-            f"Bybit Бот запущен! [{env}]\n\n"
-            f"Режим: ФЬЮЧЕРСЫ (linear)\n"
-            f"Символ: {SYMBOL}\n"
-            f"Лот: {TRADE_USD} USDT\n"
-            f"Плечо: {LEVERAGE}x\n"
-            f"Время: 23:31 CET, 11 ноября 2025"
-        )
+        msg = f"Bybit Бот запущен! [{env}]\n\nРежим: ФЬЮЧЕРСЫ\n{SYMBOL} | {TRADE_USD} USDT | {LEVERAGE}x"
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         logger.info("Стартовое уведомление отправлено.")
     except Exception as e:
@@ -115,11 +109,9 @@ async def home():
         <p>
           <b>Webhook:</b> <code>POST /webhook</code><br>
           <b>Header:</b> <code>Authorization: Bearer {WEBHOOK_SECRET}</code><br>
-          <b>Пример:</b> <code>{{"signal":"buy", "amount":10}}</code><br>
+          <b>Пример:</b> <code>{{"signal":"buy"}}</code><br>
           <a href="/balance">Проверить баланс</a>
         </p>
-        <hr>
-        <small>Время: 23:31 CET, 11 ноября 2025 | DE</small>
       </body>
     </html>
     """
@@ -146,22 +138,18 @@ async def open_position(signal: str, amount_usd=None, symbol: str = SYMBOL):
         if qty <= 0:
             raise ValueError("Неверный размер позиции")
 
-        # Плечо
         client.set_leverage(category=TRADE_TYPE, symbol=symbol, buyLeverage=str(LEVERAGE), sellLeverage=str(LEVERAGE))
 
-        # Закрываем старую
         positions = client.get_positions(category=TRADE_TYPE, symbol=symbol)
         for pos in positions.get("result", {}).get("list", []):
             if float(pos["size"]) > 0:
                 opp_side = "Sell" if pos["side"] == "Buy" else "Buy"
                 client.place_order(category=TRADE_TYPE, symbol=symbol, side=opp_side, orderType="Market", qty=pos["size"], timeInForce="IOC")
 
-        # Открываем новую
         order = client.place_order(category=TRADE_TYPE, symbol=symbol, side=side, orderType="Market", qty=str(qty), timeInForce="IOC")
         order_id = order.get("result", {}).get("orderId")
         entry_price = float(order.get("result", {}).get("avgPrice") or 0)
 
-        # TP/SL
         tp_price = round(entry_price * (1.015 if side == "Buy" else 0.985), 2)
         sl_price = round(entry_price * (0.99 if side == "Buy" else 1.01), 2)
         client.place_order(category=TRADE_TYPE, symbol=symbol, side="Sell" if side == "Buy" else "Buy", orderType="Limit", qty=str(qty), price=str(tp_price), timeInForce="GTC", reduceOnly=True)
@@ -173,12 +161,7 @@ async def open_position(signal: str, amount_usd=None, symbol: str = SYMBOL):
             "symbol": symbol, "order_id": order_id, "entry_price": entry_price,
             "tp": tp_price, "sl": sl_price
         }
-        msg = (
-            f"{side} {qty:.3f} {symbol}\n"
-            f"Цена: ${entry_price:.2f}\n"
-            f"TP: ${tp_price:.2f} | SL: ${sl_price:.2f}\n"
-            f"Баланс: {available:.2f} USDT"
-        )
+        msg = f"{side} {qty:.3f} {symbol}\nЦена: ${entry_price:.2f}\nTP: ${tp_price:.2f} | SL: ${sl_price:.2f}\nБаланс: {available:.2f} USDT"
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         logger.info(msg)
     except Exception as e:
