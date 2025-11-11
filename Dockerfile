@@ -1,25 +1,18 @@
-# --- 1. Используем официальный Python 3.12 slim ---
+# --- Базовый образ ---
 FROM python:3.12-slim
 
-# --- 2. Устанавливаем зависимости для сборки и системы ---
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# --- 3. Создаем рабочую директорию ---
+# --- Рабочая директория ---
 WORKDIR /app
 
-# --- 4. Копируем файлы проекта ---
+# --- Установка зависимостей ---
 COPY requirements.txt .
-COPY main.py .
-
-# --- 5. Устанавливаем Python зависимости ---
 RUN pip install --no-cache-dir -r requirements.txt
 
-# --- 6. Экспонируем порт FastAPI (Fly автоматически пробрасывает 8080) ---
+# --- Копируем код бота ---
+COPY . .
+
+# --- Открываем порт ---
 EXPOSE 8080
 
-# --- 7. Команда запуска ---
+# --- Команда запуска ---
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
-
