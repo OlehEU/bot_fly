@@ -1,9 +1,8 @@
-app = "bot-fly-oz"  # ← замени на имя своего приложения на Fly.io
-primary_region = "fra"  # Германия — низкая задержка
+app = "bot-fly-b7iqvq"
+primary_region = "fra"
 
 [build]
-  builder = "paketobuildpacks/builder:base"
-  buildpacks = ["gcr.io/paketo-buildpacks/python"]
+  dockerfile = "Dockerfile"  # ← ВАЖНО: указываем Dockerfile
 
 [[services]]
   http_checks = []
@@ -22,9 +21,3 @@ primary_region = "fra"  # Германия — низкая задержка
   [[services.ports]]
     handlers = ["tls", "http"]
     port = 443
-
-  [[services.tcp_checks]]
-    grace_period = "5s"
-    interval = "15s"
-    restart_limit = 0
-    timeout = "2s"
