@@ -36,7 +36,7 @@ client = HTTP(
 # === FastAPI ===
 app = FastAPI()
 last_trade_info = None
-active_position = False  # Защита от дублей
+active_position = False
 
 
 # === Вспомогательные функции ===
@@ -46,21 +46,26 @@ def calculate_qty(usd_amount: float, symbol: str = SYMBOL) -> float:
         ticker = client.get_tickers(category=TRADE_TYPE, symbol=symbol)
         price = float(ticker["result"]["list"][0]["lastPrice"])
         qty = usd_amount / price
+        # Мин. 1 USD эквивалент (Bybit правило)
+        min_usd = 1.0
+        if usd_amount < min_usd:
+            raise ValueError(f"Сумма {usd_amount} USD < минимума {min_usd} USD")
         return round(qty, 3)
     except Exception as e:
         logger.error(f"Ошибка расчёта qty: {e}")
         return 0.0
 
 
-def check_balance(required_usd: float) -> bool:
-    """Проверка баланса USDT"""
+def check_balance(required_usd: float) -> float:
+    """Проверка баланса USDT — возвращает доступный баланс"""
     try:
         balance = client.get_wallet_balance(accountType="UNIFIED", coin="USDT")
         available = float(balance["result"]["list"][0]["coin"][0]["walletBalance"])
-        return available >= required_usd * 1.1  # +10% на комиссии
+        logger.info(f"Баланс USDT: {available}")
+        return available
     except Exception as e:
         logger.error(f"Ошибка проверки баланса: {e}")
-        return False
+        return 0.0
 
 
 # === Уведомление при старте ===
@@ -68,12 +73,12 @@ def check_balance(required_usd: float) -> bool:
 async def startup_notify():
     try:
         env = "Тестнет" if BYBIT_TESTNET else "Продакшн"
-        msg = f"Бот запущен!\n\n" \
-              f"Режим: {env}\n" \
-              f"Торговля: {TRADE_TYPE}\n" \
-              f"Символ: {SYMBOL}\n" \
-              f"Лот: {TRADE_USD} USDT\n" \
-              f"Плечо: {LEVERAGE}x"
+        msg = f"🤖 Бот запущен!\n\n" \
+              f"⚙️ Режим: {env}\n" \
+              f"📈 Торговля: {TRADE_TYPE}\n" \
+              f"💰 Символ: {SYMBOL}\n" \
+              f"📊 Лот: {TRADE_USD} USDT\n" \
+              f"⚡ Плечо: {LEVERAGE}x"
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         logger.info("Стартовое уведомление отправлено.")
     except Exception as e:
@@ -105,10 +110,18 @@ async def home():
         <pre style="background:#2d2d2d; padding:10px; border-radius:8px;">{last_trade_text}</pre>
         <p><b>Webhook:</b> <code>POST /webhook</code><br>
         <b>Header:</b> <code>Authorization: Bearer {WEBHOOK_SECRET}</code><br>
-        <b>Пример:</b> <code>{"signal":"buy"}</code></p>
+        <b>Пример:</b> <code>{{"signal":"buy"}}</code><br>
+        <a href="/balance">Проверить баланс</a></p>
       </body>
     </html>
     """
+
+
+# === Новый endpoint: Проверка баланса ===
+@app.get("/balance")
+async def get_balance():
+    balance = check_balance(0)
+    return {"usdt_balance": balance, "min_required": TRADE_USD}
 
 
 # === Открытие позиции ===
@@ -122,8 +135,10 @@ async def open_position(signal: str, amount_usd=None, symbol: str = SYMBOL):
         side = "Buy" if signal.lower() == "buy" else "Sell"
         usd = float(amount_usd) if amount_usd else TRADE_USD
 
-        if not check_balance(usd):
-            raise ValueError("Недостаточно USDT на балансе")
+        # Проверяем баланс
+        available = check_balance(usd)
+        if available < usd * 1.1:  # +10% на комиссии
+            raise ValueError(f"Недостаточно USDT: {available:.2f} < {usd * 1.1:.2f}")
 
         qty = calculate_qty(usd, symbol)
         if qty <= 0:
@@ -203,17 +218,18 @@ async def open_position(signal: str, amount_usd=None, symbol: str = SYMBOL):
             "sl": sl_price
         }
 
-        msg = f"Ордер {side} {qty} {symbol}\n" \
-              f"Цена входа: {entry_price}\n" \
-              f"TP: {tp_price} | SL: {sl_price}"
+        msg = f"✅ Ордер {side} {qty:.3f} {symbol}\n" \
+              f"Цена входа: ${entry_price:.2f}\n" \
+              f"TP: ${tp_price:.2f} | SL: ${sl_price:.2f}\n" \
+              f"Баланс: {available:.2f} USDT"
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         logger.info(msg)
 
     except Exception as e:
-        err_msg = f"Ошибка {signal}: {e}"
+        err_msg = f"❌ Ошибка {signal}: {e}\nБаланс: {check_balance(0):.2f} USDT"
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=err_msg)
         logger.error(err_msg)
-        active_position = False
+        active_position = False  # Сброс флага
 
 
 # === Webhook ===
@@ -228,7 +244,7 @@ async def webhook(request: Request):
     try:
         data = await request.json()
     except:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        return {"status": "error", "message": "Invalid JSON"}
 
     signal = data.get("signal")
     amount = data.get("amount")
@@ -237,5 +253,6 @@ async def webhook(request: Request):
     if signal not in ["buy", "sell"]:
         return {"status": "error", "message": "signal: 'buy' или 'sell'"}
 
+    # Запуск в фоне
     asyncio.create_task(open_position(signal, amount, symbol))
-    return {"status": "ok", "message": f"{signal} сигнал принят"}
+    return {"status": "ok", "message": f"{signal} сигнал принят"}  # Всегда возвращаем!
