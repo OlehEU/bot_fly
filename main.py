@@ -87,13 +87,23 @@ async def check_balance() -> float:
             pass
         return 0.0
 
-# === Количество монет ===
+# === РАСЧЁТ КОЛИЧЕСТВА МОНЕТ (qty) ===
 def calculate_qty(usd_amount: float) -> float:
     try:
         ticker = exchange.fetch_ticker(SYMBOL)
         price = ticker['last']
-        qty = usd_amount / price
-        return round(qty, 3)
+        logger.info(f"Цена {SYMBOL}: {price:.2f} USDT")
+
+        raw_qty = usd_amount / price
+        qty = round(raw_qty, 2)  # Шаг 0.01 для SOL
+
+        min_qty = 0.01
+        if qty < min_qty:
+            raise ValueError(f"qty {qty} < min {min_qty}")
+
+        logger.info(f"qty: {raw_qty:.6f} → {qty}")
+        return qty
+
     except Exception as e:
         logger.error(f"Ошибка qty: {e}")
         return 0.0
@@ -231,4 +241,5 @@ async def webhook(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
