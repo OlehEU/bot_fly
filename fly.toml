@@ -1,18 +1,19 @@
+# fly.toml
 app = "bot-fly-b7iqvq"
 primary_region = "fra"
 
 [build]
-  dockerfile = "Dockerfile"  # ← ВАЖНО: указываем Dockerfile
+  # Fly сам соберёт образ из Dockerfile
+  # Ничего не указываем — используем Dockerfile
 
 [[services]]
-  http_checks = []
   internal_port = 8000
   protocol = "tcp"
 
   [services.concurrency]
+    type = "connections"
     hard_limit = 25
     soft_limit = 20
-    type = "connections"
 
   [[services.ports]]
     handlers = ["http"]
@@ -21,3 +22,20 @@ primary_region = "fra"
   [[services.ports]]
     handlers = ["tls", "http"]
     port = 443
+
+  [[services.tcp_checks]]
+    grace_period = "1s"
+    interval = "15s"
+    restart_limit = 0
+    timeout = "2s"
+
+  [[services.http_checks]]
+    interval = "10s"
+    grace_period = "5s"
+    method = "get"
+    path = "/"
+    protocol = "http"
+    timeout = "2s"
+    tls_skip_verify = false
+
+    [services.http_checks.headers]
