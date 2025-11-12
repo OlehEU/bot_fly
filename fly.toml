@@ -12,6 +12,7 @@ primary_region = "fra"
 [[services]]
   internal_port = 8000
   protocol = "tcp"
+  process = "app"  # ← КРИТИЧНО! Привязка процесса к сервису
 
   [services.concurrency]
     type = "connections"
