@@ -57,7 +57,7 @@ def retry_on_403(max_retries: int = 4, delay: int = 3):
                     return await func(*args, **kwargs)
                 except Exception as e:
                     if "403" in str(e) and attempt < max_retries - 1:
-                        logger.warning(f"403 — повтор через {delay}s")
+                        logger.warning(f"403 — повтор через {delay}s (попытка {attempt+2})")
                         await asyncio.sleep(delay)
                         continue
                     logger.error(f"API ошибка: {e}")
@@ -76,10 +76,13 @@ async def check_balance() -> float:
         return float(usdt)
     except Exception as e:
         logger.error(f"Ошибка баланса: {e}")
-        await bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=f"БАЛАНС = 0 USDT\nОшибка: {e}\n\nПроверь:\n1. API ключ\n2. IP в MEXC\n3. USDT на счёте"
-        )
+        try:
+            await bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=f"БАЛАНС = 0 USDT\nОшибка: {e}\n\nПроверь:\n1. API ключ\n2. IP в MEXC\n3. USDT на счёте"
+            )
+        except:
+            pass
         return 0.0
 
 # === Количество монет ===
@@ -155,13 +158,14 @@ async def get_balance():
 async def open_position(signal: str, amount_usd=None):
     global last_trade_info, active_position
     if active_position:
+        logger.info("Позиция уже открыта — пропускаем.")
         return
     try:
         side = "buy" if signal == "buy" else "sell"
         usd = amount_usd or TRADE_USD
         bal = await check_balance()
         if bal < usd * 1.1:
-            raise ValueError("Недостаточно USDT")
+            raise ValueError(f"Недостаточно USDT: {bal:.2f} < {usd * 1.1:.2f}")
 
         qty = calculate_qty(usd)
         if qty <= 0:
@@ -188,27 +192,32 @@ async def open_position(signal: str, amount_usd=None):
 
         active_position = True
         last_trade_info = {"signal": signal, "qty": qty, "entry": entry, "tp": tp, "sl": sl}
-        msg = f"{side.upper()} {qty} {SYMBOL}\nEntry: ${entry}\nTP: ${tp} | SL: ${sl}"
+        msg = f"{side.upper()} {qty} {SYMBOL}\nEntry: ${entry}\nTP: ${tp} | SL: ${sl}\nБаланс: {bal:.2f} USDT"
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+        logger.info(msg)
     except Exception as e:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"Ошибка: {e}")
+        err_msg = f"Ошибка {signal}: {e}\nБаланс: {await check_balance():.2f} USDT"
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=err_msg)
+        logger.error(err_msg)
         active_position = False
 
 # === Webhook ===
 @app.post("/webhook")
 async def webhook(request: Request):
     if WEBHOOK_SECRET and request.headers.get("Authorization") != f"Bearer {WEBHOOK_SECRET}":
-        raise HTTPException(401)
+        raise HTTPException(401, detail="Unauthorized")
     try:
         data = await request.json()
     except:
-        return {"status": "error"}
+        return {"status": "error", "message": "Invalid JSON"}
     signal = data.get("signal")
+    amount = data.get("amount")
     if signal not in ["buy", "sell"]:
-        return {"status": "error"}
-    asyncio.create_task(open_position(signal, data.get("amount")))
-    return {"status": "ok"}
+        return {"status": "error", "message": "signal: buy или sell"}
+    asyncio.create_task(open_position(signal, amount))
+    return {"status": "ok", "message": f"{signal} принят"}
 
+# === ЗАПУСК ===
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
