@@ -69,9 +69,11 @@ def retry_on_403(max_retries: int = 4, delay: int = 3):
 # === Баланс ===
 @retry_on_403()
 async def check_balance() -> float:
+    logger.info("Проверка баланса USDT...")
     try:
-        balance = await exchange.fetch_balance()
-        usdt = balance['total'].get('USDT', 0)
+        balance_data = await exchange.fetch_balance()
+        logger.info(f"Ответ API: {balance_data}")  # ← КЛЮЧЕВАЯ СТРОКА
+        usdt = balance_data['total'].get('USDT', 0)
         logger.info(f"Баланс USDT: {usdt:.4f}")
         return float(usdt)
     except Exception as e:
@@ -100,16 +102,24 @@ def calculate_qty(usd_amount: float) -> float:
 @app.on_event("startup")
 async def startup_notify():
     try:
+        logger.info("=== ЗАПУСК БОТА ===")
         balance = await check_balance()
+        logger.info(f"СТАРТОВЫЙ БАЛАНС: {balance:.4f} USDT")
+
         msg = f"MEXC Бот запущен!\n\n" \
               f"Символ: {SYMBOL}\n" \
               f"Лот: {TRADE_USD} USDT\n" \
               f"Плечо: {LEVERAGE}x\n" \
               f"Баланс: {balance:.2f} USDT"
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-        logger.info("Стартовое уведомление отправлено.")
+        logger.info("Стартовое уведомление отправлено в Telegram.")
     except Exception as e:
-        logger.error(f"Ошибка старта: {e}")
+        error_msg = f"ОШИБКА ПРИ СТАРТЕ: {e}"
+        logger.error(error_msg)
+        try:
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=error_msg)
+        except:
+            pass
 
 # === Главная ===
 @app.get("/", response_class=HTMLResponse)
@@ -221,3 +231,4 @@ async def webhook(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
