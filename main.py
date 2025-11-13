@@ -203,7 +203,13 @@ async def open_position(signal: str, amount_usd=None):
         side = "buy" if signal == "buy" else "sell"
         logger.info(f"Открываем {side.upper()} {qty} {SYMBOL}")
 
-        await exchange.set_leverage(LEVERAGE, SYMBOL)
+        # УСТАНАВЛИВАЕМ ПЛЕЧО С ПАРАМЕТРАМИ MEXC
+        position_type = 1 if side == "buy" else 2
+        await exchange.set_leverage(
+            leverage=LEVERAGE,
+            symbol=SYMBOL,
+            params={'openType': 1, 'positionType': position_type}
+        )
 
         positions = await exchange.fetch_positions([SYMBOL])
         for pos in positions:
@@ -212,7 +218,7 @@ async def open_position(signal: str, amount_usd=None):
                 logger.info(f"Закрываем {close_side} {pos['contracts']} {SYMBOL}")
                 await exchange.create_market_order(SYMBOL, close_side, pos['contracts'])
 
-        order = await exchange.create_market_order(SYMBOL, side, qty)
+        order = await exchange.create_market_order(SYMBOL, side, qty, params={'openType': 1, 'positionType': position_type})
         entry = order['average'] or order['price']
         tp = round(entry * (1.015 if side == "buy" else 0.985), 6)
         sl = round(entry * (0.99 if side == "buy" else 1.01), 6)
@@ -257,3 +263,4 @@ async def webhook(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
