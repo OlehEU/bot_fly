@@ -28,7 +28,7 @@ MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", 25))
-SYMBOL = os.getenv("SYMBOL", "XRP/USDT:USDT")  # ← ФЬЮЧЕРСЫ!
+SYMBOL = os.getenv("SYMBOL", "XRP/USDT:USDT")  # ФЬЮЧЕРСЫ!
 LEVERAGE = int(os.getenv("LEVERAGE", 10))
 MIN_USD = float(os.getenv("MIN_USD", 5.0))
 
@@ -55,7 +55,7 @@ async def tg_send(text: str):
     except Exception as e:
         logger.error(f"Telegram thread error: {e}")
 
-# === MEXC V3 (Futures) ===
+# === MEXC (Futures) ===
 exchange = ccxt.mexc({
     "apiKey": MEXC_API_KEY,
     "secret": MEXC_API_SECRET,
@@ -88,10 +88,7 @@ def retry_on_error(max_retries: int = 4, delay: int = 2):
 async def check_balance() -> float:
     bal = await exchange.fetch_balance()
     usdt = bal.get("total", {}).get("USDT", 0) or bal.get("free", {}).get("USDT", 0)
-    try:
-        usdt = float(usdt)
-    except:
-        usdt = 0.0
+    usdt = float(usdt) if usdt else 0.0
     logger.info(f"Баланс USDT: {usdt:.4f}")
     return usdt
 
@@ -103,9 +100,12 @@ async def calculate_qty(usd_amount: float) -> float:
     ticker = await exchange.fetch_ticker(SYMBOL)
     price = ticker["last"]
     raw_qty = usd_amount / price
-    qty = exchange.amount_to_precision(SYMBOL, raw_qty)
-    qty = max(float(qty), market["limits"]["amount"]["min"])
-    logger.info(f"qty: {usd_amount} USD → {qty} @ {price}")
+    qty_str = exchange.amount_to_precision(SYMBOL, raw_qty)
+    qty = float(qty_str)
+    min_qty = market["limits"]["amount"]["min"]
+    if qty < min_qty:
+        qty = min_qty
+    logger.info(f"calculate_qty: {usd_amount} USD → {qty} @ {price}")
     return qty
 
 # === Открытие позиции ===
@@ -123,20 +123,19 @@ async def open_position(signal: str, amount_usd: Optional[float] = None):
         balance = await check_balance()
         usd = amount_usd or (balance * RISK_PERCENT / 100.0)
         if usd < MIN_USD:
-            raise ValueError(f"Маленький лот: {usd:.2f} USD < {MIN_USD}")
+            raise ValueError(f"Маленький лот: {usd:.2f} < {MIN_USD}")
 
         qty = await calculate_qty(usd)
         side = "buy" if signal == "buy" else "sell"
-        positionSide = "LONG" if signal == "buy" else "SHORT"
         pos_type = 1 if signal == "buy" else 2
 
-        # Плечо
+        # Установка плеча
         try:
             await exchange.set_leverage(LEVERAGE, SYMBOL, params={"openType": 1, "positionType": pos_type})
         except Exception as e:
-            logger.warning(f"set_leverage: {e}")
+            logger.warning(f"set_leverage failed: {e}")
 
-        # Закрываем старую
+        # Закрываем старую позицию
         positions = await exchange.fetch_positions([SYMBOL])
         for pos in positions:
             contracts = pos.get("contracts", 0)
@@ -152,16 +151,20 @@ async def open_position(signal: str, amount_usd: Optional[float] = None):
             SYMBOL, "market", side, qty,
             params={"openType": 1, "positionType": pos_type, "leverage": LEVERAGE}
         )
-        entry = order.get("average") or order.get("price") or (await exchange.fetch_ticker(SYMBOL))["last"]
+        entry = order.get("average") or order.get("price")
+        if not entry:
+            ticker = await exchange.fetch_ticker(SYMBOL)
+            entry = ticker["last"]
 
         tp = round(float(entry) * (1.015 if side == "buy" else 0.985), 6)
         sl = round(float(entry) * (0.99 if side == "buy" else 1.01), 6)
 
-        # TP/SL
+        # TP
         await exchange.create_order(
             SYMBOL, "limit", "sell" if side == "buy" else "buy", qty, tp,
             params={"openType": 1, "positionType": pos_type, "leverage": LEVERAGE, "reduceOnly": True}
         )
+        # SL
         await exchange.create_order(
             SYMBOL, "limit", "sell" if side == "buy" else "buy", qty, sl,
             params={"openType": 1, "positionType": pos_type, "leverage": LEVERAGE, "reduceOnly": True}
@@ -173,17 +176,18 @@ async def open_position(signal: str, amount_usd: Optional[float] = None):
         await tg_send(
             f"<b>{signal.upper()} EXECUTED</b>\n"
             f"<code>{qty}</code> <b>{SYMBOL}</b>\n"
-            f"Entry: <code>{entry}</code</code>\n"
+            f"Entry: <code>{entry}</code>\n"
             f"TP: <code>{tp}</code> | SL: <code>{sl}</code>\n"
             f"Баланс: <code>{balance:.2f}</code> USDT"
         )
 
     except Exception as e:
         active_position = False
+        bal = await check_balance()
         await tg_send(
             f"<b>ERROR {signal}</b>\n"
             f"<code>{e}</code>\n"
-            f"Баланс: <code>{await check_balance():.2f}</code> USDT"
+            f"Баланс: <code>{bal:.2f}</code> USDT"
         )
         logger.exception("open_position error")
 
@@ -207,7 +211,10 @@ async def startup_notify():
 
 @app.on_event("shutdown")
 async def shutdown():
-    await exchange.close()
+    try:
+        await exchange.close()
+    except:
+        pass
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
