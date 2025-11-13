@@ -31,16 +31,12 @@ logger = logging.getLogger("mexc-bot")
 # === Telegram ===
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# === MEXC Client (V3 API) ===
+# === MEXC Client ===
 exchange = ccxt.mexc({
     'apiKey': MEXC_API_KEY,
     'secret': MEXC_API_SECRET,
     'enableRateLimit': True,
-    'sandbox': False,  # Mainnet
-    'version': 'v3',   # V3 API для Futures
-    'options': {
-        'defaultType': 'swap',  # Perpetual futures
-    }
+    'options': {'defaultType': 'swap'},
 })
 
 # === FastAPI ===
