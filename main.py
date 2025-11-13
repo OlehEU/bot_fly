@@ -20,7 +20,7 @@ TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
 MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", 25))  # 25% от баланса
-SYMBOL = os.getenv("SYMBOL", "XRP/USDT:USDT")       # XRP Futures
+SYMBOL = os.getenv("SYMBOL", "XRP/USDT:USDT")  # XRP Futures
 LEVERAGE = int(os.getenv("LEVERAGE", 10))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
@@ -31,12 +31,16 @@ logger = logging.getLogger("mexc-bot")
 # === Telegram ===
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# === MEXC Client ===
+# === MEXC Client (V3 API) ===
 exchange = ccxt.mexc({
     'apiKey': MEXC_API_KEY,
     'secret': MEXC_API_SECRET,
     'enableRateLimit': True,
-    'options': {'defaultType': 'swap'},
+    'sandbox': False,  # Mainnet
+    'version': 'v3',   # V3 API для Futures
+    'options': {
+        'defaultType': 'swap',  # Perpetual futures
+    }
 })
 
 # === FastAPI ===
@@ -193,7 +197,7 @@ async def open_position(signal: str, amount_usd=None):
         usd = amount_usd or (balance * RISK_PERCENT / 100)
         logger.info(f"Риск: {RISK_PERCENT}% → {usd:.2f} USDT из {balance:.2f}")
 
-        if usd < 5.:
+        if usd < 5:
             raise ValueError(f"Слишком маленький лот: {usd:.2f} USDT")
 
         qty = await calculate_qty(usd)
