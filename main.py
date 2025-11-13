@@ -37,7 +37,7 @@ exchange = ccxt.mexc({
     'secret': MEXC_API_SECRET,
     'enableRateLimit': True,
     'sandbox': False,
-    'version': 'v3',                     # <—— V3
+    'version': 'v3',  # V3 API
     'options': {'defaultType': 'swap'},
 })
 
@@ -46,7 +46,7 @@ app = FastAPI()
 last_trade_info = None
 active_position = False
 
-# === RETRY при 403/429 ===
+# === RETRY ===
 def retry_on_error(max_retries: int = 5, delay: int = 3):
     def decorator(func):
         @wraps(func)
@@ -56,7 +56,7 @@ def retry_on_error(max_retries: int = 5, delay: int = 3):
                     return await func(*args, **kwargs)
                 except Exception as e:
                     if any(code in str(e) for code in ["403", "429", "1002"]) and attempt < max_retries - 1:
-                        logger.warning(f"{e} — повтор через {delay}s (попытка {attempt+2})")
+                        logger.warning(f"{e} — повтор через {delay}s")
                         await asyncio.sleep(delay)
                         continue
                     logger.error(f"Критическая ошибка: {e}")
@@ -77,40 +77,38 @@ async def check_balance() -> float:
         logger.error(f"Ошибка баланса: {e}")
         return 0.0
 
-# === РАСЧЁТ qty + vol ===
-async def calculate_qty(usd_amount: float) -> tuple[float, float]:
-    markets = await exchange.load_markets()
-    market = markets[SYMBOL]
-    min_qty = market['limits']['amount']['min']
-    contract_size = market['contractSize'] or 1.0
-    ticker = await exchange.fetch_ticker(SYMBOL)
-    price = ticker['last']
-    raw_qty = usd_amount / price
-    qty = exchange.amount_to_precision(SYMBOL, raw_qty)
-    qty = max(float(qty), min_qty)
-    vol = qty * contract_size
-    logger.info(f"qty={qty} vol={vol} price={price}")
-    return qty, vol
+# === РАСЧЁТ qty ===
+async def calculate_qty(usd_amount: float) -> float:
+    try:
+        markets = await exchange.load_markets()
+        market = markets[SYMBOL]
+        min_qty = market['limits']['amount']['min']
+        ticker = await exchange.fetch_ticker(SYMBOL)
+        price = ticker['last']
+        raw_qty = usd_amount / price
+        qty = exchange.amount_to_precision(SYMBOL, raw_qty)
+        qty = max(float(qty), min_qty)
+        logger.info(f"qty={qty} price={price}")
+        return qty
+    except Exception as e:
+        logger.error(f"Ошибка qty: {e}")
+        return 0.0
 
-# === Старт (с таймаутом) ===
+# === Старт ===
 @app.on_event("startup")
 async def startup_notify():
     try:
         logger.info("=== ЗАПУСК БОТА ===")
         balance = await asyncio.wait_for(check_balance(), timeout=15)
-        msg = (f"MEXC Бот запущен!\n\n"
-               f"Символ: {SYMBOL}\n"
-               f"Риск: {RISK_PERCENT}%\n"
-               f"Плечо: {LEVERAGE}x\n"
-               f"Баланс: {balance:.2f} USDT")
+        msg = f"MEXC Бот запущен!\nСимвол: {SYMBOL}\nРиск: {RISK_PERCENT}%\nПлечо: {LEVERAGE}x\nБаланс: {balance:.2f} USDT"
         await asyncio.wait_for(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg), timeout=10)
         logger.info("Стартовое уведомление отправлено.")
     except asyncio.TimeoutError:
-        logger.error("Таймаут при старте (Telegram или API)")
+        logger.error("Таймаут при старте")
     except Exception as e:
         logger.error(f"ОШИБКА ПРИ СТАРТЕ: {e}")
 
-# === Главная / Баланс ===
+# === Главная ===
 @app.get("/", response_class=HTMLResponse)
 async def home():
     global last_trade_info, active_position
@@ -119,14 +117,13 @@ async def home():
     return f"""<html><head><title>MEXC Bot</title><meta charset="utf-8"></head>
     <body style="font-family:Arial;background:#1e1e1e;color:#e0e0e0;padding:20px;">
       <h2 style="color:#00b894;">MEXC Futures Bot</h2>
-      <ul><li><b>Символ:</b> {SYMBOL}</li>
-          <li><b>Лот:</b> {RISK_PERCENT}%</li>
-          <li><b>Плечо:</b> {LEVERAGE}×</li>
-          <li><b>Позиция:</b> {status}</li></ul>
+      <ul><li><b>Символ:</b> {SYMBOL}</li><li><b>Риск:</b> {RISK_PERCENT}%</li><li><b>Плечо:</b> {LEVERAGE}×</li><li><b>Позиция:</b> {status}</li></ul>
       <h3>Последняя сделка:</h3><pre style="background:#2d2d2d;padding:10px;">{last}</pre>
+      <p><b>Webhook:</b> <code>POST /webhook</code> <b>Header:</b> <code>Authorization: Bearer {WEBHOOK_SECRET}</code></p>
       <a href="/balance">Баланс</a>
     </body></html>"""
 
+# === Баланс ===
 @app.get("/balance", response_class=HTMLResponse)
 async def get_balance():
     bal = await check_balance()
@@ -137,7 +134,7 @@ async def get_balance():
       <a href="/">Назад</a></body></html>"""
 
 # === Открытие позиции ===
-async def open_position(signal: str, amount_usd: float | None = None):
+async def open_position(signal: str, amount_usd=None):
     global last_trade_info, active_position
     if active_position:
         return
@@ -148,14 +145,12 @@ async def open_position(signal: str, amount_usd: float | None = None):
         if usd < 5:
             raise ValueError("Маленький лот")
 
-        qty, vol = await calculate_qty(usd)
+        qty = await calculate_qty(usd)
         side = "buy" if signal == "buy" else "sell"
         pos_type = 1 if side == "buy" else 2
 
-        # Плечо
         await exchange.set_leverage(LEVERAGE, SYMBOL, params={'openType': 1, 'positionType': pos_type})
 
-        # Закрываем старую
         pos = await exchange.fetch_positions([SYMBOL])
         for p in pos:
             if p['contracts'] > 0:
@@ -165,16 +160,14 @@ async def open_position(signal: str, amount_usd: float | None = None):
                     params={'openType': 1, 'positionType': pos_type, 'leverage': LEVERAGE}
                 )
 
-        # Открываем
         order = await exchange.create_market_order(
             SYMBOL, side, qty,
-            params={'openType': 1, 'positionType': pos_type, 'leverage': LEVERAGE, 'vol': vol}
+            params={'openType': 1, 'positionType': pos_type, 'leverage': LEVERAGE}
         )
         entry = order['average'] or order['price']
         tp = round(entry * (1.015 if side == "buy" else 0.985), 6)
         sl = round(entry * (0.99 if side == "buy" else 1.01), 6)
 
-        # TP/SL
         await exchange.create_order(
             SYMBOL, 'limit', 'sell' if side == "buy" else 'buy', qty, tp,
             params={'openType': 1, 'positionType': pos_type, 'leverage': LEVERAGE, 'reduceOnly': True}
