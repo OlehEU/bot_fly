@@ -127,7 +127,7 @@ async def startup_notify():
         logger.info(f"СТАРТОВЫЙ БАЛАНС: {balance:.4f} USDT")
         msg = f"MEXC Бот запущен!\n\n" \
               f"Символ: {SYMBOL}\n" \
-              f"Лот: {TRADE_USD} USDT\n" \
+              f"Риск: {RISK_PERCENT}%\n" \
               f"Плечо: {LEVERAGE}x\n" \
               f"Баланс: {balance:.2f} USDT"
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
@@ -153,7 +153,7 @@ async def home():
       <ul>
         <li><b>Биржа:</b> MEXC</li>
         <li><b>Символ:</b> {SYMBOL}</li>
-        <li><b>Лот:</b> {TRADE_USD} USDT</li>
+        <li><b>Лот:</b> {RISK_PERCENT}% USDT</li>
         <li><b>Плечо:</b> {LEVERAGE}×</li>
         <li><b>Позиция:</b> {status}</li>
       </ul>
@@ -169,7 +169,7 @@ async def home():
 @app.get("/balance", response_class=HTMLResponse)
 async def get_balance():
     balance = await check_balance()
-    required = TRADE_USD * 1.1
+    required = balance * (RISK_PERCENT / 100) * 1.1  # 25% + 10%
     status = "Достаточно" if balance >= required else "Недостаточно"
     color = "#00b894" if balance >= required else "#e74c3c"
     return f"""
@@ -177,7 +177,7 @@ async def get_balance():
     <body style="font-family: Arial; background:#1e1e1e; color:#e0e0e0; padding:20px;">
       <h2>Баланс USDT</h2>
       <p><b>Доступно:</b> <span style="color:{color}">{balance:.2f}</span> USDT</p>
-      <p><b>Требуется:</b> {required:.2f} USDT</p>
+      <p><b>Требуется (25% + 10%):</b> {required:.2f} USDT</p>
       <p><b>Статус:</b> {status}</p>
       <a href="/">На главную</a>
     </body></html>
@@ -258,6 +258,7 @@ async def webhook(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
