@@ -20,7 +20,7 @@ TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
 MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", 25))  # 25% от баланса
-SYMBOL = os.getenv("SYMBOL", "XRP/USDT:USDT")  # XRP Futures
+SYMBOL = os.getenv("SYMBOL", "XRP_USDT")  # ИСПРАВЛЕНО: формат для фьючерсов
 LEVERAGE = int(os.getenv("LEVERAGE", 10))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
@@ -43,6 +43,32 @@ exchange = ccxt.mexc({
 app = FastAPI()
 last_trade_info = None
 active_position = False
+
+# === Вспомогательные функции ===
+async def get_current_price() -> float:
+    """Получить текущую цену символа"""
+    try:
+        ticker = await exchange.fetch_ticker(SYMBOL)
+        return float(ticker['last'])
+    except Exception as e:
+        logger.error(f"Ошибка получения цены: {e}")
+        return 0.0
+
+async def close_existing_positions():
+    """Закрыть все существующие позиции"""
+    try:
+        positions = await exchange.fetch_positions([SYMBOL])
+        for pos in positions:
+            if pos['contracts'] and float(pos['contracts']) > 0:
+                logger.info(f"Закрываем существующую позицию: {pos['side']} {pos['contracts']}")
+                close_side = 'sell' if pos['side'] == 'long' else 'buy'
+                await exchange.create_market_order(SYMBOL, close_side, abs(float(pos['contracts'])))
+                await asyncio.sleep(1)  # Даём время на закрытие
+                return True
+        return False
+    except Exception as e:
+        logger.error(f"Ошибка при закрытии позиций: {e}")
+        return False
 
 # === RETRY при 403 ===
 def retry_on_403(max_retries: int = 4, delay: int = 3):
@@ -120,7 +146,7 @@ async def startup_notify():
         logger.info("=== ЗАПУСК БОТА ===")
         balance = await check_balance()
         logger.info(f"СТАРТОВЫЙ БАЛАНС: {balance:.4f} USDT")
-        msg = f"MEXC Бот запущен!\n\n" \
+        msg = f"✅ MEXC Бот запущен!\n\n" \
               f"Символ: {SYMBOL}\n" \
               f"Риск: {RISK_PERCENT}%\n" \
               f"Плечо: {LEVERAGE}x\n" \
@@ -128,7 +154,7 @@ async def startup_notify():
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         logger.info("Стартовое уведомление отправлено.")
     except Exception as e:
-        error_msg = f"ОШИБКА ПРИ СТАРТЕ: {e}"
+        error_msg = f"❌ ОШИБКА ПРИ СТАРТЕ: {e}"
         logger.error(error_msg)
         try:
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=error_msg)
@@ -181,56 +207,105 @@ async def get_balance():
 # === Открытие позиции ===
 async def open_position(signal: str, amount_usd=None):
     global last_trade_info, active_position
-    if active_position:
-        logger.info("Позиция уже открыта — пропускаем.")
-        return
-
+    
     try:
+        # Закрываем существующие позиции
+        had_position = await close_existing_positions()
+        if had_position:
+            await asyncio.sleep(2)  # Даём больше времени на закрытие
+
         balance = await check_balance()
         if balance <= 0:
-            raise ValueError("Баланс = 0 USDT")
+            raise ValueError(f"Баланс = {balance:.2f} USDT")
 
         usd = amount_usd or (balance * RISK_PERCENT / 100)
         logger.info(f"Риск: {RISK_PERCENT}% → {usd:.2f} USDT из {balance:.2f}")
 
         if usd < 5:
-            raise ValueError(f"Слишком маленький лот: {usd:.2f} USDT")
+            raise ValueError(f"Слишком маленький лот: {usd:.2f} USDT (мин. 5 USDT)")
 
+        # Устанавливаем плечо и режим маржи
+        await exchange.set_leverage(LEVERAGE, SYMBOL)
+        await exchange.set_margin_mode('isolated', SYMBOL)
+        
+        # Рассчитываем количество
         qty = await calculate_qty(usd)
         if qty <= 0:
-            raise ValueError("Неверный qty")
+            raise ValueError(f"Неверный qty: {qty}")
 
-        side = "buy" if signal == "buy" else "sell"
+        side = "buy" if signal.lower() == "buy" else "sell"
         logger.info(f"Открываем {side.upper()} {qty} {SYMBOL}")
 
-        await exchange.set_leverage(LEVERAGE, SYMBOL)
-
-        positions = await exchange.fetch_positions([SYMBOL])
-        for pos in positions:
-            if pos['contracts'] > 0:
-                close_side = 'sell' if pos['side'] == 'long' else 'buy'
-                logger.info(f"Закрываем {close_side} {pos['contracts']} {SYMBOL}")
-                await exchange.create_market_order(SYMBOL, close_side, pos['contracts'])
-
+        # Создаем рыночный ордер
         order = await exchange.create_market_order(SYMBOL, side, qty)
-        entry = order['average'] or order['price']
-        tp = round(entry * (1.015 if side == "buy" else 0.985), 6)
-        sl = round(entry * (0.99 if side == "buy" else 1.01), 6)
+        logger.info(f"Ордер создан: {order}")
 
-        await exchange.create_order(SYMBOL, 'limit', 'sell' if side == "buy" else 'buy', qty, tp, {'reduceOnly': True})
-        await exchange.create_order(SYMBOL, 'limit', 'sell' if side == "buy" else 'buy', qty, sl, {'reduceOnly': True})
+        # Получаем цену входа
+        if order.get('filled', 0) > 0:
+            entry = order.get('average') or await get_current_price()
+        else:
+            entry = await get_current_price()
+
+        # Рассчитываем TP/SL
+        if side == "buy":
+            tp = entry * 1.015  # +1.5%
+            sl = entry * 0.99   # -1%
+        else:
+            tp = entry * 0.985  # -1.5%
+            sl = entry * 1.01   # +1%
+
+        # Создаем TP/SL ордера (лимитные)
+        try:
+            tp_order = await exchange.create_order(
+                SYMBOL, 'limit', 
+                'sell' if side == "buy" else 'buy', 
+                qty, tp, 
+                {'reduceOnly': True}
+            )
+            logger.info(f"TP ордер создан: {tp}")
+        except Exception as e:
+            logger.warning(f"Не удалось создать TP: {e}")
+
+        try:
+            sl_order = await exchange.create_order(
+                SYMBOL, 'limit', 
+                'sell' if side == "buy" else 'buy', 
+                qty, sl, 
+                {'reduceOnly': True}
+            )
+            logger.info(f"SL ордер создан: {sl}")
+        except Exception as e:
+            logger.warning(f"Не удалось создать SL: {e}")
 
         active_position = True
-        last_trade_info = {"signal": signal, "qty": qty, "entry": entry, "tp": tp, "sl": sl}
+        last_trade_info = {
+            "signal": signal, 
+            "side": side,
+            "qty": qty, 
+            "entry": round(entry, 6), 
+            "tp": round(tp, 6), 
+            "sl": round(sl, 6),
+            "order_id": order.get('id', 'N/A'),
+            "timestamp": asyncio.get_event_loop().time()
+        }
 
-        msg = f"{side.upper()} {qty} {SYMBOL}\nEntry: ${entry}\nTP: ${tp} | SL: ${sl}\nБаланс: {balance:.2f} USDT"
+        msg = (f"✅ {side.upper()} ОТКРЫТА\n"
+               f"Символ: {SYMBOL}\n"
+               f"Количество: {qty}\n"
+               f"Вход: ${entry:.4f}\n"
+               f"TP: ${tp:.4f} | SL: ${sl:.4f}\n"
+               f"Баланс: {balance:.2f} USDT")
+        
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         logger.info(msg)
 
     except Exception as e:
-        err_msg = f"Ошибка {signal}: {e}\nБаланс: {await check_balance():.2f} USDT"
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=err_msg)
+        err_msg = f"❌ Ошибка открытия {signal}: {str(e)}\nБаланс: {await check_balance():.2f} USDT"
         logger.error(err_msg)
+        try:
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=err_msg)
+        except:
+            pass
         active_position = False
 
 # === Webhook ===
@@ -252,6 +327,29 @@ async def webhook(request: Request):
 
     asyncio.create_task(open_position(signal, amount))
     return {"status": "ok", "message": f"{signal} принят"}
+
+# === Закрытие позиции ===
+@app.post("/close")
+async def close_position(request: Request):
+    if WEBHOOK_SECRET and request.headers.get("Authorization") != f"Bearer {WEBHOOK_SECRET}":
+        raise HTTPException(401, detail="Unauthorized")
+    
+    try:
+        global active_position
+        had_position = await close_existing_positions()
+        
+        if had_position:
+            active_position = False
+            msg = "✅ Позиция закрыта"
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+            return {"status": "ok", "message": "Позиция закрыта"}
+        else:
+            return {"status": "error", "message": "Нет открытых позиций"}
+            
+    except Exception as e:
+        error_msg = f"❌ Ошибка закрытия позиции: {e}"
+        logger.error(error_msg)
+        return {"status": "error", "message": str(e)}
 
 # === ЗАПУСК ===
 if __name__ == "__main__":
