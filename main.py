@@ -20,7 +20,7 @@ TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
 MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", 25))  # 25% от баланса
-SYMBOL = os.getenv("SYMBOL", "XRP/USDT:USDT")       # XRP Futures
+SYMBOL = os.getenv("SYMBOL", "XRP/USDT:USDT")  # XRP Futures
 LEVERAGE = int(os.getenv("LEVERAGE", 10))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
@@ -202,13 +202,15 @@ async def open_position(signal: str, amount_usd=None):
 
         side = "buy" if signal == "buy" else "sell"
         logger.info(f"Открываем {side.upper()} {qty} {SYMBOL}")
-        # Устанавливаем плечо с правильными параметрами
-        position_type = 1 if side == "buy" else 2
-        await exchange.set_leverage(
-            leverage=LEVERAGE,
-            symbol=SYMBOL,
-            params={'openType': 1, 'positionType': position_type}
-        )
+
+        await exchange.set_leverage(LEVERAGE, SYMBOL)
+
+        positions = await exchange.fetch_positions([SYMBOL])
+        for pos in positions:
+            if pos['contracts'] > 0:
+                close_side = 'sell' if pos['side'] == 'long' else 'buy'
+                logger.info(f"Закрываем {close_side} {pos['contracts']} {SYMBOL}")
+                await exchange.create_market_order(SYMBOL, close_side, pos['contracts'])
 
         order = await exchange.create_market_order(SYMBOL, side, qty)
         entry = order['average'] or order['price']
@@ -255,4 +257,3 @@ async def webhook(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
