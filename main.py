@@ -20,7 +20,7 @@ TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
 MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", 25))  # 25% от баланса
-SYMBOL = os.getenv("SYMBOL", "XRP/USDT:USDT")  # ← XRP вместо SOL
+SYMBOL = os.getenv("SYMBOL", "XRP/USDT:USDT")       # XRP
 LEVERAGE = int(os.getenv("LEVERAGE", 10))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
@@ -90,20 +90,15 @@ async def calculate_qty(usd_amount: float) -> float:
         market = markets[SYMBOL]
         min_qty = market['limits']['amount']['min']
         precision = market['precision']['amount']
-
         ticker = await exchange.fetch_ticker(SYMBOL)
         price = ticker['last']
         logger.info(f"Цена {SYMBOL}: {price:.2f} USDT")
-
         raw_qty = usd_amount / price
         logger.info(f"Сырой qty: {usd_amount} / {price:.2f} = {raw_qty:.6f}")
-
         qty = exchange.amount_to_precision(SYMBOL, raw_qty)
         qty = float(qty)
-
         if qty < min_qty:
             raise ValueError(f"qty {qty} < min {min_qty}")
-
         logger.info(f"Финальный qty: {qty} (min: {min_qty}, шаг: {precision})")
         return qty
     except Exception as e:
@@ -153,7 +148,7 @@ async def home():
       <ul>
         <li><b>Биржа:</b> MEXC</li>
         <li><b>Символ:</b> {SYMBOL}</li>
-        <li><b>Лот:</b> {RISK_PERCENT}% USDT</li>
+        <li><b>Лот:</b> {RISK_PERCENT}% от баланса</li>
         <li><b>Плечо:</b> {LEVERAGE}×</li>
         <li><b>Позиция:</b> {status}</li>
       </ul>
@@ -169,7 +164,7 @@ async def home():
 @app.get("/balance", response_class=HTMLResponse)
 async def get_balance():
     balance = await check_balance()
-    required = balance * (RISK_PERCENT / 100) * 1.1  # 25% + 10%
+    required = balance * (RISK_PERCENT / 100) * 1.1
     status = "Достаточно" if balance >= required else "Недостаточно"
     color = "#00b894" if balance >= required else "#e74c3c"
     return f"""
@@ -198,32 +193,42 @@ async def open_position(signal: str, amount_usd=None):
         usd = amount_usd or (balance * RISK_PERCENT / 100)
         logger.info(f"Риск: {RISK_PERCENT}% → {usd:.2f} USDT из {balance:.2f}")
 
-        if usd < 5:  # Минимум 5 USDT
+        if usd < 5:
             raise ValueError(f"Слишком маленький лот: {usd:.2f} USDT")
 
         qty = await calculate_qty(usd)
         if qty <= 0:
             raise ValueError("Неверный qty")
 
-        # Закрыть старую
+        # Определяем сторону
+        side = "buy" if signal == "buy" else "sell"
+        logger.info(f"Открываем {side.upper()} {qty} {SYMBOL}")
+
+        # Устанавливаем плечо
+        await exchange.set_leverage(LEVERAGE, SYMBOL)
+
+        # Закрываем старую позицию
         positions = await exchange.fetch_positions([SYMBOL])
         for pos in positions:
             if pos['contracts'] > 0:
                 close_side = 'sell' if pos['side'] == 'long' else 'buy'
+                logger.info(f"Закрываем {close_side} {pos['contracts']} {SYMBOL}")
                 await exchange.create_market_order(SYMBOL, close_side, pos['contracts'])
 
-        # Открыть новую
+        # Открываем новую
         order = await exchange.create_market_order(SYMBOL, side, qty)
         entry = order['average'] or order['price']
-        tp = round(entry * (1.015 if side == "buy" else 0.985), 2)
-        sl = round(entry * (0.99 if side == "buy" else 1.01), 2)
+        tp = round(entry * (1.015 if side == "buy" else 0.985), 6)
+        sl = round(entry * (0.99 if side == "buy" else 1.01), 6)
 
         await exchange.create_order(SYMBOL, 'limit', 'sell' if side == "buy" else 'buy', qty, tp, {'reduceOnly': True})
         await exchange.create_order(SYMBOL, 'limit', 'sell' if side == "buy" else 'buy', qty, sl, {'reduceOnly': True})
 
         active_position = True
         last_trade_info = {"signal": signal, "qty": qty, "entry": entry, "tp": tp, "sl": sl}
-        msg = f"{side.upper()} {qty} {SYMBOL}\nEntry: ${entry}\nTP: ${tp} | SL: ${sl}\nБаланс: {bal:.2f} USDT"
+
+        msg = f"{side.upper()} {qty} {SYMBOL}\nEntry: ${entry}\nTP: ${tp} | SL: ${sl}\
+
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         logger.info(msg)
 
@@ -250,7 +255,6 @@ async def webhook(request: Request):
     if signal not in ["buy", "sell"]:
         return {"status": "error", "message": "signal: buy или sell"}
 
-    # Запускаем в фоне
     asyncio.create_task(open_position(signal, amount))
     return {"status": "ok", "message": f"{signal} принят"}
 
@@ -258,7 +262,3 @@ async def webhook(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-
-
