@@ -226,7 +226,6 @@ async def open_position(signal: str, amount_usd=None):
 
         active_position = True
         last_trade_info = {"signal": signal, "qty": qty, "entry": entry, "tp": tp, "sl": sl}
-
         msg = f"{side.upper()} {qty} {SYMBOL}\nEntry: ${entry}\nTP: ${tp} | SL: ${sl}\nБаланс: {balance:.2f} USDT"
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         logger.info(msg)
@@ -261,4 +260,5 @@ async def webhook(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
