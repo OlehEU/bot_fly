@@ -2,7 +2,6 @@ import os
 import json
 import asyncio
 import logging
-import time
 from functools import wraps
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
@@ -21,7 +20,7 @@ TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
 MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
 TRADE_USD = float(os.getenv("TRADE_USD", 25))
-SYMBOL = os.getenv("SYMBOL", "SOL/USDT:USDT")  # MEXC Perpetual
+SYMBOL = os.getenv("SYMBOL", "SOL/USDT:USDT")
 LEVERAGE = int(os.getenv("LEVERAGE", 10))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
@@ -32,14 +31,12 @@ logger = logging.getLogger("mexc-bot")
 # === Telegram ===
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# === MEXC Client (ccxt) ===
+# === MEXC Client ===
 exchange = ccxt.mexc({
     'apiKey': MEXC_API_KEY,
     'secret': MEXC_API_SECRET,
     'enableRateLimit': True,
-    'options': {
-        'defaultType': 'swap',  # Perpetual futures
-    }
+    'options': {'defaultType': 'swap'},
 })
 
 # === FastAPI ===
@@ -72,7 +69,6 @@ async def check_balance() -> float:
     logger.info("Проверка баланса USDT...")
     try:
         balance_data = await exchange.fetch_balance()
-        logger.info(f"Ответ API: {balance_data}")  # ← КЛЮЧЕВАЯ СТРОКА
         usdt = balance_data['total'].get('USDT', 0)
         logger.info(f"Баланс USDT: {usdt:.4f}")
         return float(usdt)
@@ -87,41 +83,36 @@ async def check_balance() -> float:
             pass
         return 0.0
 
-# === ПРАВИЛЬНЫЙ РАСЧЁТ qty ДЛЯ MEXC FUTURES ===
+# === РАСЧЁТ qty ===
 async def calculate_qty(usd_amount: float) -> float:
     try:
-        # 1. Получаем контракт
         markets = await exchange.load_markets()
         market = markets[SYMBOL]
         min_qty = market['limits']['amount']['min']
         precision = market['precision']['amount']
 
-        # 2. Текущая цена
         ticker = await exchange.fetch_ticker(SYMBOL)
         price = ticker['last']
         logger.info(f"Цена {SYMBOL}: {price:.2f} USDT")
 
-        # 3. Сырой qty
         raw_qty = usd_amount / price
         logger.info(f"Сырой qty: {usd_amount} / {price:.2f} = {raw_qty:.6f}")
 
-        # 4. Округляем ВНИЗ до шага
         qty = exchange.amount_to_precision(SYMBOL, raw_qty)
         qty = float(qty)
 
-        # 5. Проверка min_size
         if qty < min_qty:
             raise ValueError(f"qty {qty} < min {min_qty}")
 
         logger.info(f"Финальный qty: {qty} (min: {min_qty}, шаг: {precision})")
         return qty
-
     except Exception as e:
         logger.error(f"Ошибка qty: {e}")
         try:
+            balance = await check_balance()
             await bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
-                text=f"Ошибка qty: {e}\nБаланс: {await check_balance():.2f} USDT"
+                text=f"Ошибка qty: {e}\nБаланс: {balance:.2f} USDT"
             )
         except:
             pass
@@ -134,14 +125,13 @@ async def startup_notify():
         logger.info("=== ЗАПУСК БОТА ===")
         balance = await check_balance()
         logger.info(f"СТАРТОВЫЙ БАЛАНС: {balance:.4f} USDT")
-
         msg = f"MEXC Бот запущен!\n\n" \
               f"Символ: {SYMBOL}\n" \
               f"Лот: {TRADE_USD} USDT\n" \
               f"Плечо: {LEVERAGE}x\n" \
               f"Баланс: {balance:.2f} USDT"
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-        logger.info("Стартовое уведомление отправлено в Telegram.")
+        logger.info("Стартовое уведомление отправлено.")
     except Exception as e:
         error_msg = f"ОШИБКА ПРИ СТАРТЕ: {e}"
         logger.error(error_msg)
@@ -193,12 +183,13 @@ async def get_balance():
     </body></html>
     """
 
-# === Позиция ===
+# === Открытие позиции ===
 async def open_position(signal: str, amount_usd=None):
     global last_trade_info, active_position
     if active_position:
         logger.info("Позиция уже открыта — пропускаем.")
         return
+
     try:
         side = "buy" if signal == "buy" else "sell"
         usd = amount_usd or TRADE_USD
@@ -206,23 +197,22 @@ async def open_position(signal: str, amount_usd=None):
         if bal < usd * 1.1:
             raise ValueError(f"Недостаточно USDT: {bal:.2f} < {usd * 1.1:.2f}")
 
-        qty = calculate_qty(usd)
+        qty = await calculate_qty(usd)
         if qty <= 0:
             raise ValueError("Неверный qty")
 
-        # Плечо
         await exchange.set_leverage(LEVERAGE, SYMBOL)
 
         # Закрыть старую
         positions = await exchange.fetch_positions([SYMBOL])
         for pos in positions:
             if pos['contracts'] > 0:
-                await exchange.create_market_order(SYMBOL, 'sell' if pos['side'] == 'long' else 'buy', pos['contracts'])
+                close_side = 'sell' if pos['side'] == 'long' else 'buy'
+                await exchange.create_market_order(SYMBOL, close_side, pos['contracts'])
 
         # Открыть новую
         order = await exchange.create_market_order(SYMBOL, side, qty)
         entry = order['average'] or order['price']
-
         tp = round(entry * (1.015 if side == "buy" else 0.985), 2)
         sl = round(entry * (0.99 if side == "buy" else 1.01), 2)
 
@@ -234,6 +224,7 @@ async def open_position(signal: str, amount_usd=None):
         msg = f"{side.upper()} {qty} {SYMBOL}\nEntry: ${entry}\nTP: ${tp} | SL: ${sl}\nБаланс: {bal:.2f} USDT"
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         logger.info(msg)
+
     except Exception as e:
         err_msg = f"Ошибка {signal}: {e}\nБаланс: {await check_balance():.2f} USDT"
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=err_msg)
@@ -245,14 +236,19 @@ async def open_position(signal: str, amount_usd=None):
 async def webhook(request: Request):
     if WEBHOOK_SECRET and request.headers.get("Authorization") != f"Bearer {WEBHOOK_SECRET}":
         raise HTTPException(401, detail="Unauthorized")
+
     try:
         data = await request.json()
     except:
         return {"status": "error", "message": "Invalid JSON"}
+
     signal = data.get("signal")
     amount = data.get("amount")
+
     if signal not in ["buy", "sell"]:
         return {"status": "error", "message": "signal: buy или sell"}
+
+    # Запускаем в фоне
     asyncio.create_task(open_position(signal, amount))
     return {"status": "ok", "message": f"{signal} принят"}
 
@@ -260,6 +256,3 @@ async def webhook(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-
