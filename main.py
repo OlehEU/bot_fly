@@ -49,7 +49,9 @@ async def get_current_price() -> float:
     """Получить текущую цену символа"""
     try:
         ticker = await exchange.fetch_ticker(SYMBOL)
-        return float(ticker['last'])
+        price = float(ticker['last'])
+        logger.info(f"Текущая цена {SYMBOL}: {price:.6f}")
+        return price
     except Exception as e:
         logger.error(f"Ошибка получения цены: {e}")
         return 0.0
@@ -129,38 +131,69 @@ async def check_balance() -> float:
             pass
         return 0.0
 
-# === РАСЧЁТ qty ===
+# === РАСЧЁТ qty === ИСПРАВЛЕННАЯ ВЕРСИЯ
 async def calculate_qty(usd_amount: float) -> float:
     try:
-        markets = await exchange.load_markets()
-        market = markets[SYMBOL]
-        min_qty = market['limits']['amount']['min']
-        precision = market['precision']['amount']
+        logger.info(f"Расчет qty для суммы: {usd_amount} USDT")
+        
+        # Загружаем рынки
+        await exchange.load_markets()
+        
+        # Получаем информацию о символе
+        market = exchange.markets[SYMBOL]
+        logger.info(f"Информация о рынке: {market}")
+        
+        # Получаем текущую цену
         ticker = await exchange.fetch_ticker(SYMBOL)
         price = ticker['last']
         logger.info(f"Цена {SYMBOL}: {price:.6f} USDT")
+        
+        # Рассчитываем сырое количество
         raw_qty = usd_amount / price
-        logger.info(f"Сырой qty: {usd_amount} / {price:.6f} = {raw_qty:.8f}")
+        logger.info(f"Сырое количество: {usd_amount} / {price:.6f} = {raw_qty:.8f}")
+        
+        # Применяем precision
         qty = exchange.amount_to_precision(SYMBOL, raw_qty)
         qty = float(qty)
-        logger.info(f"Финальный qty: {qty} (min: {min_qty}, шаг: {precision})")
+        logger.info(f"Количество после precision: {qty}")
+        
+        # Проверяем минимальное количество
+        min_qty = market['limits']['amount']['min']
+        logger.info(f"Минимальное количество: {min_qty}")
         
         if qty < min_qty:
-            # Пробуем увеличить до минимального
+            logger.warning(f"Рассчитанное количество {qty} меньше минимального {min_qty}")
+            # Используем минимальное разрешенное количество
             qty = min_qty
-            logger.info(f"Qty увеличен до минимального: {qty}")
+            logger.info(f"Используем минимальное количество: {qty}")
             
+        # Проверяем стоимость позиции
+        position_value = qty * price
+        logger.info(f"Стоимость позиции: {position_value:.2f} USDT")
+        
+        if position_value < 5:  # MEXC minimum
+            logger.warning(f"Стоимость позиции {position_value:.2f} USDT слишком мала")
+            # Рассчитываем минимальное количество для 5 USDT
+            min_qty_for_5usd = 5 / price
+            qty = exchange.amount_to_precision(SYMBOL, min_qty_for_5usd)
+            qty = float(qty)
+            logger.info(f"Скорректированное количество для мин. 5 USDT: {qty}")
+        
+        logger.info(f"Финальное количество: {qty}")
         return qty
+        
     except Exception as e:
-        logger.error(f"Ошибка qty: {e}")
+        logger.error(f"Ошибка расчета qty: {e}")
+        # Детальная диагностика
         try:
             balance = await check_balance()
+            market_info = exchange.markets.get(SYMBOL, "Market not found")
             await bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
-                text=f"Ошибка qty: {e}\nБаланс: {balance:.2f} USDT"
+                text=f"Ошибка qty: {e}\nБаланс: {balance:.2f} USDT\nСимвол: {SYMBOL}"
             )
-        except:
-            pass
+        except Exception as bot_error:
+            logger.error(f"Ошибка отправки в Telegram: {bot_error}")
         return 0.0
 
 # === Старт ===
@@ -197,7 +230,7 @@ async def home():
       <h2 style="color:#00b894;">MEXC Futures Bot</h2>
       <ul>
         <li><b>Биржа:</b> MEXC</li>
-               <li><b>Символ:</b> {SYMBOL}</li>
+        <li><b>Символ:</b> {SYMBOL}</li>
         <li><b>Лот:</b> {RISK_PERCENT}% от баланса</li>
         <li><b>Плечо:</b> {LEVERAGE}×</li>
         <li><b>Позиция:</b> {status}</li>
@@ -233,35 +266,44 @@ async def open_position(signal: str, amount_usd=None):
     global last_trade_info, active_position
     
     try:
+        logger.info(f"=== ПОПЫТКА ОТКРЫТИЯ ПОЗИЦИИ {signal.upper()} ===")
+        
         # Закрываем существующие позиции
         had_position = await close_existing_positions()
         if had_position:
             await asyncio.sleep(2)  # Даём больше времени на закрытие
 
         balance = await check_balance()
+        logger.info(f"Текущий баланс: {balance:.2f} USDT")
+        
         if balance <= 0:
             raise ValueError(f"Баланс = {balance:.2f} USDT")
 
         usd = amount_usd or (balance * RISK_PERCENT / 100)
-        logger.info(f"Риск: {RISK_PERCENT}% → {usd:.2f} USDT из {balance:.2f}")
+        logger.info(f"Сумма для позиции: {usd:.2f} USDT ({RISK_PERCENT}% от баланса)")
 
         if usd < 5:
-            raise ValueError(f"Слишком маленький лот: {usd:.2f} USDT (мин. 5 USDT)")
+            # Используем минимальную сумму 5 USDT
+            usd = 5
+            logger.info(f"Используем минимальную сумму: {usd} USDT")
 
         # Рассчитываем количество
         qty = await calculate_qty(usd)
+        logger.info(f"Рассчитанное количество: {qty}")
+        
         if qty <= 0:
             raise ValueError(f"Неверный qty: {qty}")
 
         side = "buy" if signal.lower() == "buy" else "sell"
-        logger.info(f"Открываем {side.upper()} {qty} {SYMBOL}")
+        logger.info(f"Открываем {side.upper()} позицию: {qty} {SYMBOL}")
 
         # Устанавливаем плечо ПЕРЕД открытием позиции
         leverage_success = await set_leverage_for_symbol(side)
         if not leverage_success:
-            raise ValueError("Не удалось установить плечо")
+            logger.warning("Не удалось установить плечо, пробуем продолжить")
 
         # Создаем рыночный ордер
+        logger.info(f"Создаем рыночный ордер: {side} {qty} {SYMBOL}")
         order = await exchange.create_market_order(SYMBOL, side, qty)
         logger.info(f"Ордер создан: {order}")
 
@@ -277,6 +319,8 @@ async def open_position(signal: str, amount_usd=None):
         else:
             tp = entry * 0.985  # -1.5%
             sl = entry * 1.01   # +1%
+
+        logger.info(f"TP: {tp:.6f}, SL: {sl:.6f}")
 
         # Создаем TP/SL ордера (лимитные)
         try:
@@ -321,7 +365,7 @@ async def open_position(signal: str, amount_usd=None):
                f"Баланс: {balance:.2f} USDT")
         
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-        logger.info(msg)
+        logger.info(f"Позиция успешно открыта: {msg}")
 
     except Exception as e:
         err_msg = f"❌ Ошибка открытия {signal}: {str(e)}\nБаланс: {await check_balance():.2f} USDT"
