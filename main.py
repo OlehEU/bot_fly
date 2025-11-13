@@ -19,8 +19,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
 MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
-TRADE_USD = float(os.getenv("TRADE_USD", 25))
-SYMBOL = os.getenv("SYMBOL", "SOL/USDT:USDT")  # ПРАВИЛЬНЫЙ ФОРМАТ ДЛЯ MEXC
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", 25))  # 25% от баланса
+SYMBOL = os.getenv("SYMBOL", "XRP/USDT:USDT")  # ← XRP вместо SOL
 LEVERAGE = int(os.getenv("LEVERAGE", 10))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
@@ -191,17 +191,19 @@ async def open_position(signal: str, amount_usd=None):
         return
 
     try:
-        side = "buy" if signal == "buy" else "sell"
-        usd = amount_usd or TRADE_USD
-        bal = await check_balance()
-        if bal < usd * 1.1:
-            raise ValueError(f"Недостаточно USDT: {bal:.2f} < {usd * 1.1:.2f}")
+        balance = await check_balance()
+        if balance <= 0:
+            raise ValueError("Баланс = 0 USDT")
+
+        usd = amount_usd or (balance * RISK_PERCENT / 100)
+        logger.info(f"Риск: {RISK_PERCENT}% → {usd:.2f} USDT из {balance:.2f}")
+
+        if usd < 5:  # Минимум 5 USDT
+            raise ValueError(f"Слишком маленький лот: {usd:.2f} USDT")
 
         qty = await calculate_qty(usd)
         if qty <= 0:
             raise ValueError("Неверный qty")
-
-        await exchange.set_leverage(LEVERAGE, SYMBOL)
 
         # Закрыть старую
         positions = await exchange.fetch_positions([SYMBOL])
@@ -256,5 +258,6 @@ async def webhook(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
