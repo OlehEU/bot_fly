@@ -20,7 +20,7 @@ TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
 MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", 25))  # 25% от баланса
-SYMBOL = os.getenv("SYMBOL", "XRP/USDT:USDT")       # XRP
+SYMBOL = os.getenv("SYMBOL", "XRP/USDT:USDT")       # XRP Futures
 LEVERAGE = int(os.getenv("LEVERAGE", 10))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
@@ -200,14 +200,11 @@ async def open_position(signal: str, amount_usd=None):
         if qty <= 0:
             raise ValueError("Неверный qty")
 
-        # Определяем сторону
         side = "buy" if signal == "buy" else "sell"
         logger.info(f"Открываем {side.upper()} {qty} {SYMBOL}")
 
-        # Устанавливаем плечо
         await exchange.set_leverage(LEVERAGE, SYMBOL)
 
-        # Закрываем старую позицию
         positions = await exchange.fetch_positions([SYMBOL])
         for pos in positions:
             if pos['contracts'] > 0:
@@ -215,7 +212,6 @@ async def open_position(signal: str, amount_usd=None):
                 logger.info(f"Закрываем {close_side} {pos['contracts']} {SYMBOL}")
                 await exchange.create_market_order(SYMBOL, close_side, pos['contracts'])
 
-        # Открываем новую
         order = await exchange.create_market_order(SYMBOL, side, qty)
         entry = order['average'] or order['price']
         tp = round(entry * (1.015 if side == "buy" else 0.985), 6)
@@ -226,11 +222,12 @@ async def open_position(signal: str, amount_usd=None):
 
         active_position = True
         last_trade_info = {"signal": signal, "qty": qty, "entry": entry, "tp": tp, "sl": sl}
+
         msg = f"{side.upper()} {qty} {SYMBOL}\nEntry: ${entry}\nTP: ${tp} | SL: ${sl}\nБаланс: {balance:.2f} USDT"
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         logger.info(msg)
 
-        except Exception as e:
+    except Exception as e:
         err_msg = f"Ошибка {signal}: {e}\nБаланс: {await check_balance():.2f} USDT"
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=err_msg)
         logger.error(err_msg)
@@ -260,5 +257,3 @@ async def webhook(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
