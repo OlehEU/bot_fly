@@ -20,7 +20,7 @@ TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
 MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
 TRADE_USD = float(os.getenv("TRADE_USD", 25))
-SYMBOL = os.getenv("SYMBOL", "SOLUSDT")  # MEXC Futures: SOLUSDT
+SYMBOL = os.getenv("SYMBOL", "SOL/USDT:USDT")  # ПРАВИЛЬНЫЙ ФОРМАТ ДЛЯ MEXC
 LEVERAGE = int(os.getenv("LEVERAGE", 10))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
@@ -256,4 +256,5 @@ async def webhook(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
