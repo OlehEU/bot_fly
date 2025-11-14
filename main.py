@@ -10,10 +10,18 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from telegram import Bot
 
+# === Настройка логирования ===
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("mexc-bot")
+
 # === Проверка секретов ===
 REQUIRED_SECRETS = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "MEXC_API_KEY", "MEXC_API_SECRET", "WEBHOOK_SECRET"]
 for secret in REQUIRED_SECRETS:
     if not os.getenv(secret):
+        logger.error(f"ОШИБКА: {secret} не задан!")
         raise EnvironmentError(f"ОШИБКА: {secret} не задан! Установи: fly secrets set {secret}=...")
 
 # === Настройки ===
@@ -26,9 +34,10 @@ SYMBOL = "XRP_USDT"
 LEVERAGE = int(os.getenv("LEVERAGE", 10))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-# === Логирование ===
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("mexc-bot")
+logger.info("=== ИНИЦИАЛИЗАЦИЯ MEXC БОТА ===")
+logger.info(f"Символ: {SYMBOL}")
+logger.info(f"Риск: {RISK_PERCENT}%")
+logger.info(f"Плечо: {LEVERAGE}x")
 
 # === Telegram ===
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -44,6 +53,7 @@ class MEXCFuturesAPI:
         self.base_url = "https://contract.mexc.com"
         self.api_key = MEXC_API_KEY
         self.secret_key = MEXC_API_SECRET
+        logger.info("MEXC API клиент инициализирован")
         
     def _sign(self, params):
         """Генерация подписи"""
@@ -71,6 +81,9 @@ class MEXCFuturesAPI:
             
             url = f"{self.base_url}{endpoint}"
             
+            logger.info(f"MEXC API Request: {method} {endpoint}")
+            logger.info(f"Params: {all_params}")
+            
             async with aiohttp.ClientSession() as session:
                 if method == 'GET':
                     async with session.get(url, params=all_params, timeout=10) as response:
@@ -79,7 +92,7 @@ class MEXCFuturesAPI:
                     async with session.post(url, data=all_params, timeout=10) as response:
                         result = await response.json()
                 
-                logger.info(f"MEXC API {method} {endpoint}: {result}")
+                logger.info(f"MEXC API Response: {result}")
                 return result
                 
         except Exception as e:
@@ -88,20 +101,23 @@ class MEXCFuturesAPI:
 
     async def get_account_assets(self):
         """Получить информацию о аккаунте"""
+        logger.info("Запрос баланса аккаунта...")
         return await self._request('GET', '/api/v1/private/account/assets')
 
     async def get_balance(self):
-        """Получить баланс USDT с детальной диагностикой"""
+        """Получить баланс USDT"""
         try:
             result = await self.get_account_assets()
-            logger.info(f"Полный ответ баланса: {result}")
+            logger.info(f"Ответ баланса: {result}")
             
             if not result:
-                raise ValueError("Нет ответа от API")
+                logger.error("Нет ответа от API баланса")
+                return 0.0
                 
             if not result.get('success'):
                 error_msg = result.get('message', 'Unknown error')
-                raise ValueError(f"API Error: {error_msg}")
+                logger.error(f"API Error: {error_msg}")
+                return 0.0
             
             data = result.get('data', [])
             logger.info(f"Данные баланса: {data}")
@@ -116,23 +132,13 @@ class MEXCFuturesAPI:
                     logger.info(f"Найден баланс USDT: {balance}")
                     return balance
             
-            # Если USDT не найден, покажем все доступные валюты
+            # Если USDT не найден
             available_currencies = [f"{a.get('currency')}: {a.get('availableBalance')}" for a in data]
             logger.warning(f"USDT не найден. Доступные валюты: {available_currencies}")
-            
-            await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=f"⚠️ USDT не найден на фьючерсном счете. Доступные валюты: {available_currencies}"
-            )
-            
             return 0.0
             
         except Exception as e:
             logger.error(f"Ошибка получения баланса: {e}")
-            await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=f"❌ Ошибка получения баланса: {str(e)}"
-            )
             return 0.0
 
     async def get_ticker(self, symbol=SYMBOL):
@@ -141,17 +147,20 @@ class MEXCFuturesAPI:
             url = f"{self.base_url}/api/v1/contract/ticker"
             params = {'symbol': symbol}
             
+            logger.info(f"Запрос цены для {symbol}...")
+            
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, params=params, timeout=10) as response:
                     result = await response.json()
-                    logger.info(f"Ticker response: {result}")
+                    logger.info(f"Ответ цены: {result}")
                     
                     if result.get('success'):
                         price = float(result['data']['lastPrice'])
                         logger.info(f"Цена {symbol}: {price}")
                         return price
                     else:
-                        raise Exception(f"Ticker error: {result.get('message')}")
+                        logger.error(f"Ошибка цены: {result.get('message')}")
+                        return 0.0
         except Exception as e:
             logger.error(f"Ошибка получения цены: {e}")
             return 0.0
@@ -169,6 +178,7 @@ class MEXCFuturesAPI:
         if price is not None:
             params['price'] = str(price)
             
+        logger.info(f"Размещение ордера: {params}")
         return await self._request('POST', '/api/v1/private/order/submit', params)
 
     async def place_market_order(self, symbol, side, quantity, position_side=1):
@@ -181,87 +191,42 @@ class MEXCFuturesAPI:
             position_side=position_side
         )
 
-    async def get_positions(self, symbol=SYMBOL):
-        """Получить открытые позиции"""
-        params = {'symbol': symbol}
-        return await self._request('GET', '/api/v1/private/position/list', params)
-
-    async def close_all_positions(self, symbol=SYMBOL):
-        """Закрыть все позиции"""
-        try:
-            result = await self.get_positions(symbol)
-            logger.info(f"Позиции: {result}")
-            
-            if result and result.get('success'):
-                positions = result.get('data', [])
-                
-                for position in positions:
-                    position_amt = float(position.get('position', 0))
-                    if position_amt != 0:
-                        position_side = position.get('positionType')
-                        
-                        if position_side == 1:  # long
-                            close_side = 3  # close long
-                        else:  # short
-                            close_side = 4  # close short
-                        
-                        close_result = await self.place_market_order(
-                            symbol=symbol,
-                            side=close_side,
-                            quantity=abs(position_amt),
-                            position_side=position_side
-                        )
-                        
-                        logger.info(f"Результат закрытия: {close_result}")
-                        return True
-                        
-            return False
-            
-        except Exception as e:
-            logger.error(f"Ошибка закрытия позиций: {e}")
-            return False
-
-    async def set_leverage(self, symbol, leverage, open_type=1, position_type=1):
-        """Установить плечо"""
-        params = {
-            'symbol': symbol,
-            'leverage': leverage,
-            'openType': open_type,
-            'positionType': position_type
-        }
-        return await self._request('POST', '/api/v1/private/position/change_margin', params)
-
 # Создаем клиент API
 mexc_api = MEXCFuturesAPI()
 
 async def check_api_connection():
     """Проверить подключение к API"""
     try:
+        logger.info("🔍 ЗАПУСК ДИАГНОСТИКИ API...")
+        
         # Проверяем баланс
         balance = await mexc_api.get_balance()
+        logger.info(f"Баланс USDT: {balance:.2f}")
         
         # Проверяем цену
         price = await mexc_api.get_ticker()
-        
-        # Проверяем доступные символы
-        url = f"{mexc_api.base_url}/api/v1/contract/detail"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params={'symbol': SYMBOL}) as response:
-                symbol_info = await response.json()
+        logger.info(f"Цена {SYMBOL}: {price:.4f}")
         
         diagnostics = f"""
 🔍 ДИАГНОСТИКА API:
 
 ✅ Баланс USDT: {balance:.2f}
 ✅ Цена {SYMBOL}: {price:.4f}
-✅ Символ {SYMBOL}: {symbol_info.get('success', False)}
-✅ API Key: {len(MEXC_API_KEY) > 0}
+✅ API Key: {'✅ Установлен' if MEXC_API_KEY else '❌ Отсутствует'}
+✅ Secret Key: {'✅ Установлен' if MEXC_API_SECRET else '❌ Отсутствует'}
+✅ Telegram: {'✅ Настроен' if TELEGRAM_TOKEN else '❌ Ошибка'}
 """
         
         logger.info(diagnostics)
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=diagnostics)
         
-        return balance > 0
+        if balance > 0:
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=diagnostics)
+            return True
+        else:
+            error_msg = f"❌ Нет средств на счете. Баланс: {balance} USDT"
+            logger.error(error_msg)
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=error_msg)
+            return False
         
     except Exception as e:
         error_msg = f"❌ Ошибка диагностики API: {str(e)}"
@@ -272,6 +237,8 @@ async def check_api_connection():
 async def calculate_quantity(usd_amount, symbol=SYMBOL):
     """Рассчитать количество для ордера"""
     try:
+        logger.info(f"Расчет количества для {usd_amount} USDT")
+        
         price = await mexc_api.get_ticker(symbol)
         if price <= 0:
             raise ValueError("Не удалось получить цену")
@@ -294,7 +261,7 @@ async def open_position(signal, amount_usd=None):
     global last_trade_info, active_position
     
     try:
-        logger.info(f"=== ОТКРЫТИЕ ПОЗИЦИИ {signal.upper()} ===")
+        logger.info(f"=== ПОПЫТКА ОТКРЫТИЯ ПОЗИЦИИ {signal.upper()} ===")
         
         # Проверяем подключение к API
         if not await check_api_connection():
@@ -320,15 +287,6 @@ async def open_position(signal, amount_usd=None):
             raise ValueError("Неверное количество")
         
         logger.info(f"Количество для ордера: {quantity}")
-        
-        # Закрываем существующие позиции
-        await mexc_api.close_all_positions()
-        await asyncio.sleep(1)
-        
-        # Устанавливаем плечо
-        position_type = 1 if signal == 'buy' else 2
-        leverage_result = await mexc_api.set_leverage(SYMBOL, LEVERAGE, 1, position_type)
-        logger.info(f"Результат установки плеча: {leverage_result}")
         
         # Определяем параметры ордера
         if signal == 'buy':
@@ -363,7 +321,6 @@ async def open_position(signal, amount_usd=None):
             'quantity': quantity,
             'entry_price': entry_price,
             'balance': balance,
-            'order_id': order_result.get('data', {}).get('orderId'),
             'timestamp': time.time()
         }
         
@@ -377,7 +334,7 @@ async def open_position(signal, amount_usd=None):
 Баланс: {balance:.2f} USDT"""
         
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-        logger.info("Позиция успешно открыта")
+        logger.info("🎉 ПОЗИЦИЯ УСПЕШНО ОТКРЫТА!")
         
     except Exception as e:
         error_msg = f"❌ Ошибка открытия позиции: {str(e)}"
@@ -387,9 +344,13 @@ async def open_position(signal, amount_usd=None):
 
 # === FastAPI Routes ===
 @app.on_event("startup")
-async def startup():
+async def startup_event():
+    """Запуск при старте приложения"""
     try:
-        logger.info("=== ЗАПУСК MEXC БОТА ===")
+        logger.info("🚀 FASTAPI STARTUP EVENT ВЫЗВАН")
+        
+        # Ждем немного для инициализации
+        await asyncio.sleep(2)
         
         # Запускаем диагностику
         await check_api_connection()
@@ -397,7 +358,7 @@ async def startup():
         balance = await mexc_api.get_balance()
         price = await mexc_api.get_ticker()
         
-        msg = f"""✅ MEXC Futures Bot запущен!
+        msg = f"""✅ MEXC Futures Bot ЗАПУЩЕН!
 
 Символ: {SYMBOL}
 Риск: {RISK_PERCENT}%
@@ -405,19 +366,26 @@ async def startup():
 Баланс: {balance:.2f} USDT
 Цена {SYMBOL}: ${price:.4f}
 
-Для торговли отправьте webhook сигнал."""
+Готов к работе! Отправьте webhook сигнал."""
         
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-        logger.info("Бот успешно запущен")
+        logger.info("🤖 БОТ УСПЕШНО ЗАПУЩЕН И ГОТОВ К РАБОТЕ")
         
     except Exception as e:
-        error_msg = f"❌ Ошибка запуска: {e}"
+        error_msg = f"❌ ОШИБКА ПРИ СТАРТЕ БОТА: {e}"
         logger.error(error_msg)
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=error_msg)
+        try:
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=error_msg)
+        except:
+            pass
 
 @app.post("/webhook")
 async def webhook(request: Request):
+    """Webhook для получения торговых сигналов"""
+    logger.info("📨 ПОЛУЧЕН WEBHOOK ЗАПРОС")
+    
     if WEBHOOK_SECRET and request.headers.get("Authorization") != f"Bearer {WEBHOOK_SECRET}":
+        logger.warning("Неавторизованный webhook запрос")
         raise HTTPException(401, detail="Unauthorized")
 
     try:
@@ -425,10 +393,15 @@ async def webhook(request: Request):
         signal = data.get("signal")
         amount = data.get("amount")
         
+        logger.info(f"Webhook данные: signal={signal}, amount={amount}")
+        
         if signal not in ["buy", "sell"]:
             return {"status": "error", "message": "signal must be 'buy' or 'sell'"}
         
+        # Запускаем открытие позиции в фоне
         asyncio.create_task(open_position(signal, amount))
+        
+        logger.info(f"✅ Сигнал {signal} принят в обработку")
         return {"status": "ok", "message": f"{signal} signal received"}
         
     except Exception as e:
@@ -437,8 +410,11 @@ async def webhook(request: Request):
 
 @app.get("/")
 async def home():
+    """Главная страница"""
     global last_trade_info, active_position
     status = "АКТИВНА" if active_position else "НЕТ"
+    
+    logger.info("📊 Запрос главной страницы")
     
     html = f"""
     <html>
@@ -480,12 +456,16 @@ async def home():
 
 @app.get("/balance")
 async def get_balance():
+    """Проверить баланс"""
+    logger.info("Запрос баланса через API")
     balance = await mexc_api.get_balance()
     return {"balance": balance, "currency": "USDT"}
 
 @app.get("/diagnostics")
 async def diagnostics():
     """Страница диагностики"""
+    logger.info("Запрос страницы диагностики")
+    
     balance = await mexc_api.get_balance()
     price = await mexc_api.get_ticker()
     
@@ -508,17 +488,7 @@ async def diagnostics():
     """
     return HTMLResponse(html)
 
-@app.post("/close")
-async def close_positions():
-    result = await mexc_api.close_all_positions()
-    if result:
-        global active_position
-        active_position = False
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="✅ Все позиции закрыты")
-        return {"status": "ok", "message": "Positions closed"}
-    else:
-        return {"status": "error", "message": "No positions to close"}
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    logger.info("🚀 ЗАПУСК UVICORN СЕРВЕРА")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
