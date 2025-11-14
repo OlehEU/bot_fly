@@ -17,13 +17,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mexc-bot")
 
-# === Проверка секретов ===
-REQUIRED_SECRETS = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "MEXC_API_KEY", "MEXC_API_SECRET", "WEBHOOK_SECRET"]
-for secret in REQUIRED_SECRETS:
-    if not os.getenv(secret):
-        logger.error(f"ОШИБКА: {secret} не задан!")
-        raise EnvironmentError(f"ОШИБКА: {secret} не задан! Установи: fly secrets set {secret}=...")
-
 # === Настройки ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
@@ -44,7 +37,7 @@ app = FastAPI()
 last_trade_info = None
 active_position = False
 
-# === MEXC API Client ===
+# === MEXC API Client (ИСПРАВЛЕННАЯ ВЕРСИЯ) ===
 class MEXCFuturesAPI:
     def __init__(self):
         self.base_url = "https://contract.mexc.com"
@@ -53,46 +46,61 @@ class MEXCFuturesAPI:
         logger.info("MEXC Futures API клиент инициализирован")
         
     def _sign(self, params):
-        """Генерация подписи для фьючерсов"""
+        """Генерация подписи - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
+        # Сортируем параметры по ключу
         sorted_params = sorted(params.items())
+        # Создаем строку для подписи
         query_string = '&'.join([f"{k}={v}" for k, v in sorted_params])
+        logger.info(f"Строка для подписи: {query_string}")
+        
         signature = hmac.new(
             self.secret_key.encode('utf-8'),
             query_string.encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
+        logger.info(f"Сгенерированная подпись: {signature}")
         return signature
 
     async def _request(self, method, endpoint, params=None):
-        """Универсальный метод запроса"""
+        """Универсальный метод запроса - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
         try:
             timestamp = str(int(time.time() * 1000))
+            
+            # Базовые параметры
             all_params = {
                 'api_key': self.api_key,
                 'req_time': timestamp,
-                **(params or {})
             }
             
+            # Добавляем пользовательские параметры если есть
+            if params:
+                all_params.update(params)
+            
+            # Генерируем подпись ДО добавления sign
             signature = self._sign(all_params)
+            
+            # Добавляем подпись в параметры
             all_params['sign'] = signature
             
             url = f"{self.base_url}{endpoint}"
             
-            logger.info(f"MEXC Futures API Request: {method} {endpoint}")
+            logger.info(f"MEXC API Request: {method} {endpoint}")
+            logger.info(f"Params: {all_params}")
             
             async with aiohttp.ClientSession() as session:
                 if method == 'GET':
                     async with session.get(url, params=all_params, timeout=10) as response:
                         result = await response.json()
                 else:
+                    # Для POST используем data, а не params
                     async with session.post(url, data=all_params, timeout=10) as response:
                         result = await response.json()
                 
-                logger.info(f"MEXC Futures API Response: {result}")
+                logger.info(f"MEXC API Response: {result}")
                 return result
                 
         except Exception as e:
-            logger.error(f"Ошибка MEXC Futures API {endpoint}: {e}")
+            logger.error(f"Ошибка MEXC API {endpoint}: {e}")
             return None
 
     async def get_account_assets(self):
@@ -101,67 +109,75 @@ class MEXCFuturesAPI:
         return await self._request('GET', '/api/v1/private/account/assets')
 
     async def get_balance(self):
-        """Получить баланс USDT на фьючерсном счете"""
+        """Получить баланс USDT на фьючерсном счете - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
         try:
             result = await self.get_account_assets()
+            logger.info(f"Полный ответ баланса: {result}")
             
             if not result:
-                logger.error("Нет ответа от API фьючерсов")
+                logger.error("Нет ответа от API")
                 return 0.0
                 
             if not result.get('success'):
                 error_msg = result.get('message', 'Unknown error')
-                logger.error(f"Futures API Error: {error_msg}")
+                error_code = result.get('code', 'No code')
+                logger.error(f"API Error {error_code}: {error_msg}")
+                
+                # Диагностика ошибки
+                if error_code == 401:
+                    logger.error("Ошибка 401: Проверьте API ключ и секрет")
+                elif error_code == 400:
+                    logger.error("Ошибка 400: Неверные параметры запроса")
+                    
                 return 0.0
             
             data = result.get('data', [])
-            logger.info(f"Данные фьючерсного баланса: {data}")
+            logger.info(f"Данные баланса: {data}")
             
             for asset in data:
                 currency = asset.get('currency')
                 available = asset.get('availableBalance')
                 wallet_balance = asset.get('walletBalance')
-                logger.info(f"Фьючерсный актив: {currency}, доступно: {available}, баланс кошелька: {wallet_balance}")
+                logger.info(f"Актив: {currency}, доступно: {available}, баланс: {wallet_balance}")
                 
                 if currency == 'USDT':
                     balance = float(available or 0)
-                    logger.info(f"Найден фьючерсный баланс USDT: {balance}")
+                    logger.info(f"Найден баланс USDT: {balance}")
                     return balance
             
-            # Если USDT не найден
-            available_currencies = [f"{a.get('currency')}: {a.get('availableBalance')}" for a in data]
-            logger.warning(f"USDT не найден на фьючерсном счете. Доступные валюты: {available_currencies}")
+            logger.warning("USDT не найден в ответе")
             return 0.0
             
         except Exception as e:
-            logger.error(f"Ошибка получения фьючерсного баланса: {e}")
+            logger.error(f"Ошибка получения баланса: {e}")
             return 0.0
 
     async def get_ticker(self, symbol=SYMBOL):
-        """Получить тикер фьючерсов"""
+        """Получить тикер"""
         try:
             url = f"{self.base_url}/api/v1/contract/ticker"
             params = {'symbol': symbol}
             
-            logger.info(f"Запрос цены фьючерсов для {symbol}...")
+            logger.info(f"Запрос цены для {symbol}...")
             
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, params=params, timeout=10) as response:
                     result = await response.json()
+                    logger.info(f"Ответ цены: {result}")
                     
                     if result.get('success'):
                         price = float(result['data']['lastPrice'])
-                        logger.info(f"Цена фьючерсов {symbol}: {price}")
+                        logger.info(f"Цена {symbol}: {price}")
                         return price
                     else:
-                        logger.error(f"Ошибка цены фьючерсов: {result.get('message')}")
+                        logger.error(f"Ошибка цены: {result.get('message')}")
                         return 0.0
         except Exception as e:
-            logger.error(f"Ошибка получения цены фьючерсов: {e}")
+            logger.error(f"Ошибка получения цены: {e}")
             return 0.0
 
     async def place_order(self, symbol, side, order_type, quantity, price=None, position_side=1):
-        """Разместить ордер на фьючерсы"""
+        """Разместить ордер"""
         params = {
             'symbol': symbol,
             'positionType': position_side,
@@ -173,11 +189,11 @@ class MEXCFuturesAPI:
         if price is not None:
             params['price'] = str(price)
             
-        logger.info(f"Размещение фьючерсного ордера: {params}")
+        logger.info(f"Размещение ордера: {params}")
         return await self._request('POST', '/api/v1/private/order/submit', params)
 
     async def place_market_order(self, symbol, side, quantity, position_side=1):
-        """Разместить рыночный ордер на фьючерсы"""
+        """Разместить рыночный ордер"""
         return await self.place_order(
             symbol=symbol,
             side=side,
@@ -186,158 +202,75 @@ class MEXCFuturesAPI:
             position_side=position_side
         )
 
-class MEXCSpotAPI:
-    def __init__(self):
-        self.base_url = "https://api.mexc.com"
-        self.api_key = MEXC_API_KEY
-        self.secret_key = MEXC_API_SECRET
-        logger.info("MEXC Spot API клиент инициализирован")
-        
-    def _sign(self, params):
-        """Генерация подписи для спота"""
-        query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
-        signature = hmac.new(
-            self.secret_key.encode('utf-8'),
-            query_string.encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
-        return signature
+# Создаем клиент API
+mexc_api = MEXCFuturesAPI()
 
-    async def get_spot_balance(self):
-        """Получить баланс спотового счета"""
-        try:
-            timestamp = str(int(time.time() * 1000))
-            params = {
-                'timestamp': timestamp,
-                'recvWindow': '5000'
-            }
-            
-            signature = self._sign(params)
-            params['signature'] = signature
-            
-            url = f"{self.base_url}/api/v3/account"
-            
-            headers = {
-                'X-MEXC-APIKEY': self.api_key
-            }
-            
-            logger.info("Запрос спотового баланса...")
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params, headers=headers, timeout=10) as response:
-                    result = await response.json()
-                    logger.info(f"Spot баланс ответ: {result}")
-                    
-                    if 'balances' in result:
-                        for balance in result['balances']:
-                            asset = balance['asset']
-                            free = float(balance['free'])
-                            if asset == 'USDT' and free > 0:
-                                logger.info(f"Найден спотовый баланс USDT: {free}")
-                                return free
-                    
-                    logger.warning("USDT не найден на спотовом счете")
-                    return 0.0
-                    
-        except Exception as e:
-            logger.error(f"Ошибка получения спотового баланса: {e}")
-            return 0.0
-
-# Создаем клиенты API
-mexc_futures = MEXCFuturesAPI()
-mexc_spot = MEXCSpotAPI()
-
-async def transfer_to_futures(amount=None):
-    """Перевести средства с спота на фьючерсы"""
+async def test_api_connection():
+    """Тестирование подключения к API"""
     try:
-        logger.info("Попытка перевода средств на фьючерсный счет...")
+        logger.info("🔧 ТЕСТИРОВАНИЕ API ПОДКЛЮЧЕНИЯ")
         
-        # Получаем спотовый баланс
-        spot_balance = await mexc_spot.get_spot_balance()
-        logger.info(f"Спотовый баланс USDT: {spot_balance}")
+        # Тест 1: Проверка баланса
+        balance = await mexc_api.get_balance()
+        logger.info(f"Баланс: {balance}")
         
-        if spot_balance <= 0:
-            logger.error("Нет средств на спотовом счете для перевода")
-            return False
-            
-        # Определяем сумму для перевода
-        transfer_amount = amount or spot_balance
-        if transfer_amount > spot_balance:
-            transfer_amount = spot_balance
-            
-        logger.info(f"Попытка перевода {transfer_amount} USDT на фьючерсный счет")
+        # Тест 2: Проверка цены
+        price = await mexc_api.get_ticker()
+        logger.info(f"Цена: {price}")
         
-        # Здесь должен быть код для перевода средств
-        # MEXC API для перевода требует отдельного endpoint
+        # Тест 3: Проверка доступности символа
+        url = f"{mexc_api.base_url}/api/v1/contract/detail"
+        params = {'symbol': SYMBOL}
         
-        # Временно просто сообщим о необходимости ручного перевода
-        msg = f"""⚠️ НУЖЕН РУЧНОЙ ПЕРЕВОД!
-
-На спотовом счете: {spot_balance:.2f} USDT
-На фьючерсном счете: 0 USDT
-
-Переведите средства вручную:
-1. Откройте MEXC
-2. Перейдите в "Futures"
-3. Нажмите "Transfer"
-4. Переведите USDT с Spot на Futures
-5. Минимум: 5 USDT"""
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as response:
+                symbol_info = await response.json()
+                logger.info(f"Информация о символе: {symbol_info}")
         
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-        return False
+        return balance >= 0 and price > 0
         
     except Exception as e:
-        logger.error(f"Ошибка перевода на фьючерсы: {e}")
+        logger.error(f"Ошибка тестирования API: {e}")
         return False
 
 async def check_api_connection():
-    """Проверить подключение к API и балансы"""
+    """Проверить подключение к API"""
     try:
-        logger.info("🔍 ЗАПУСК ПОЛНОЙ ДИАГНОСТИКИ...")
+        logger.info("🔍 ПРОВЕРКА ПОДКЛЮЧЕНИЯ К API...")
         
-        # Проверяем фьючерсный баланс
-        futures_balance = await mexc_futures.get_balance()
-        logger.info(f"Фьючерсный баланс USDT: {futures_balance:.2f}")
-        
-        # Проверяем спотовый баланс
-        spot_balance = await mexc_spot.get_spot_balance()
-        logger.info(f"Спотовый баланс USDT: {spot_balance:.2f}")
+        # Проверяем баланс
+        balance = await mexc_api.get_balance()
+        logger.info(f"Баланс USDT: {balance:.2f}")
         
         # Проверяем цену
-        price = await mexc_futures.get_ticker()
-        logger.info(f"Цена фьючерсов {SYMBOL}: {price:.4f}")
+        price = await mexc_api.get_ticker()
+        logger.info(f"Цена {SYMBOL}: {price:.4f}")
         
         diagnostics = f"""
-🔍 ДИАГНОСТИКА СИСТЕМЫ:
+🔍 ДИАГНОСТИКА API:
 
-💰 БАЛАНСЫ:
-• Фьючерсный счет: {futures_balance:.2f} USDT
-• Спотовый счет: {spot_balance:.2f} USDT
+💰 Баланс: {balance:.2f} USDT
+📊 Символ: {SYMBOL}
+💰 Цена: ${price:.4f}
+⚡ Плечо: {LEVERAGE}x
+🎯 Риск: {RISK_PERCENT}%
 
-📊 ТОРГОВЛЯ:
-• Символ: {SYMBOL}
-• Цена: ${price:.4f}
-• Риск: {RISK_PERCENT}%
-• Плечо: {LEVERAGE}x
-
-🔑 API:
-• API Key: {'✅' if MEXC_API_KEY else '❌'}
-• Secret Key: {'✅' if MEXC_API_SECRET else '❌'}
+💡 СТАТУС: {'✅ ГОТОВ К ТОРГОВЛЕ' if balance > 5 else '⚠️ МАЛО СРЕДСТВ'}
 """
         
         logger.info(diagnostics)
         
-        # Отправляем диагностику в Telegram
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=diagnostics)
-        
-        # Если на фьючерсном счете нет средств, но есть на спотовом
-        if futures_balance <= 0 and spot_balance > 0:
-            await transfer_to_futures()
-            
-        return futures_balance > 0
+        if balance > 0:
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=diagnostics)
+            return True
+        else:
+            error_msg = f"❌ Нет средств на счете. Баланс: {balance} USDT"
+            logger.error(error_msg)
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=error_msg)
+            return False
         
     except Exception as e:
-        error_msg = f"❌ Ошибка диагностики: {str(e)}"
+        error_msg = f"❌ Ошибка диагностики API: {str(e)}"
         logger.error(error_msg)
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=error_msg)
         return False
@@ -347,9 +280,9 @@ async def calculate_quantity(usd_amount, symbol=SYMBOL):
     try:
         logger.info(f"Расчет количества для {usd_amount} USDT")
         
-        price = await mexc_futures.get_ticker(symbol)
+        price = await mexc_api.get_ticker(symbol)
         if price <= 0:
-            raise ValueError("Не удалось получить цену фьючерсов")
+            raise ValueError("Не удалось получить цену")
         
         quantity = usd_amount / price
         quantity = round(quantity, 1)  # Округляем до 1 знака
@@ -371,16 +304,16 @@ async def open_position(signal, amount_usd=None):
     try:
         logger.info(f"=== ПОПЫТКА ОТКРЫТИЯ ПОЗИЦИИ {signal.upper()} ===")
         
-        # Проверяем подключение к API и балансы
+        # Проверяем подключение к API
         if not await check_api_connection():
             raise ValueError("Проблемы с подключением к API или нет средств")
         
-        # Получаем фьючерсный баланс
-        balance = await mexc_futures.get_balance()
-        logger.info(f"Фьючерсный баланс: {balance} USDT")
+        # Получаем баланс
+        balance = await mexc_api.get_balance()
+        logger.info(f"Баланс: {balance} USDT")
         
         if balance <= 5:
-            raise ValueError(f"Недостаточно средств на фьючерсном счете: {balance} USDT. Минимум 5 USDT требуется.")
+            raise ValueError(f"Недостаточно средств: {balance} USDT. Минимум 5 USDT требуется.")
         
         # Определяем сумму для торговли
         usd_amount = amount_usd or (balance * RISK_PERCENT / 100)
@@ -405,7 +338,7 @@ async def open_position(signal, amount_usd=None):
             position_side = 2  # short
         
         # Размещаем рыночный ордер
-        order_result = await mexc_futures.place_market_order(
+        order_result = await mexc_api.place_market_order(
             symbol=SYMBOL,
             side=order_side,
             quantity=quantity,
@@ -419,7 +352,7 @@ async def open_position(signal, amount_usd=None):
             raise ValueError(f"Ошибка ордера: {error_msg}")
         
         # Получаем цену входа
-        entry_price = await mexc_futures.get_ticker(SYMBOL)
+        entry_price = await mexc_api.get_ticker(SYMBOL)
         
         # Сохраняем информацию о сделке
         active_position = True
@@ -460,11 +393,14 @@ async def startup_event():
         # Ждем немного для инициализации
         await asyncio.sleep(3)
         
-        # Запускаем полную диагностику
+        # Тестируем API подключение
+        await test_api_connection()
+        
+        # Запускаем диагностику
         await check_api_connection()
         
-        futures_balance = await mexc_futures.get_balance()
-        price = await mexc_futures.get_ticker()
+        balance = await mexc_api.get_balance()
+        price = await mexc_api.get_ticker()
         
         msg = f"""✅ MEXC Futures Bot ЗАПУЩЕН!
 
@@ -472,11 +408,11 @@ async def startup_event():
 • Символ: {SYMBOL}
 • Риск: {RISK_PERCENT}%
 • Плечо: {LEVERAGE}x
-• Фьючерсный баланс: {futures_balance:.2f} USDT
+• Баланс: {balance:.2f} USDT
 • Цена: ${price:.4f}
 
 💡 ДЕЙСТВИЯ:
-{f"✅ Готов к работе! Отправьте webhook сигнал." if futures_balance > 5 else "⚠️ Переведите USDT на фьючерсный счет!"}"""
+{f"✅ Готов к работе! Отправьте webhook сигнал." if balance > 5 else "⚠️ Пополните счет минимум 5 USDT!"}"""
         
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         logger.info("🤖 БОТ УСПЕШНО ЗАПУЩЕН")
@@ -523,9 +459,8 @@ async def home():
     """Главная страница"""
     global last_trade_info, active_position
     
-    futures_balance = await mexc_futures.get_balance()
-    spot_balance = await mexc_spot.get_spot_balance()
-    price = await mexc_futures.get_ticker()
+    balance = await mexc_api.get_balance()
+    price = await mexc_api.get_ticker()
     
     status = "АКТИВНА" if active_position else "НЕТ"
     
@@ -548,9 +483,8 @@ async def home():
             <h1 class="success">🤖 MEXC Futures Trading Bot</h1>
             
             <div class="card">
-                <h3>💰 БАЛАНСЫ</h3>
-                <p><b>Фьючерсный счет:</b> <span class="{'success' if futures_balance > 0 else 'error'}">{futures_balance:.2f} USDT</span></p>
-                <p><b>Спотовый счет:</b> <span class="{'success' if spot_balance > 0 else 'warning'}">{spot_balance:.2f} USDT</span></p>
+                <h3>💰 БАЛАНС</h3>
+                <p><b>Фьючерсный счет:</b> <span class="{'success' if balance > 0 else 'error'}">{balance:.2f} USDT</span></p>
             </div>
             
             <div class="card">
@@ -581,12 +515,10 @@ async def home():
 async def get_balance():
     """Проверить баланс"""
     logger.info("Запрос баланса через API")
-    futures_balance = await mexc_futures.get_balance()
-    spot_balance = await mexc_spot.get_spot_balance()
+    balance = await mexc_api.get_balance()
     
     return {
-        "futures_balance": futures_balance,
-        "spot_balance": spot_balance,
+        "balance": balance,
         "currency": "USDT"
     }
 
@@ -595,9 +527,8 @@ async def diagnostics():
     """Страница диагностики"""
     logger.info("Запрос страницы диагностики")
     
-    futures_balance = await mexc_futures.get_balance()
-    spot_balance = await mexc_spot.get_spot_balance()
-    price = await mexc_futures.get_ticker()
+    balance = await mexc_api.get_balance()
+    price = await mexc_api.get_ticker()
     
     html = f"""
     <html>
@@ -605,9 +536,8 @@ async def diagnostics():
         <body style="font-family: Arial; background: #1e1e1e; color: white; padding: 20px;">
             <h1>🔧 Диагностика системы</h1>
             <div style="background: #2d2d2d; padding: 20px; border-radius: 10px;">
-                <h3>💰 БАЛАНСЫ</h3>
-                <p><b>Фьючерсный счет:</b> {futures_balance:.2f} USDT</p>
-                <p><b>Спотовый счет:</b> {spot_balance:.2f} USDT</p>
+                <h3>💰 БАЛАНС</h3>
+                <p><b>Фьючерсный счет:</b> {balance:.2f} USDT</p>
                 
                 <h3>📊 ТОРГОВЛЯ</h3>
                 <p><b>Символ:</b> {SYMBOL}</p>
