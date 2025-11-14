@@ -30,7 +30,7 @@ TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
 MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", 25))
-SYMBOL = os.getenv("SYMBOL", "XRP/USDT:USDT")
+SYMBOL = os.getenv("SYMBOL", "XRP/USDT:USDT")  # Используем стандартный формат ccxt
 LEVERAGE = int(os.getenv("LEVERAGE", 10))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
@@ -65,7 +65,7 @@ async def get_current_price(symbol: str = SYMBOL) -> float:
         return 0.0
 
 async def check_balance() -> float:
-    """Проверить баланс USDT через ccxt (как в рабочем коде)"""
+    """Проверить баланс USDT через ccxt"""
     logger.info("Проверка баланса USDT...")
     try:
         balance_data = await exchange.fetch_balance()
@@ -74,14 +74,34 @@ async def check_balance() -> float:
         return float(usdt)
     except Exception as e:
         logger.error(f"Ошибка баланса: {e}")
-        try:
-            await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=f"БАЛАНС = 0 USDT\nОшибка: {e}\n\nПроверь:\n1. API ключ\n2. IP в MEXC\n3. USDT на счёте"
-            )
-        except:
-            pass
         return 0.0
+
+async def set_leverage_with_params(symbol: str, leverage: int, side: str):
+    """Установить плечо с правильными параметрами для MEXC"""
+    try:
+        # Параметры для MEXC
+        params = {
+            'openType': 1,  # 1 = isolated, 2 = cross
+            'positionType': 1 if side == 'buy' else 2  # 1 = long, 2 = short
+        }
+        
+        await exchange.set_leverage(leverage, symbol, params)
+        logger.info(f"Плечо {leverage}x установлено для {side}")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка установки плеча: {e}")
+        return False
+
+async def set_margin_mode_for_mexc(symbol: str):
+    """Установить режим маржи для MEXC"""
+    try:
+        # MEXC автоматически устанавливает режим маржи через параметры в set_leverage
+        # Не нужно вызывать отдельно set_margin_mode
+        logger.info("Режим маржи устанавливается автоматически через set_leverage")
+        return True
+    except Exception as e:
+        logger.warning(f"Не критичная ошибка режима маржи: {e}")
+        return True
 
 async def calculate_qty(usd_amount: float) -> float:
     """Рассчитать количество для ордера"""
@@ -92,25 +112,21 @@ async def calculate_qty(usd_amount: float) -> float:
         precision = market['precision']['amount']
         ticker = await exchange.fetch_ticker(SYMBOL)
         price = ticker['last']
-        logger.info(f"Цена {SYMBOL}: {price:.2f} USDT")
+        logger.info(f"Цена {SYMBOL}: {price:.6f} USDT")
         raw_qty = usd_amount / price
-        logger.info(f"Сырой qty: {usd_amount} / {price:.2f} = {raw_qty:.6f}")
+        logger.info(f"Сырой qty: {usd_amount} / {price:.6f} = {raw_qty:.8f}")
         qty = exchange.amount_to_precision(SYMBOL, raw_qty)
         qty = float(qty)
+        
+        # Проверяем минимальное количество
         if qty < min_qty:
-            raise ValueError(f"qty {qty} < min {min_qty}")
+            logger.warning(f"qty {qty} < min {min_qty}, используем минимальное")
+            qty = min_qty
+            
         logger.info(f"Финальный qty: {qty} (min: {min_qty}, шаг: {precision})")
         return qty
     except Exception as e:
         logger.error(f"Ошибка qty: {e}")
-        try:
-            balance = await check_balance()
-            await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=f"Ошибка qty: {e}\nБаланс: {balance:.2f} USDT"
-            )
-        except:
-            pass
         return 0.0
 
 async def close_existing_positions():
@@ -141,16 +157,12 @@ async def check_all_balances():
         try:
             balance_data = await exchange.fetch_balance()
             total_balance = balance_data['total']
-            free_balance = balance_data['free']
-            used_balance = balance_data['used']
             
             # Формируем отчет по всем валютам с балансом > 0
             balances_report = []
             for currency, total in total_balance.items():
                 if total > 0:
-                    free = free_balance.get(currency, 0)
-                    used = used_balance.get(currency, 0)
-                    balances_report.append(f"  • {currency}: {total:.4f} (свободно: {free:.4f})")
+                    balances_report.append(f"  • {currency}: {total:.4f}")
             
             balances_text = "\n".join(balances_report) if balances_report else "  • Нет средств"
             
@@ -192,7 +204,7 @@ async def check_all_balances():
         return False
 
 async def open_position(signal: str, amount_usd=None):
-    """Открыть позицию (как в рабочем коде)"""
+    """Открыть позицию с исправленной установкой плеча"""
     global last_trade_info, active_position
     
     try:
@@ -202,14 +214,10 @@ async def open_position(signal: str, amount_usd=None):
         if not await check_all_balances():
             raise ValueError("Проблемы с балансом или недостаточно средств")
         
-        # Проверяем, есть ли уже открытая позиция
-        positions = await exchange.fetch_positions([SYMBOL])
-        for pos in positions:
-            if pos['contracts'] and float(pos['contracts']) > 0:
-                logger.info(f"Позиция уже открыта: {pos['side']} {pos['contracts']} - закрываем сначала")
-                close_side = 'sell' if pos['side'] == 'long' else 'buy'
-                await exchange.create_market_order(SYMBOL, close_side, abs(float(pos['contracts'])))
-                await asyncio.sleep(1)
+        # Закрываем существующие позиции
+        had_position = await close_existing_positions()
+        if had_position:
+            await asyncio.sleep(2)
 
         balance = await check_balance()
         if balance <= 0:
@@ -221,10 +229,6 @@ async def open_position(signal: str, amount_usd=None):
         if usd < 5:
             raise ValueError(f"Слишком маленький лот: {usd:.2f} USDT (мин. 5 USDT)")
 
-        # Устанавливаем плечо и режим маржи
-        await exchange.set_leverage(LEVERAGE, SYMBOL)
-        await exchange.set_margin_mode('isolated', SYMBOL)
-        
         # Рассчитываем количество
         qty = await calculate_qty(usd)
         if qty <= 0:
@@ -233,23 +237,27 @@ async def open_position(signal: str, amount_usd=None):
         side = "buy" if signal.lower() == "buy" else "sell"
         logger.info(f"Открываем {side.upper()} {qty} {SYMBOL}")
 
+        # Устанавливаем плечо с правильными параметрами
+        leverage_success = await set_leverage_with_params(SYMBOL, LEVERAGE, side)
+        if not leverage_success:
+            logger.warning("Не удалось установить плечо, пробуем продолжить")
+
         # Создаем рыночный ордер
         order = await exchange.create_market_order(SYMBOL, side, qty)
         logger.info(f"Ордер создан: {order}")
 
         # Получаем цену входа
-        if order['filled'] > 0:
-            entry = order['average'] or await get_current_price()
-        else:
-            entry = await get_current_price()
+        entry = await get_current_price()
+        if order.get('filled', 0) > 0 and order.get('average'):
+            entry = order['average']
 
         # Рассчитываем TP/SL
         if side == "buy":
-            tp = entry * 1.015  # +1.5%
-            sl = entry * 0.99   # -1%
+            tp = round(entry * 1.015, 6)  # +1.5%
+            sl = round(entry * 0.99, 6)   # -1%
         else:
-            tp = entry * 0.985  # -1.5%
-            sl = entry * 1.01   # +1%
+            tp = round(entry * 0.985, 6)  # -1.5%
+            sl = round(entry * 1.01, 6)   # +1%
 
         # Создаем TP/SL ордера (лимитные)
         try:
@@ -277,11 +285,13 @@ async def open_position(signal: str, amount_usd=None):
         active_position = True
         last_trade_info = {
             "signal": signal, 
+            "side": side,
             "qty": qty, 
             "entry": entry, 
             "tp": tp, 
             "sl": sl,
-            "order_id": order['id']
+            "order_id": order.get('id', 'N/A'),
+            "timestamp": time.time()
         }
 
         msg = (f"✅ {side.upper()} ОТКРЫТА\n"
@@ -295,7 +305,7 @@ async def open_position(signal: str, amount_usd=None):
         logger.info(msg)
 
     except Exception as e:
-        err_msg = f"❌ Ошибка открытия {signal}: {str(e)}\nБаланс: {await check_balance():.2f} USDT"
+        err_msg = f"❌ Ошибка открытия {signal}: {str(e)}"
         logger.error(err_msg)
         try:
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=err_msg)
@@ -423,13 +433,11 @@ async def balances_page():
     try:
         balance_data = await exchange.fetch_balance()
         total_balance = balance_data['total']
-        free_balance = balance_data['free']
         
         balances_html = ""
         for currency, total in total_balance.items():
             if total > 0:
-                free = free_balance.get(currency, 0)
-                balances_html += f'<p><b>{currency}:</b> {total:.4f} (свободно: {free:.4f})</p>'
+                balances_html += f'<p><b>{currency}:</b> {total:.4f}</p>'
         
         if not balances_html:
             balances_html = "<p>Нет средств на счете</p>"
