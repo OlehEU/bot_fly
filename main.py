@@ -54,17 +54,21 @@ active_position = False
 async def set_initial_settings():
     """Установить режим маржи и кредитное плечо при запуске."""
     try:
-        # 1. Установка режима маржи (Cross/Isolated)
-        # Для простоты используем Cross (Кросс-маржа), который обычно является безопасным дефолтом.
-        logger.info(f"Установка кросс-маржи для {SYMBOL}...")
-        await exchange.set_margin_mode('cross', SYMBOL) 
-        
-        # 2. Установка кредитного плеча
+        # 1. Установка кредитного плеча. (Должно предшествовать установке режима маржи)
         logger.info(f"Установка кредитного плеча: {LEVERAGE}x для {SYMBOL}...")
         await exchange.set_leverage(LEVERAGE, SYMBOL)
         
+        # 2. Установка режима маржи (Cross/Isolated).
+        # ИСПРАВЛЕНИЕ: Согласно логам, для MEXC setMarginMode требует передачи плеча в параметрах.
+        margin_mode = 'cross'
+        logger.info(f"Установка {margin_mode}-маржи для {SYMBOL} (с плечом {LEVERAGE}x)...")
+        
+        # Передаем leverage в params, чтобы выполнить требование MEXC API
+        await exchange.set_margin_mode(margin_mode, SYMBOL, params={'leverage': LEVERAGE})
+        
         logger.info("Настройки маржи и плеча успешно применены.")
     except Exception as e:
+        # Примечание: Эта ошибка может возникать, если позиция уже открыта.
         logger.warning(f"Ошибка установки маржи/плеча. Проверьте, что позиция закрыта: {e}")
 
 async def get_current_price() -> float:
@@ -81,14 +85,15 @@ async def get_current_price() -> float:
 async def check_balance() -> float:
     """Проверить баланс USDT на фьючерсном аккаунте"""
     try:
-        # Явно запрашиваем баланс для фьючерсного аккаунта (если поддерживается)
-        balance_data = await exchange.fetch_balance({'type': 'future'})
+        # ИСПРАВЛЕНИЕ: Убираем явный type='future', который вызвал ошибку "not support self method".
+        # Полагаемся на 'defaultType': 'swap' для приоритета фьючерсного баланса.
+        balance_data = await exchange.fetch_balance()
         
-        # MEXC использует 'USDT' в total/free. Для фьючерсов лучше смотреть 'free' или 'used' в 'info'
+        # MEXC использует 'USDT' в total/free для фьючерсов
         usdt_free = balance_data.get('free', {}).get('USDT', 0)
         
         # Запасной вариант: берем общий баланс USDT, если 'free' не сработает
-        if usdt_free == 0:
+        if usdt_free == 0 and balance_data.get('total', {}).get('USDT', 0) > 0:
             usdt_free = balance_data.get('total', {}).get('USDT', 0)
 
         logger.info(f"Свободный баланс USDT (Futures): {usdt_free:.4f}")
@@ -107,7 +112,6 @@ async def calculate_qty(usd_amount: float) -> float:
         if price <= 0:
             raise ValueError("Не удалось получить цену")
             
-        # --- ИСПРАВЛЕНИЕ: Учет кредитного плеча ---
         # 1. Рассчитываем нольциональный объем (Notional Value)
         # Нольциональный объем = Маржа * Плечо
         notional_value = usd_amount * LEVERAGE
@@ -124,8 +128,8 @@ async def calculate_qty(usd_amount: float) -> float:
         quantity = exchange.decimal_to_precision(quantity, ccxt.ROUND, amount_precision)
         quantity = float(quantity)
         
+        # MEXC часто имеет минимальный размер лота. Убеждаемся, что Qty >= 1
         if quantity < 1:
-            # MEXC часто имеет минимальный размер лота. Если расчет слишком мал, ставим минимум (можно настроить)
             quantity = 1.0 
             
         logger.info(f"Рассчитано: (Маржа: {usd_amount:.2f} * Плечо: {LEVERAGE}) / Цена: {price:.4f} = Qty: {quantity}")
@@ -146,7 +150,6 @@ async def open_position(signal: str, amount_usd=None):
              logger.info("Позиция уже открыта. Пропускаем сигнал.")
              return
         
-        # --- ИСПРАВЛЕНИЕ: Установка настроек перед сделкой ---
         # Убеждаемся, что плечо и режим маржи установлены
         await set_initial_settings()
         
@@ -155,6 +158,7 @@ async def open_position(signal: str, amount_usd=None):
         
         MIN_ORDER_USDT = 5.0 # Минимальный размер ордера, может отличаться
         
+        # ИСПРАВЛЕНИЕ: Теперь баланс должен быть корректным, и эта проверка будет работать правильно.
         if balance <= MIN_ORDER_USDT:
             raise ValueError(f"Недостаточно средств. Свободный баланс: {balance:.2f} USDT")
 
@@ -180,8 +184,7 @@ async def open_position(signal: str, amount_usd=None):
         order = await exchange.create_market_order(SYMBOL, side, qty)
         logger.info(f"Ордер создан: {order}")
 
-        # --- ИСПРАВЛЕНИЕ: Использование фактической цены входа ---
-        # Цена входа должна быть средней ценой исполнения ордера, а не текущей ценой
+        # Использование фактической средней цены исполнения ордера
         entry = order.get('average', order.get('price')) 
         if not entry:
              entry = await get_current_price() # Запасной вариант, если биржа не вернула цену немедленно
