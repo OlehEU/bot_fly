@@ -1,46 +1,532 @@
-# fly.toml
-app = "bot-fly-b7iqvq"
-primary_region = "fra"
+# main.py — MEXC Futures Bot (Async HTTPS + httpx)
+import os
+import json
+import asyncio
+import logging
+import time
+import traceback
+import hmac
+import hashlib
+from contextlib import asynccontextmanager
+import ccxt.async_support as ccxt
+import httpx
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse
+from telegram import Bot
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
-[vm]
-  memory = "1gb"
-  cpu_kind = "shared"
-  cpus = 1
+# === НАСТРОЙКА ЛОГИРОВАНИЯ ===
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("mexc-bot")
 
-[build]
-  # Fly сам соберёт образ из Dockerfile
-  # Ничего не указываем — используем Dockerfile
+# === КОНФИГУРАЦИЯ ===
+REQUEST_TIMEOUT = 30
+MAX_RETRIES = 3
+RETRY_DELAY = 2
+RATE_LIMIT = "10/minute"
 
-[[services]]
-  internal_port = 8000
-  protocol = "tcp"
+# === СЕКРЕТЫ / ПАРАМЕТРЫ ===
+REQUIRED_SECRETS = [
+    "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "MEXC_API_KEY",
+    "MEXC_API_SECRET", "WEBHOOK_SECRET", "SYMBOL",
+    "FIXED_AMOUNT_USDT", "LEVERAGE"
+]
 
-  [services.concurrency]
-    type = "connections"
-    hard_limit = 25
-    soft_limit = 20
+for secret in REQUIRED_SECRETS:
+    if not os.getenv(secret):
+        logger.warning(f"Предупреждение: {secret} не задан! Используется дефолт.")
 
-  [[services.ports]]
-    handlers = ["http"]
-    port = 80
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "default_token")
+TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "123456789"))
+MEXC_API_KEY = os.getenv("MEXC_API_KEY", "default_key")
+MEXC_API_SECRET = os.getenv("MEXC_API_SECRET", "default_secret")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "default_webhook_secret")
+SYMBOL = os.getenv("SYMBOL", "BTC/USDT:USDT")
+FIXED_AMOUNT_USDT = float(os.getenv("FIXED_AMOUNT_USDT", "10.0"))
+LEVERAGE = max(int(os.getenv("LEVERAGE", "5")), 1)
+MAX_RISK_USDT = float(os.getenv("MAX_RISK_USDT", str(FIXED_AMOUNT_USDT * 3)))
 
-  [[services.ports]]
-    handlers = ["tls", "http"]
-    port = 443
+# --- НОРМАЛИЗАЦИЯ СИМВОЛА (для MEXC API body) ---
+def normalize_symbol_for_api(ccxt_symbol: str) -> str:
+    # ccxt symbol like "XRP/USDT:USDT" -> MEXC API expects "XRP_USDT"
+    s = ccxt_symbol.replace('/', '_')
+    s = s.replace(':USDT', '')
+    return s
 
-  [[services.tcp_checks]]
-    grace_period = "1s"
-    interval = "15s"
-    restart_limit = 0
-    timeout = "2s"
+original_symbol = SYMBOL
+if '_' in SYMBOL and ':' not in SYMBOL and '/' not in SYMBOL:
+    # if user passed "XRP_USDT"
+    base, quote = SYMBOL.split('_')
+    SYMBOL = f"{base}/{quote}:{quote}"
+    logger.info(f"СИМВОЛ ИСПРАВЛЕН: {original_symbol} → {SYMBOL}")
 
-  [[services.http_checks]]
-    interval = "10s"
-    grace_period = "5s"
-    method = "get"
-    path = "/"
-    protocol = "http"
-    timeout = "2s"
-    tls_skip_verify = false
+MEXC_SYMBOL = normalize_symbol_for_api(SYMBOL)
+logger.info(f"=== MEXC BOT | {SYMBOL} (API: {MEXC_SYMBOL}) | {FIXED_AMOUNT_USDT} USDT | {LEVERAGE}x ===")
 
-    [services.http_checks.headers]
+# === ИНИЦИАЛИЗАЦИЯ ===
+bot = Bot(token=TELEGRAM_TOKEN)
+exchange = ccxt.mexc({
+    'apiKey': MEXC_API_KEY,
+    'secret': MEXC_API_SECRET,
+    'enableRateLimit': True,
+    'options': {'defaultType': 'swap'},
+    'timeout': REQUEST_TIMEOUT * 1000,
+    'sandbox': os.getenv("SANDBOX", "False").lower() == "true",
+})
+
+app = FastAPI()
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+
+# === ГЛОБАЛЬНЫЕ ===
+last_trade_info = None
+active_position = False
+position_lock = asyncio.Lock()
+
+# === КОНСТАНТЫ MEXC ===
+SIDE_BUY = 1
+SIDE_SELL = 2
+SIDE_CLOSE_LONG = 3
+SIDE_CLOSE_SHORT = 4
+ORDER_MARKET = 5
+MARGIN_ISOLATED = 1
+POSITION_LONG = 1
+POSITION_SHORT = 2
+
+# === ВСПОМОГАТЕЛЬНЫЕ ===
+@asynccontextmanager
+async def error_handler(operation: str):
+    try:
+        yield
+    except Exception as e:
+        error_msg = f"ОШИБКА в {operation}: {str(e)}\n{traceback.format_exc()}"
+        logger.error(error_msg)
+        try:
+            # обрезаем сообщение чтобы не превышать лимиты телеграма
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=error_msg[:4000])
+        except Exception:
+            pass
+
+async def get_current_price() -> float:
+    async with error_handler("get_current_price"):
+        ticker = await exchange.fetch_ticker(SYMBOL)
+        price = float(ticker['last'])
+        logger.info(f"Цена {SYMBOL}: {price:.6f}")
+        return price
+
+async def check_balance_detailed():
+    async with error_handler("check_balance"):
+        balance = await exchange.fetch_balance()
+        total = balance.get('total', {}).get('USDT', 0)
+        free = balance.get('free', {}).get('USDT', 0)
+        used = balance.get('used', {}).get('USDT', 0)
+        logger.info(f"Баланс: Всего {total:.4f}, Свободно {free:.4f}, Занято {used:.4f}")
+        return {'total': float(total), 'free': float(free), 'used': float(used)}
+
+async def set_leverage_fixed():
+    async with error_handler("set_leverage"):
+        params_template = {'openType': MARGIN_ISOLATED}
+        try:
+            # LONG
+            params = params_template.copy()
+            params['positionType'] = POSITION_LONG
+            await exchange.set_leverage(LEVERAGE, SYMBOL, params=params)
+            logger.info(f"Плечо {LEVERAGE}x установлено для LONG")
+
+            # SHORT
+            params = params_template.copy()
+            params['positionType'] = POSITION_SHORT
+            await exchange.set_leverage(LEVERAGE, SYMBOL, params=params)
+            logger.info(f"Плечо {LEVERAGE}x установлено для SHORT")
+        except ccxt.ExchangeError as e:
+            if 'not modified' in str(e).lower():
+                logger.info("Плечо уже установлено")
+            else:
+                logger.warning(f"Ошибка установки плеча: {e}")
+
+async def calculate_qty() -> float:
+    async with error_handler("calculate_qty"):
+        price = await get_current_price()
+        # ensure markets are loaded
+        if SYMBOL not in exchange.markets:
+            logger.warning("Рынки устарели → перезагрузка")
+            await exchange.load_markets(reload=True)
+            if SYMBOL not in exchange.markets:
+                raise ccxt.ExchangeError(f"Символ {SYMBOL} не найден")
+
+        market = exchange.markets[SYMBOL]
+        # рассчитываем базовую qty (количество базовой валюты)
+        raw_qty = (FIXED_AMOUNT_USDT * LEVERAGE) / price
+        # приводим к точности биржи
+        try:
+            quantity = float(exchange.amount_to_precision(SYMBOL, raw_qty))
+        except Exception:
+            # fallback rounding
+            quantity = round(raw_qty, market.get('precision', {}).get('amount', 6) or 6)
+
+        # минимальные ограничения
+        min_amount = (market.get('limits', {}).get('amount') or {}).get('min') or 0
+        if min_amount and quantity < min_amount:
+            logger.warning(f"Количество {quantity} меньше min_amount {min_amount}, увеличиваем до min")
+            quantity = float(exchange.amount_to_precision(SYMBOL, min_amount))
+
+        order_value = quantity * price
+        MIN_NOTIONAL = 5.0
+        if order_value < MIN_NOTIONAL:
+            # скорректируем до минимальной стоимости
+            needed_qty = (MIN_NOTIONAL / price)
+            quantity = float(exchange.amount_to_precision(SYMBOL, needed_qty))
+            order_value = quantity * price
+            logger.warning(f"Количество скорректировано для min notional {MIN_NOTIONAL} USDT -> qty={quantity}")
+
+        if order_value > MAX_RISK_USDT:
+            raise ValueError(f"Риск превышает лимит: {order_value:.2f} > {MAX_RISK_USDT}")
+
+        logger.info(f"Расчёт: {quantity} @ {price} = {order_value:.2f} USDT")
+        return quantity
+
+def _to_numeric_vol(vol):
+    # MEXC vol should be numeric; convert to int when necessary (contracts) or to string
+    if isinstance(vol, (int,)):
+        return vol
+    if isinstance(vol, float):
+        # if it's effectively integer, cast
+        if abs(vol - int(vol)) < 1e-8:
+            return int(round(vol))
+        return round(vol, 6)
+    try:
+        return int(vol)
+    except Exception:
+        try:
+            return float(vol)
+        except Exception:
+            return vol
+
+async def create_order_mexc_format(side: int, vol: float, externalOid: str, tp=None, sl=None, is_close=False):
+    # build order dict according to contract.mexc API
+    volume = _to_numeric_vol(vol)
+    order = {
+        'symbol': MEXC_SYMBOL,
+        'vol': volume,
+        'leverage': LEVERAGE,
+        'side': side,
+        'type': ORDER_MARKET,
+        'openType': MARGIN_ISOLATED,
+        'positionMode': 2,  # hedge mode (if desired)
+        'externalOid': externalOid,
+    }
+    if is_close:
+        order['reduceOnly'] = True
+    if tp:
+        order['takeProfitPrice'] = round(tp, 6)
+    if sl:
+        order['stopLossPrice'] = round(sl, 6)
+    logger.info(f"Ордер MEXC (body): {json.dumps(order, indent=2)}")
+    return order
+
+# === АСИНХРОННЫЙ HTTPS К MEXC API (httpx) ===
+def _sign_mexc_request(access_key: str, secret_key: str, body: str) -> tuple[str, str]:
+    timestamp = str(int(time.time() * 1000))
+    sign_str = access_key + timestamp + body
+    signature = hmac.new(
+        secret_key.encode('utf-8'),
+        sign_str.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+    return timestamp, signature
+
+async def submit_order_mexc(order_data: dict):
+    """Асинхронный HTTPS запрос — НЕ БЛОКИРУЕТ event loop"""
+    url = "https://contract.mexc.com/api/v1/private/order/submit"
+    body = json.dumps(order_data, separators=(',', ':'), ensure_ascii=False)
+    timestamp, signature = _sign_mexc_request(MEXC_API_KEY, MEXC_API_SECRET, body)
+
+    headers = {
+        'ApiKey': MEXC_API_KEY,
+        'Request-Time': timestamp,
+        'Signature': signature,
+        'Content-Type': 'application/json'
+    }
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        last_exc = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                logger.info(f"Попытка {attempt + 1}/{MAX_RETRIES} отправки на MEXC")
+                response = await client.post(url, headers=headers, content=body)
+                text = response.text
+                try:
+                    result = response.json()
+                except Exception:
+                    # непарсимый ответ — логируем и пробуем снова
+                    logger.error(f"Неправильный JSON в ответе MEXC: {text}")
+                    raise Exception(f"Invalid JSON response: {text}")
+
+                logger.info(f"MEXC response: {json.dumps(result)[:1000]}")
+                if result.get('success') is True or str(result.get('success')).lower() in ['true', '1']:
+                    return result
+                # если success==False — логируем код/сообщение и выбрасываем
+                code = result.get('code', 'unknown')
+                msg = result.get('message', result.get('msg', 'no message'))
+                logger.error(f"MEXC API Error {code}: {msg}")
+                # если есть известные коды — можно обработать отдельно
+                last_exc = Exception(f"API Error {code}: {msg}")
+                # для некоторых ошибок можно сделать задержку и retry
+                if code in (510,):  # пример - rate limit/backoff
+                    await asyncio.sleep(5)
+                else:
+                    # не делаем retries для других ошибок
+                    break
+
+            except httpx.TimeoutException as te:
+                logger.warning(f"ТАЙМАУТ на попытке {attempt + 1}: {te}")
+                last_exc = te
+            except Exception as e:
+                logger.error(f"Async HTTPS Error (attempt {attempt+1}): {e}")
+                last_exc = e
+
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(RETRY_DELAY)
+
+        # все попытки закончились неудачей
+        raise last_exc or Exception("Ордер не отправлен (неизвестная причина)")
+
+# === ТОРГОВЛЯ ===
+async def open_position_mexc(signal: str, tp_percent: float = None, sl_percent: float = None):
+    """
+    Исправленная и надёжная функция открытия позиции через MEXC contract API.
+    signal: "buy" или "sell"
+    tp_percent, sl_percent: процент от входа (например 1.5 -> TP +1.5%)
+    """
+    global last_trade_info, active_position
+    async with position_lock:
+        if active_position:
+            logger.warning("Позиция уже открыта! Прерываем открытие.")
+            try:
+                await bot.send_message(TELEGRAM_CHAT_ID, "ДУБЛЬ СИГНАЛА — позиция уже активна")
+            except Exception:
+                pass
+            return
+
+        async with error_handler("open_position"):
+            # Установим плечо на случай, если не установлено
+            await set_leverage_fixed()
+            await asyncio.sleep(0.5)
+
+            balance_data = await check_balance_detailed()
+            if balance_data['free'] < FIXED_AMOUNT_USDT:
+                raise ValueError(f"Недостаточно свободных средств: {balance_data['free']:.2f} < {FIXED_AMOUNT_USDT}")
+
+            qty = await calculate_qty()
+            if not qty or qty <= 0:
+                raise ValueError("Невозможно рассчитать qty (<=0)")
+
+            side = SIDE_BUY if signal.lower() == "buy" else SIDE_SELL
+            side_text = "LONG" if side == SIDE_BUY else "SHORT"
+
+            entry_price = await get_current_price()
+            tp_price = (entry_price * (1 + tp_percent / 100)) if (tp_percent is not None) else None
+            sl_price = (entry_price * (1 - sl_percent / 100)) if (sl_percent is not None) else None
+
+            external_oid = f"bot_open_{int(time.time())}_{signal}"
+            order_data = await create_order_mexc_format(side, qty, external_oid, tp=tp_price, sl=sl_price)
+
+            # --- Отправка ордера ---
+            response = await submit_order_mexc(order_data)
+            # ожидаем формат: {'success': True, 'code': '0', 'data': {...}} или похожий
+            order_id = None
+            data_field = response.get('data')
+            if isinstance(data_field, dict):
+                # иногда data содержит объект с orderId
+                order_id = data_field.get('orderId') or data_field.get('order_id') or data_field.get('id') or data_field
+            else:
+                order_id = data_field
+
+            active_position = True
+            last_trade_info = {
+                "signal": signal, "side": side_text, "qty": qty, "entry": entry_price,
+                "tp": tp_price, "sl": sl_price, "order_id": order_id, "timestamp": time.time()
+            }
+
+            position_size = qty * entry_price
+            msg = (f"{side_text} ОТКРЫТА\n"
+                   f"Символ: {SYMBOL}\n"
+                   f"Количество: {qty}\n"
+                   f"Размер: {position_size:.2f} USDT\n"
+                   f"Плечо: {LEVERAGE}x\n"
+                   f"Цена: ${entry_price:.4f}\n"
+                   f"{(f'TP: ${tp_price:.4f}\\n' if tp_price else '')}"
+                   f"{(f'SL: ${sl_price:.4f}\\n' if sl_price else '')}"
+                   f"Order ID: {order_id}")
+            try:
+                await bot.send_message(TELEGRAM_CHAT_ID, text=msg)
+            except Exception:
+                logger.info("Не удалось отправить сообщение в Telegram")
+            logger.info(f"ПОЗИЦИЯ ОТКРЫТА: {side_text} (order_id={order_id})")
+
+async def close_position_mexc():
+    global active_position, last_trade_info
+    async with position_lock:
+        if not active_position:
+            return {"status": "error", "message": "Нет позиции"}
+
+        async with error_handler("close_position"):
+            positions = await exchange.fetch_positions([SYMBOL])
+            pos = next((p for p in positions if p['symbol'] == SYMBOL and float(p.get('contracts', 0)) > 0), None)
+            if not pos:
+                active_position = False
+                return {"status": "error", "message": "Позиция не найдена"}
+
+            side = SIDE_CLOSE_LONG if pos.get('side') == 'long' else SIDE_CLOSE_SHORT
+            qty = float(pos.get('contracts', 0))
+            entry_price = float(pos.get('entryPrice', 0) or 0)
+            exit_price = await get_current_price()
+            realized_pnl = float(pos.get('realizedPnl', 0) or 0)
+
+            pnl_percent = 0.0
+            try:
+                pnl_percent = ((exit_price - entry_price) / entry_price * 100 * LEVERAGE) * (1 if pos.get('side') == 'long' else -1)
+            except Exception:
+                pass
+
+            external_oid = f"bot_close_{int(time.time())}"
+            order_data = await create_order_mexc_format(side, qty, external_oid, is_close=True)
+            response = await submit_order_mexc(order_data)
+            close_order_id = response.get('data', 'unknown')
+
+            msg = (f"ПОЗИЦИЯ ЗАКРЫТА ({pos.get('side','?').upper()})\n"
+                   f"Символ: {SYMBOL}\n"
+                   f"Количество: {qty}\n"
+                   f"Вход: ${entry_price:.4f} → Выход: ${exit_price:.4f}\n"
+                   f"P&L: {pnl_percent:+.2f}% | {realized_pnl:+.4f} USDT\n"
+                   f"Close Order ID: {close_order_id}")
+            try:
+                await bot.send_message(TELEGRAM_CHAT_ID, text=msg)
+            except Exception:
+                pass
+
+            active_position = False
+            last_trade_info = None
+            logger.info(f"ПОЗИЦИЯ ЗАКРЫТА: PnL {pnl_percent:+.2f}%")
+            return {"status": "ok", "pnl_percent": pnl_percent, "pnl_usdt": realized_pnl}
+
+# === FASTAPI ===
+@app.on_event("startup")
+async def startup():
+    async with error_handler("startup"):
+        await exchange.load_markets(reload=True)
+        await set_leverage_fixed()
+        price = await get_current_price()
+        balance = (await check_balance_detailed())['total']
+        msg = (f"MEXC BOT ЗАПУЩЕН\n"
+               f"Баланс: {balance:.2f} USDT\n"
+               f"Символ: {SYMBOL} (API: {MEXC_SYMBOL})\n"
+               f"Сумма: {FIXED_AMOUNT_USDT} USDT\n"
+               f"Плечо: {LEVERAGE}x\n"
+               f"{'SANDBOX' if exchange.sandbox else 'LIVE'}")
+        try:
+            await bot.send_message(TELEGRAM_CHAT_ID, text=msg)
+        except Exception:
+            logger.info("Не удалось отправить стартовое сообщение в Telegram")
+        logger.info("БОТ ГОТОВ")
+
+@app.on_event("shutdown")
+async def shutdown():
+    try:
+        await exchange.close()
+    except Exception:
+        pass
+    try:
+        await bot.send_message(TELEGRAM_CHAT_ID, text="Бот остановлен")
+    except Exception:
+        pass
+
+@app.post("/webhook")
+@limiter.limit(RATE_LIMIT)
+async def webhook(request: Request):
+    logger.info("Webhook получен")
+    if WEBHOOK_SECRET and request.headers.get("Authorization") != f"Bearer {WEBHOOK_SECRET}":
+        raise HTTPException(401, "Unauthorized")
+    data = await request.json()
+    signal = data.get("signal")
+    if signal not in ["buy", "sell", "close"]:
+        raise HTTPException(400, "signal: buy/sell/close")
+    if signal == "close":
+        asyncio.create_task(close_position_mexc())
+    else:
+        tp = data.get("tp_percent")
+        sl = data.get("sl_percent")
+        asyncio.create_task(open_position_mexc(signal, tp, sl))
+    return {"status": "ok"}
+
+@app.post("/close")
+async def force_close(request: Request):
+    if WEBHOOK_SECRET and request.headers.get("Authorization") != f"Bearer {WEBHOOK_SECRET}":
+        raise HTTPException(401)
+    return await close_position_mexc()
+
+@app.get("/health")
+async def health():
+    try:
+        price = await get_current_price()
+        balance = await check_balance_detailed()
+        positions = await exchange.fetch_positions([SYMBOL])
+        pos_info = next((p for p in positions if p['symbol'] == SYMBOL and float(p.get('contracts', 0)) > 0), None)
+        return {
+            "status": "healthy",
+            "price": price,
+            "balance": balance,
+            "active": active_position,
+            "position": pos_info,
+            "last_trade": last_trade_info
+        }
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}
+
+@app.get("/")
+async def dashboard():
+    try:
+        balance_data = await check_balance_detailed()
+        price = await get_current_price()
+        positions = await exchange.fetch_positions([SYMBOL])
+        pos_details = next((p for p in positions if p['symbol'] == SYMBOL and float(p.get('contracts', 0)) > 0), None)
+
+        status = "АКТИВНА" if active_position else "НЕТ"
+        html = f"""
+        <html><head><title>MEXC Bot</title>
+        <style>body{{font-family:Arial;background:#1e1e1e;color:white;padding:20px;}}
+        .card{{background:#2d2d2d;padding:20px;margin:10px 0;border-radius:10px;}}
+        .success{{color:#00b894;}} .warning{{color:#fdcb6e;}} .info{{color:#74b9ff;}}
+        button{{background:#00b894;color:white;border:none;padding:10px 20px;border-radius:5px;cursor:pointer;}}
+        .danger-btn{{background:#e74c3c;}} pre{{background:#1a1a1a;padding:15px;border-radius:5px;}}
+        </style></head><body>
+        <h1>MEXC Futures Bot</h1>
+        <div class="card"><h3>БАЛАНС</h3>
+        <p>Всего: <span class="info">{balance_data['total']:.2f}</span> USDT</p>
+        <p>Свободно: {balance_data['free']:.2f} USDT</p></div>
+        <div class="card"><h3>РЫНОК</h3>
+        <p>Символ: <span class="info">{SYMBOL}</span></p>
+        <p>Цена: <span class="info">${price:.4f}</span></p>
+        <p>Позиция: <span class="{'success' if active_position else 'warning'}">{status}</span></p></div>
+        """
+        if pos_details:
+            pnl_class = "success" if float(pos_details.get('unrealizedPnl', 0)) > 0 else "danger"
+            html += f"<div class='card'><h3>ПОЗИЦИЯ</h3><p>Сторона: <span class='{pnl_class}'>{pos_details.get('side','').upper()}</span></p></div>"
+        html += f"<div class='card'><h3>НАСТРОЙКИ</h3><p>Сумма: {FIXED_AMOUNT_USDT} USDT</p><p>Плечо: {LEVERAGE}x</p></div>"
+        if last_trade_info:
+            html += f"<div class='card'><h3>ПОСЛЕДНЯЯ СДЕЛКА</h3><pre>{json.dumps(last_trade_info, indent=2, default=str)}</pre></div>"
+        if active_position:
+            html += '<div class="card"><form action="/close" method="post"><button class="danger-btn">Закрыть позицию</button></form></div>'
+        html += '</body></html>'
+        return HTMLResponse(html)
+    except Exception as e:
+        return HTMLResponse(f"<h1>Ошибка: {str(e)}</h1>")
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
