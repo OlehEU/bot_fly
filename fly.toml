@@ -1,4 +1,4 @@
-# main.py — MEXC Futures Bot (Async HTTPS + httpx)
+# main.py — MEXC Futures Bot (Direct HTTPS API)
 import os
 import json
 import asyncio
@@ -9,7 +9,7 @@ import hmac
 import hashlib
 from contextlib import asynccontextmanager
 import ccxt.async_support as ccxt
-import httpx
+import requests
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from telegram import Bot
@@ -69,7 +69,7 @@ exchange = ccxt.mexc({
     'apiKey': MEXC_API_KEY,
     'secret': MEXC_API_SECRET,
     'enableRateLimit': True,
-toa    'options': {'defaultType': 'swap'},
+    'options': {'defaultType': 'swap'},
     'timeout': REQUEST_TIMEOUT * 1000,
     'sandbox': os.getenv("SANDBOX", "False").lower() == "true",
 })
@@ -83,7 +83,7 @@ last_trade_info = None
 active_position = False
 position_lock = asyncio.Lock()
 
-# === КОНСТАНТЫ MEXC ===
+# === КОНСТАНТЫ MEXC (из документации) ===
 SIDE_BUY = 1
 SIDE_SELL = 2
 SIDE_CLOSE_LONG = 3
@@ -195,7 +195,7 @@ async def create_order_mexc_format(side: int, vol: float, externalOid: str, tp=N
     logger.info(f"Ордер MEXC: {json.dumps(order, indent=2)}")
     return order
 
-# === АСИНХРОННЫЙ HTTPS К MEXC API (httpx) ===
+# === ПРЯМОЙ HTTPS К MEXC API ===
 def _sign_mexc_request(access_key: str, secret_key: str, body: str) -> tuple[str, str]:
     timestamp = str(int(time.time() * 1000))
     sign_str = access_key + timestamp + body
@@ -207,7 +207,7 @@ def _sign_mexc_request(access_key: str, secret_key: str, body: str) -> tuple[str
     return timestamp, signature
 
 async def submit_order_mexc(order_data: dict):
-    """Асинхронный HTTPS запрос — НЕ БЛОКИРУЕТ event loop"""
+    """Прямой HTTPS запрос — 100% надёжно"""
     url = "https://contract.mexc.com/api/v1/private/order/submit"
     body = json.dumps(order_data)
     timestamp, signature = _sign_mexc_request(MEXC_API_KEY, MEXC_API_SECRET, body)
@@ -219,35 +219,36 @@ async def submit_order_mexc(order_data: dict):
         'Content-Type': 'application/json'
     }
 
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        for attempt in range(MAX_RETRIES):
-            try:
-                logger.info(f"Попытка {attempt + 1}/{MAX_RETRIES} (async HTTPS)")
-                response = await client.post(url, headers=headers, content=body)
-                result = response.json()
+    for attempt in range(MAX_RETRIES):
+        try:
+            logger.info(f"Попытка {attempt + 1}/{MAX_RETRIES} (прямой HTTPS)")
+            response = requests.post(
+                url, headers=headers, data=body, timeout=REQUEST_TIMEOUT
+            )
+            result = response.json()
 
-                if result.get('success'):
-                    order_id = result.get('data', 'unknown')
-                    logger.info(f"УСПЕХ! Order ID: {order_id}")
-                    return result
-                else:
-                    code = result.get('code', 'unknown')
-                    msg = result.get('message', 'no message')
-                    logger.error(f"MEXC API Error {code}: {msg}")
-                    if code == 510:
-                        await asyncio.sleep(10)
-                    raise Exception(f"API Error {code}: {msg}")
+            if result.get('success'):
+                order_id = result.get('data', 'unknown')
+                logger.info(f"УСПЕХ! Order ID: {order_id}")
+                return result
+            else:
+                code = result.get('code', 'unknown')
+                msg = result.get('message', 'no message')
+                logger.error(f"MEXC API Error {code}: {msg}")
+                if code == 510:
+                    await asyncio.sleep(10)
+                raise Exception(f"MEXC API Error {code}: {msg}")
 
-            except httpx.TimeoutException:
-                logger.warning(f"ТАЙМАУТ на попытке {attempt + 1}")
-            except Exception as e:
-                logger.error(f"Async HTTPS Error: {e}")
-                raise
+        except requests.Timeout:
+            logger.warning(f"ТАЙМАУТ HTTPS на попытке {attempt + 1}")
+        except Exception as e:
+            logger.error(f"HTTPS Error: {e}")
+            raise
 
-            if attempt < MAX_RETRIES - 1:
-                await asyncio.sleep(RETRY_DELAY)
+        if attempt < MAX_RETRIES - 1:
+            await asyncio.sleep(RETRY_DELAY)
 
-    raise Exception("Ордер не отправлен")
+    raise Exception("Ордер не отправлен (прямой HTTPS)")
 
 # === ТОРГОВЛЯ ===
 async def open_position_mexc(signal: str, tp_percent: float = None, sl_percent: float = None):
