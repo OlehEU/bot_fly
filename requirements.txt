@@ -6,6 +6,7 @@ aiogram
 slowapi
 requests
 httpx
+pydantic
 
 
 
