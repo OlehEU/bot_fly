@@ -32,20 +32,25 @@ RISK_PERCENT = float(os.getenv("RISK_PERCENT", 25))
 LEVERAGE = int(os.getenv("LEVERAGE", 10))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-# === Символ ===
-SYMBOL = "XRP/USDT:USDT"  # Правильный формат для CCXT
+# === Символ (ИСПРАВЛЕНО НА СПОТ) ===
+SYMBOL = "XRP/USDT"  # Спотовая пара
 
 logger.info("=== ИНИЦИАЛИЗАЦИЯ MEXC БОТА ===")
 
 # === Telegram ===
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# === MEXC Exchange ===
+# === MEXC Exchange (ИСПРАВЛЕНО НА СПОТ) ===
 exchange = ccxt.mexc({
     'apiKey': MEXC_API_KEY,
     'secret': MEXC_API_SECRET,
     'enableRateLimit': True,
-    'options': {'defaultType': 'swap'},
+    # УБРАЛИ 'defaultType': 'swap' для спотовой торговли
+    'options': {
+        'recvWindow': 15000,
+    },
+    'timeout': 30000,
+    'rateLimit': 1000,
 })
 
 # === FastAPI ===
@@ -68,18 +73,39 @@ async def error_handler(operation: str):
             pass
         raise
 
+async def create_order_with_retry(symbol, side, qty, max_retries=3):
+    """Создать ордер с повторными попытками при таймаутах"""
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"🔄 Попытка {attempt + 1} создать ордер {side} {qty} {symbol}...")
+            order = await exchange.create_market_order(symbol, side, qty)
+            logger.info(f"✅ Ордер успешно создан на попытке {attempt + 1}")
+            return order
+        except ccxt.RequestTimeout as e:
+            logger.warning(f"⏰ Таймаут попытки {attempt + 1}. Ждем 3 секунды...")
+            if attempt == max_retries - 1:  # Последняя попытка
+                logger.error("❌ Все попытки создания ордера завершились таймаутом")
+                raise e
+            await asyncio.sleep(3)
+        except ccxt.BaseError as e:
+            logger.error(f"🔴 Ошибка API MEXC на попытке {attempt + 1}: {e}")
+            raise e
+        except Exception as e:
+            logger.error(f"🔴 Неизвестная ошибка на попытке {attempt + 1}: {e}")
+            raise e
+
 async def get_current_price() -> float:
     async with error_handler("get_current_price"):
         ticker = await exchange.fetch_ticker(SYMBOL)
         price = float(ticker['last'])
-        logger.info(f"Текущая цена {SYMBOL}: {price:.6f}")
+        logger.info(f"💰 Текущая цена {SYMBOL}: {price:.6f}")
         return price
 
 async def check_balance() -> float:
     async with error_handler("check_balance"):
         balance_data = await exchange.fetch_balance()
         usdt = balance_data['total'].get('USDT', 0)
-        logger.info(f"Баланс USDT: {usdt:.4f}")
+        logger.info(f"💳 Баланс USDT: {usdt:.4f}")
         return float(usdt)
 
 async def calculate_qty(usd_amount: float) -> float:
@@ -88,18 +114,59 @@ async def calculate_qty(usd_amount: float) -> float:
         if price <= 0:
             raise ValueError("Не удалось получить цену")
         
-        # Простой расчет количества
+        # Рассчитываем количество
         quantity = usd_amount / price
         
-        # Округляем до 1 знака (минимальный шаг для XRP)
-        quantity = round(quantity, 1)
+        # Для спота округляем до целых чисел (XRP обычно торгуется целыми)
+        quantity = int(quantity)  # Округляем до целого
         
         # Минимальное количество
-        if quantity < 1.0:
-            quantity = 1.0
+        if quantity < 1:
+            quantity = 1
             
-        logger.info(f"Рассчитано количество: {quantity} {SYMBOL} за {usd_amount} USDT")
+        logger.info(f"📊 Рассчитано количество: {quantity} {SYMBOL} за {usd_amount} USDT")
         return quantity
+
+async def close_position():
+    """Закрыть текущую позицию (для спота - продать)"""
+    global active_position, last_trade_info
+    
+    if not active_position or not last_trade_info:
+        logger.warning("⚠️ Нет активной позиции для закрытия")
+        return
+    
+    async with error_handler("close_position"):
+        current_side = last_trade_info['side']
+        
+        # Для спота просто продаем купленный актив
+        if current_side == 'buy':
+            close_side = 'sell'
+            logger.info(f"🔒 Продаем позицию: {last_trade_info['qty']} {SYMBOL}")
+            
+            # Создаем ордер на продажу
+            order = await create_order_with_retry(SYMBOL, close_side, last_trade_info['qty'])
+            
+            # Получаем цену выхода
+            exit_price = await get_current_price()
+            
+            # Рассчитываем PnL
+            entry = last_trade_info['entry']
+            qty = last_trade_info['qty']
+            pnl = (exit_price - entry) * qty
+            
+            msg = (f"🔒 ПОЗИЦИЯ ПРОДАНА\n"
+                   f"Символ: {SYMBOL}\n"
+                   f"Продано: {qty} XRP\n"
+                   f"Цена покупки: ${entry:.4f}\n"
+                   f"Цена продажи: ${exit_price:.4f}\n"
+                   f"PnL: ${pnl:.2f}")
+            
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+            
+            active_position = False
+            logger.info(f"✅ Позиция продана. PnL: ${pnl:.2f}")
+        else:
+            logger.warning("⚠️ Нельзя закрыть позицию SELL в споте")
 
 async def open_position(signal: str, amount_usd=None):
     global last_trade_info, active_position
@@ -109,31 +176,37 @@ async def open_position(signal: str, amount_usd=None):
         
         # Проверяем баланс
         balance = await check_balance()
-        logger.info(f"Текущий баланс: {balance:.2f} USDT")
+        logger.info(f"💳 Текущий баланс: {balance:.2f} USDT")
         
         if balance <= 5:
-            raise ValueError(f"Недостаточно средств: {balance:.2f} USDT")
+            raise ValueError(f"❌ Недостаточно средств: {balance:.2f} USDT")
 
         # Рассчитываем сумму для торговли
         usd = amount_usd or (balance * RISK_PERCENT / 100)
-        logger.info(f"Риск: {RISK_PERCENT}% → {usd:.2f} USDT из {balance:.2f}")
+        logger.info(f"🎯 Риск: {RISK_PERCENT}% → {usd:.2f} USDT из {balance:.2f}")
 
         if usd < 5:
             usd = 5
+            logger.info(f"📈 Сумма увеличена до минимальной: {usd} USDT")
 
         # Рассчитываем количество
         qty = await calculate_qty(usd)
-        logger.info(f"Рассчитанное количество: {qty}")
+        logger.info(f"📦 Рассчитанное количество: {qty}")
         
         if qty <= 0:
-            raise ValueError(f"Неверное количество: {qty}")
+            raise ValueError(f"❌ Неверное количество: {qty}")
 
         side = "buy" if signal.lower() == "buy" else "sell"
-        logger.info(f"Открываем {side.upper()} {qty} {SYMBOL}")
+        
+        # В споте обычно только BUY ордера
+        if side == "sell":
+            logger.warning("⚠️ SELL ордер в споте - убедитесь что у вас есть XRP для продажи")
+        
+        logger.info(f"🔄 Открываем {side.upper()} {qty} {SYMBOL}")
 
-        # Создаем рыночный ордер
-        order = await exchange.create_market_order(SYMBOL, side, qty)
-        logger.info(f"Ордер создан: {order['id']}")
+        # СОЗДАЕМ ОРДЕР С ПОВТОРАМИ
+        order = await create_order_with_retry(SYMBOL, side, qty)
+        logger.info(f"✅ Ордер создан: {order['id']}")
 
         # Получаем цену входа
         entry_price = await get_current_price()
@@ -148,14 +221,14 @@ async def open_position(signal: str, amount_usd=None):
             "balance": balance,
             "order_id": order['id'],
             "timestamp": time.time(),
-            "leverage": LEVERAGE
+            "leverage": 1  # В споте плеча нет
         }
 
         msg = (f"✅ {side.upper()} ОТКРЫТА\n"
                f"Символ: {SYMBOL}\n"
-               f"Количество: {qty}\n"
-               f"Вход: ${entry_price:.4f}\n"
-               f"Плечо: {LEVERAGE}x\n"
+               f"Количество: {qty} XRP\n"
+               f"Цена: ${entry_price:.4f}\n"
+               f"Стоимость: ${usd:.2f} USDT\n"
                f"Баланс: {balance:.2f} USDT")
         
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
@@ -167,29 +240,35 @@ async def startup_event():
     async with error_handler("startup"):
         logger.info("🚀 ЗАПУСК БОТА")
         
-        balance = await check_balance()
-        price = await get_current_price()
-        
-        msg = f"""✅ MEXC Futures Bot ЗАПУЩЕН!
+        # Проверяем подключение к бирже
+        try:
+            balance = await check_balance()
+            price = await get_current_price()
+            
+            msg = f"""✅ MEXC Futures Bot ЗАПУЩЕН!
 
 💰 Баланс: {balance:.2f} USDT
 📊 Символ: {SYMBOL}
 💰 Цена: ${price:.4f}
-⚡ Плечо: {LEVERAGE}x
 📈 Риск: {RISK_PERCENT}%
 
 💡 Готов к работе!"""
-        
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-        logger.info("🤖 БОТ УСПЕШНО ЗАПУЩЕН")
+            
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+            logger.info("🤖 БОТ УСПЕШНО ЗАПУЩЕН")
+        except Exception as e:
+            error_msg = f"❌ Ошибка при запуске бота: {e}"
+            logger.error(error_msg)
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=error_msg)
 
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info("🛑 ОСТАНОВКА БОТА")
     try:
         await exchange.close()
-    except:
-        pass
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🔴 Бот остановлен")
+    except Exception as e:
+        logger.error(f"Ошибка при остановке: {e}")
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -202,7 +281,7 @@ async def webhook(request: Request):
         data = await request.json()
         signal = data.get("signal")
         
-        logger.info(f"Webhook данные: signal={signal}")
+        logger.info(f"📊 Webhook данные: signal={signal}")
         
         if signal not in ["buy", "sell"]:
             return {"status": "error", "message": "signal must be 'buy' or 'sell'"}
@@ -212,7 +291,7 @@ async def webhook(request: Request):
         return {"status": "ok", "message": f"{signal} signal received"}
         
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        logger.error(f"❌ Webhook error: {e}")
         return {"status": "error", "message": str(e)}
 
 @app.get("/health")
@@ -232,7 +311,7 @@ async def health_check():
             "timestamp": time.time()
         }
     except Exception as e:
-        logger.error(f"Health check failed: {e}")
+        logger.error(f"❌ Health check failed: {e}")
         return {"status": "unhealthy", "error": str(e)}
 
 @app.get("/")
@@ -248,17 +327,18 @@ async def home():
         html = f"""
         <html>
             <head>
-                <title>MEXC Futures Bot</title>
+                <title>MEXC Spot Bot</title>
                 <meta charset="utf-8">
                 <style>
                     body {{ font-family: Arial; background: #1e1e1e; color: white; padding: 20px; }}
                     .card {{ background: #2d2d2d; padding: 20px; margin: 10px 0; border-radius: 10px; }}
                     .success {{ color: #00b894; }}
                     .warning {{ color: #fdcb6e; }}
+                    .info {{ color: #74b9ff; }}
                 </style>
             </head>
             <body>
-                <h1 class="success">🤖 MEXC Futures Bot</h1>
+                <h1 class="success">🤖 MEXC Spot Bot</h1>
                 
                 <div class="card">
                     <h3>💰 БАЛАНС</h3>
@@ -274,13 +354,24 @@ async def home():
                 
                 <div class="card">
                     <h3>⚡ НАСТРОЙКИ</h3>
-                    <p><b>Плечо:</b> {LEVERAGE}x</p>
+                    <p><b>Тип:</b> SPOT (без плеча)</p>
                     <p><b>Риск:</b> {RISK_PERCENT}%</p>
+                </div>
+                
+                <div class="card info">
+                    <h3>🔄 ФУНКЦИОНАЛ</h3>
+                    <p><b>Повторы при таймаутах:</b> 3 попытки</p>
+                    <p><b>Таймаут запросов:</b> 30 секунд</p>
                 </div>
                 
                 <div class="card">
                     <h3>📈 Последняя сделка</h3>
                     <pre>{json.dumps(last_trade_info, indent=2, ensure_ascii=False) if last_trade_info else "Нет данных"}</pre>
+                </div>
+                
+                <div class="card">
+                    <h3>🔧 Действия</h3>
+                    <p><a href="/health" style="color: #74b9ff;">Health Check</a></p>
                 </div>
             </body>
         </html>
