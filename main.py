@@ -20,7 +20,8 @@ logger = logging.getLogger("mexc-bot")
 # === НАСТРОЙКИ ТАЙМАУТОВ И ПОВТОРОВ ===
 REQUEST_TIMEOUT = 60
 MAX_RETRIES = 3
-RETRY_DELAY = 2
+RETRY_DELAY = 5 # ИСПРАВЛЕНИЕ: Увеличиваем задержку повтора с 2 до 5 секунд
+# ... (остальной код не изменен)
 
 # === Проверка секретов ===
 REQUIRED_SECRETS = [
@@ -110,7 +111,6 @@ async def error_handler(operation: str):
         # НЕ вызываем raise, чтобы не оборвать родительскую задачу FastAPI,
         # которая была запущена через asyncio.create_task. 
         # Если нужно, родительская функция должна сама обработать исключение.
-        # В данном случае, open_position_mexc/close_position_mexc уже завершились с ошибкой в логах.
         # Возвращаем управление, чтобы избежать "Task exception was never retrieved" в asyncio.
         # pass
 
