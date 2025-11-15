@@ -33,19 +33,22 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 # === ФИКСИРОВАННАЯ СУММА ===
 FIXED_AMOUNT_USD = 5  # Всегда торгуем на 5 USDT
 
-# === Символ ===
-SYMBOL = "XRP/USDT"
+# === Символ (ФЬЮЧЕРСЫ) ===
+SYMBOL = "XRP/USDT:USDT"  # ФЬЮЧЕРСНЫЙ формат
 
 logger.info("=== ИНИЦИАЛИЗАЦИЯ MEXC БОТА ===")
 
 # === Telegram ===
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# === MEXC Exchange ===
+# === MEXC Exchange (ФЬЮЧЕРСЫ) ===
 exchange = ccxt.mexc({
     'apiKey': MEXC_API_KEY,
     'secret': MEXC_API_SECRET,
     'enableRateLimit': True,
+    'options': {
+        'defaultType': 'swap',  # ФЬЮЧЕРСЫ
+    },
     'timeout': 30000,
 })
 
@@ -90,15 +93,15 @@ async def calculate_qty_simple() -> float:
         # Простой расчет: 5 USDT / цена
         quantity = FIXED_AMOUNT_USD / price
         
-        # Округляем до целых чисел (XRP обычно целыми)
-        quantity = int(quantity)
+        # Округляем до 1 знака для фьючерсов
+        quantity = round(quantity, 1)
         
-        # Минимум 1 XRP
-        if quantity < 1:
-            quantity = 1
+        # Минимум 1.0 XRP
+        if quantity < 1.0:
+            quantity = 1.0
             
         logger.info(f"📊 Купим {quantity} XRP за {FIXED_AMOUNT_USD} USDT (цена: {price:.4f})")
-        return float(quantity)
+        return quantity
 
 async def open_position_simple(signal: str):
     global last_trade_info, active_position
@@ -156,7 +159,7 @@ async def startup_event():
         balance = await check_balance()
         price = await get_current_price()
         
-        msg = f"""✅ MEXC Spot Bot ЗАПУЩЕН!
+        msg = f"""✅ MEXC Futures Bot ЗАПУЩЕН!
 
 💰 Баланс: {balance:.2f} USDT
 📊 Символ: {SYMBOL}
@@ -227,7 +230,7 @@ async def home():
         html = f"""
         <html>
             <head>
-                <title>MEXC Simple Bot</title>
+                <title>MEXC Futures Bot</title>
                 <meta charset="utf-8">
                 <style>
                     body {{ font-family: Arial; background: #1e1e1e; color: white; padding: 20px; }}
@@ -237,7 +240,7 @@ async def home():
                 </style>
             </head>
             <body>
-                <h1 class="success">🤖 MEXC Simple Bot</h1>
+                <h1 class="success">🤖 MEXC Futures Bot</h1>
                 
                 <div class="card">
                     <h3>💰 БАЛАНС</h3>
