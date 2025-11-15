@@ -44,6 +44,18 @@ SYMBOL = os.getenv("SYMBOL", "BTC/USDT:USDT")
 FIXED_AMOUNT_USDT = float(os.getenv("FIXED_AMOUNT_USDT", 10.0))
 LEVERAGE = int(os.getenv("LEVERAGE", 5))
 
+# --- SYMBOL NORMALIZATION (ИСПРАВЛЕНИЕ) ---
+# MEXC internal symbols often look like 'XRP_USDT', CCXT requires 'XRP/USDT:USDT' for futures.
+# This logic attempts to fix non-standard formats provided via environment variables, 
+# что было причиной ошибки в логах.
+original_symbol = SYMBOL
+if '_' in SYMBOL and ':' not in SYMBOL and SYMBOL.endswith('USDT'):
+    base, quote = SYMBOL.split('_')
+    # Преобразуем в стандартный CCXT фьючерсный формат BASE/QUOTE:QUOTE
+    SYMBOL = f"{base}/{quote}:{quote}"
+    logger.info(f"🔄 СИМВОЛ АВТОМАТИЧЕСКИ ИСПРАВЛЕН: {original_symbol} -> {SYMBOL}")
+# --- КОНЕЦ НОРМАЛИЗАЦИИ ---
+
 logger.info("=== ИНИЦИАЛИЗАЦИЯ MEXC БОТА ===")
 logger.info(f"📊 Настройки: Символ={SYMBOL}, Сумма={FIXED_AMOUNT_USDT}, Плечо={LEVERAGE}")
 
@@ -95,10 +107,16 @@ async def error_handler(operation: str):
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=error_msg[:4000])
         except:
             pass
-        raise
+        # НЕ вызываем raise, чтобы не оборвать родительскую задачу FastAPI,
+        # которая была запущена через asyncio.create_task. 
+        # Если нужно, родительская функция должна сама обработать исключение.
+        # В данном случае, open_position_mexc/close_position_mexc уже завершились с ошибкой в логах.
+        # Возвращаем управление, чтобы избежать "Task exception was never retrieved" в asyncio.
+        # pass
 
 async def get_current_price() -> float:
     async with error_handler("get_current_price"):
+        # Используем нормализованный SYMBOL
         ticker = await exchange.fetch_ticker(SYMBOL)
         price = float(ticker['last'])
         logger.info(f"💰 Текущая цена {SYMBOL}: {price:.6f}")
@@ -148,9 +166,17 @@ async def calculate_qty() -> float:
         # 1. Проверяем, что данные рынка загружены
         if SYMBOL not in exchange.markets:
             logger.error("❌ Данные о рынке не загружены. Попытка загрузить сейчас.")
-            await exchange.load_markets()
+            # Повторная загрузка рынков
+            try:
+                await exchange.load_markets()
+            except Exception as e:
+                logger.error(f"❌ Критическая ошибка при загрузке рынков: {e}")
+            
+            # Если после попытки загрузки SYMBOL все еще отсутствует, это критическая ошибка.
             if SYMBOL not in exchange.markets:
-                 raise ccxt.ExchangeError(f"Не удалось загрузить данные для символа {SYMBOL}")
+                 # Теперь, благодаря нормализации, эта ошибка должна возникать только при 
+                 # реальной проблеме подключения/отсутствии символа на бирже.
+                 raise ccxt.ExchangeError(f"Не удалось загрузить данные о точности для символа {SYMBOL} (проверьте формат)")
         
         market = exchange.markets[SYMBOL]
         precision = market['precision']['amount']
@@ -278,6 +304,7 @@ async def open_position_mexc(signal: str):
             raise ValueError(f"❌ Недостаточно средств. Нужно: {FIXED_AMOUNT_USDT} USDT, есть: {balance:.2f} USDT")
 
         # Рассчитываем количество с учетом точности
+        # Если здесь будет ошибка, она будет перехвачена error_handler
         qty = await calculate_qty()
         
         # Определяем сторону для MEXC API
@@ -491,8 +518,12 @@ async def webhook(request: Request):
             return {"status": "error", "message": "signal must be 'buy', 'sell' or 'close'"}
         
         if signal == "close":
+             # Создаем задачу, чтобы не блокировать вебхук, 
+             # а ошибки обрабатываются внутри close_position_mexc
              asyncio.create_task(close_position_mexc())
         else:
+             # Создаем задачу, чтобы не блокировать вебхук, 
+             # а ошибки обрабатываются внутри open_position_mexc
              asyncio.create_task(open_position_mexc(signal))
         
         return {"status": "ok", "message": f"{signal} signal received"}
