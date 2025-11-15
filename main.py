@@ -33,10 +33,9 @@ RISK_PERCENT = float(os.getenv("RISK_PERCENT", 25))
 LEVERAGE = int(os.getenv("LEVERAGE", 10))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-# === Исправленный формат символов для MEXC ===
-SYMBOL_SPOT = "XRPUSDT"  # Для спотовой торговли
-SYMBOL_FUTURES = "XRP_USDT"  # Для фьючерсов (правильный формат для MEXC)
-SYMBOL = SYMBOL_FUTURES  # Используем фьючерсы
+# === Исправленный формат символов для CCXT ===
+# CCXT использует стандартный формат для фьючерсов MEXC
+SYMBOL = "XRP/USDT:USDT"  # Правильный формат для CCXT
 
 logger.info("=== ИНИЦИАЛИЗАЦИЯ MEXC БОТА ===")
 
@@ -80,6 +79,15 @@ async def error_handler(operation: str):
             pass
         raise
 
+async def load_markets_once():
+    """Загрузить рынки один раз при старте"""
+    global markets_loaded
+    if not hasattr(load_markets_once, 'markets'):
+        logger.info("Загрузка информации о рынках...")
+        load_markets_once.markets = await exchange.load_markets()
+        logger.info(f"Загружено {len(load_markets_once.markets)} рынков")
+    return load_markets_once.markets
+
 async def get_current_price() -> float:
     """Получить текущую цену символа"""
     async with error_handler("get_current_price"):
@@ -112,27 +120,51 @@ async def calculate_qty(usd_amount: float) -> float:
         if price <= 0:
             raise ValueError("Не удалось получить цену")
         
-        # Рассчитываем количество
+        # Рассчитываем базовое количество
         quantity = usd_amount / price
         
-        # Получаем информацию о рынке для минимального количества
-        market = await exchange.load_markets()
-        symbol_info = market[SYMBOL]
+        # Загружаем информацию о рынках
+        markets = await load_markets_once()
         
-        # Округляем до правильного шага
-        if symbol_info.get('precision', {}).get('amount'):
-            precision = symbol_info['precision']['amount']
-            quantity = exchange.amount_to_precision(SYMBOL, quantity)
+        # Получаем информацию о символе
+        if SYMBOL not in markets:
+            available_symbols = [sym for sym in markets.keys() if 'XRP' in sym and 'USDT' in sym]
+            logger.warning(f"Символ {SYMBOL} не найден. Доступные символы с XRP: {available_symbols[:5]}")
+            # Используем первый доступный символ с XRP если наш не найден
+            if available_symbols:
+                global SYMBOL
+                SYMBOL = available_symbols[0]
+                logger.info(f"Автоматически выбран символ: {SYMBOL}")
+            else:
+                raise ValueError(f"Символ {SYMBOL} не найден и нет альтернатив")
+        
+        symbol_info = markets[SYMBOL]
+        
+        # Получаем precision для amount
+        amount_precision = symbol_info.get('precision', {}).get('amount')
+        if amount_precision:
+            # Округляем до нужной точности
+            if isinstance(amount_precision, (int, float)):
+                quantity = round(quantity, amount_precision)
+            else:
+                # Для сложной precision (например, шаг 0.1)
+                quantity = exchange.amount_to_precision(SYMBOL, quantity)
         
         quantity = float(quantity)
         
         # Проверяем минимальное количество
-        min_amount = symbol_info.get('limits', {}).get('amount', {}).get('min', 0)
+        min_amount = symbol_info.get('limits', {}).get('amount', {}).get('min', 0.1)
         if quantity < min_amount:
             quantity = min_amount
             logger.warning(f"Количество увеличено до минимального: {min_amount}")
         
-        logger.info(f"Рассчитано количество: {quantity} {SYMBOL} за {usd_amount} USDT")
+        # Проверяем максимальное количество (если есть)
+        max_amount = symbol_info.get('limits', {}).get('amount', {}).get('max')
+        if max_amount and quantity > max_amount:
+            quantity = max_amount
+            logger.warning(f"Количество уменьшено до максимального: {max_amount}")
+        
+        logger.info(f"Рассчитано количество: {quantity} {SYMBOL} за {usd_amount} USDT (цена: {price})")
         return quantity
 
 async def check_order_status(order_id: str):
@@ -141,11 +173,14 @@ async def check_order_status(order_id: str):
         order = await exchange.fetch_order(order_id, SYMBOL)
         
         # Для рыночных ордеров используем cummulativeQuoteQty для расчета реальной цены
-        if order['type'] == 'market' and order['filled'] > 0:
-            cum_quote_qty = float(order['info'].get('cummulativeQuoteQty', 0))
+        if order['filled'] > 0:
+            cum_quote_qty = float(order.get('cost', 0))
+            if cum_quote_qty == 0:
+                cum_quote_qty = float(order['info'].get('cummulativeQuoteQty', 0))
+            
             filled_qty = float(order['filled'])
             
-            if filled_qty > 0:
+            if filled_qty > 0 and cum_quote_qty > 0:
                 actual_price = cum_quote_qty / filled_qty
                 logger.info(f"Реальная цена исполнения: {actual_price:.6f}")
                 order['actual_price'] = actual_price
@@ -227,12 +262,16 @@ async def close_position():
 async def get_position_info():
     """Получить информацию о текущей позиции"""
     async with error_handler("get_position_info"):
-        positions = await exchange.fetch_positions([SYMBOL])
-        for pos in positions:
-            if (pos['symbol'] == SYMBOL.replace("_", "/") and 
-                float(pos['contracts']) > 0):
-                return pos
-        return None
+        try:
+            positions = await exchange.fetch_positions([SYMBOL])
+            for pos in positions:
+                if (pos['symbol'] == SYMBOL.replace(":USDT", "").replace("/", "_") and 
+                    float(pos.get('contracts', 0)) > 0):
+                    return pos
+            return None
+        except Exception as e:
+            logger.warning(f"Не удалось получить позиции: {e}")
+            return None
 
 async def open_position(signal: str, amount_usd=None):
     """Открыть позицию (исправленная версия для MEXC)"""
@@ -240,6 +279,9 @@ async def open_position(signal: str, amount_usd=None):
     
     async with error_handler("open_position"):
         logger.info(f"🚀 ОТКРЫТИЕ ПОЗИЦИИ {signal.upper()}")
+        
+        # Загружаем рынки при первом вызове
+        await load_markets_once()
         
         # Проверяем, есть ли активная позиция
         if active_position:
@@ -317,10 +359,16 @@ async def startup_event():
     async with error_handler("startup"):
         logger.info("🚀 ЗАПУСК БОТА")
         
+        # Загружаем рынки при старте
+        markets = await load_markets_once()
+        
         # Проверяем подключение
         balance = await check_balance()
         price = await get_current_price()
         await set_leverage()
+        
+        # Находим все доступные XRP пары для информации
+        xrp_symbols = [sym for sym in markets.keys() if 'XRP' in sym and 'USDT' in sym]
         
         msg = f"""✅ MEXC Futures Bot ЗАПУЩЕН!
 
@@ -329,6 +377,8 @@ async def startup_event():
 💰 Цена: ${price:.4f}
 ⚡ Плечо: {LEVERAGE}x
 📈 Риск: {RISK_PERCENT}%
+
+Доступные XRP пары: {', '.join(xrp_symbols[:3])}...
 
 💡 Готов к работе!"""
         
@@ -389,6 +439,7 @@ async def health_check():
         price = await get_current_price()
         balance = await check_balance()
         position_info = await get_position_info()
+        markets = await load_markets_once()
         
         return {
             "status": "healthy",
@@ -398,6 +449,8 @@ async def health_check():
             "current_price": price,
             "balance": balance,
             "position_info": position_info,
+            "symbol": SYMBOL,
+            "available_xrp_symbols": [sym for sym in markets.keys() if 'XRP' in sym and 'USDT' in sym][:5],
             "timestamp": time.time()
         }
     except Exception as e:
@@ -413,6 +466,7 @@ async def home():
         balance = await check_balance()
         price = await get_current_price()
         position_info = await get_position_info()
+        markets = await load_markets_once()
         
         status = "АКТИВНА" if active_position else "НЕТ"
         position_details = ""
@@ -422,6 +476,9 @@ async def home():
             <p><b>Размер позиции:</b> {position_info.get('contracts', 0)}</p>
             <p><b>PnL:</b> ${position_info.get('unrealizedPnl', 0):.2f}</p>
             """
+        
+        # Список доступных XRP символов
+        xrp_symbols = [sym for sym in markets.keys() if 'XRP' in sym and 'USDT' in sym]
         
         html = f"""
         <html>
@@ -434,6 +491,7 @@ async def home():
                     .success {{ color: #00b894; }}
                     .warning {{ color: #fdcb6e; }}
                     .danger {{ color: #e17055; }}
+                    .info {{ color: #74b9ff; }}
                 </style>
             </head>
             <body>
@@ -461,6 +519,11 @@ async def home():
                 <div class="card">
                     <h3>📈 Последняя сделка</h3>
                     <pre>{json.dumps(last_trade_info, indent=2, ensure_ascii=False) if last_trade_info else "Нет данных"}</pre>
+                </div>
+                
+                <div class="card info">
+                    <h3>🔍 Доступные XRP символы</h3>
+                    <p>{', '.join(xrp_symbols[:10])}</p>
                 </div>
                 
                 <div class="card">
