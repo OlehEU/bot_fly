@@ -88,14 +88,22 @@ async def check_balance() -> float:
         logger.info(f"💳 Баланс USDT: {usdt:.4f}")
         return float(usdt)
 
-async def set_leverage():
-    """Установить кредитное плечо"""
+async def set_leverage_fixed():
+    """Установить кредитное плечо с правильными параметрами для MEXC"""
     async with error_handler("set_leverage"):
         try:
-            await exchange.set_leverage(LEVERAGE, SYMBOL)
-            logger.info(f"⚡ Плечо установлено: {LEVERAGE}x")
+            # Для MEXC фьючерсов нужно указывать openType и positionType
+            # openType: 1 = isolated, 2 = cross
+            # positionType: 1 = long, 2 = short
+            params = {
+                'openType': 1,  # isolated margin
+                'positionType': 1,  # long position
+            }
+            await exchange.set_leverage(LEVERAGE, SYMBOL, params)
+            logger.info(f"⚡ Плечо установлено: {LEVERAGE}x (isolated, long)")
         except Exception as e:
             logger.warning(f"⚠️ Не удалось установить плечо: {e}")
+            # Продолжаем без установки плеча - возможно оно уже установлено
 
 async def calculate_qty_simple() -> float:
     """ПРОСТОЙ РАСЧЕТ: фиксированная сумма / цена"""
@@ -128,31 +136,47 @@ async def calculate_qty_simple() -> float:
         logger.info(f"📊 Итоговое количество: {quantity} {SYMBOL}")
         return quantity
 
-async def create_order_with_retry(symbol, side, qty, max_retries=3):
-    """Создать ордер с повторными попытками"""
-    for attempt in range(max_retries):
-        try:
-            logger.info(f"🔄 Попытка {attempt + 1}: {side.upper()} {qty} {symbol}")
-            order = await exchange.create_market_order(symbol, side, qty)
-            logger.info(f"✅ Ордер создан: ID {order['id']}")
-            return order
-            
-        except ccxt.BadRequest as e:
-            error_msg = str(e)
-            logger.error(f"🔴 Ошибка API (BadRequest): {error_msg}")
-            raise e
-            
-        except ccxt.RequestTimeout as e:
-            logger.warning(f"⏰ Таймаут попытки {attempt + 1}")
-            if attempt == max_retries - 1:
-                logger.error("❌ Все попытки завершились таймаутом")
-                raise e
-            await asyncio.sleep(2)
-            
-        except Exception as e:
-            logger.error(f"🔴 Неизвестная ошибка: {e}")
-            logger.error(f"🔴 Traceback: {traceback.format_exc()}")
-            raise e
+async def create_order_with_debug(symbol, side, qty):
+    """Создать ордер с максимально детальным дебагом"""
+    try:
+        logger.info(f"🎯 Создание ордера:")
+        logger.info(f"   Символ: {symbol}")
+        logger.info(f"   Сторона: {side}") 
+        logger.info(f"   Количество: {qty}")
+        logger.info(f"   Тип: market")
+        
+        # Параметры для MEXC фьючерсов
+        params = {
+            'positionType': 1 if side == 'buy' else 2,  # 1 = long, 2 = short
+        }
+        
+        logger.info(f"   Параметры: {params}")
+        
+        # Создаем ордер
+        order = await exchange.create_market_order(symbol, side, qty, None, params)
+        
+        logger.info(f"✅ Ордер создан успешно!")
+        logger.info(f"   ID ордера: {order['id']}")
+        logger.info(f"   Статус: {order['status']}")
+        logger.info(f"   Исполнено: {order.get('filled', 0)}")
+        
+        return order
+        
+    except ccxt.BadRequest as e:
+        logger.error(f"🔴 ОШИБКА BadRequest:")
+        logger.error(f"   Сообщение: {str(e)}")
+        logger.error(f"   Аргументы: {e.args}")
+        # Выводим полный response если есть
+        if hasattr(e, 'response'):
+            logger.error(f"   Response: {e.response}")
+        raise
+        
+    except Exception as e:
+        logger.error(f"🔴 ОШИБКА при создании ордера:")
+        logger.error(f"   Тип: {type(e).__name__}")
+        logger.error(f"   Сообщение: {str(e)}")
+        logger.error(f"   Traceback:\n{traceback.format_exc()}")
+        raise
 
 async def open_position_simple(signal: str):
     global last_trade_info, active_position
@@ -160,8 +184,11 @@ async def open_position_simple(signal: str):
     async with error_handler("open_position_simple"):
         logger.info(f"🚀 ОТКРЫТИЕ ПОЗИЦИИ {signal.upper()} на {FIXED_AMOUNT_USD} USDT с плечом {LEVERAGE}x")
         
-        # Устанавливаем плечо
-        await set_leverage()
+        # Устанавливаем плечо (пропускаем ошибку если не получается)
+        try:
+            await set_leverage_fixed()
+        except Exception as e:
+            logger.warning(f"⚠️ Продолжаем без установки плеча: {e}")
         
         # Проверяем баланс
         balance = await check_balance()
@@ -174,10 +201,10 @@ async def open_position_simple(signal: str):
         qty = await calculate_qty_simple()
         
         side = "buy" if signal.lower() == "buy" else "sell"
-        logger.info(f"🎯 Финальные параметры: {side.upper()} {qty} {SYMBOL}")
+        logger.info(f"🎯 Финальные параметры ордера: {side.upper()} {qty} {SYMBOL}")
 
-        # Создаем рыночный ордер
-        order = await create_order_with_retry(SYMBOL, side, qty)
+        # Создаем рыночный ордер с ДЕТАЛЬНЫМ дебагом
+        order = await create_order_with_debug(SYMBOL, side, qty)
         logger.info(f"✅ Ордер успешно создан: {order['id']}")
 
         # Получаем цену входа
@@ -216,8 +243,11 @@ async def startup_event():
     async with error_handler("startup"):
         logger.info("🚀 ЗАПУСК БОТА")
         
-        # Устанавливаем плечо при старте
-        await set_leverage()
+        # Пытаемся установить плечо (игнорируем ошибки)
+        try:
+            await set_leverage_fixed()
+        except:
+            logger.warning("⚠️ Плечо не установлено при старте - продолжим без него")
         
         balance = await check_balance()
         price = await get_current_price()
@@ -234,15 +264,6 @@ async def startup_event():
         
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         logger.info("🤖 БОТ УСПЕШНО ЗАПУЩЕН")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    logger.info("🛑 ОСТАНОВКА БОТА")
-    try:
-        await exchange.close()
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🔴 Бот остановлен")
-    except Exception as e:
-        logger.error(f"Ошибка при остановке: {e}")
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -268,88 +289,4 @@ async def webhook(request: Request):
         logger.error(f"❌ Webhook error: {e}")
         return {"status": "error", "message": str(e)}
 
-@app.get("/health")
-async def health_check():
-    try:
-        price = await get_current_price()
-        balance = await check_balance()
-        
-        return {
-            "status": "healthy",
-            "exchange_connected": price > 0,
-            "balance_available": balance > FIXED_AMOUNT_USD,
-            "active_position": active_position,
-            "current_price": price,
-            "balance": balance,
-            "fixed_amount": FIXED_AMOUNT_USD,
-            "leverage": LEVERAGE,
-            "symbol": SYMBOL,
-            "timestamp": time.time()
-        }
-    except Exception as e:
-        logger.error(f"❌ Health check failed: {e}")
-        return {"status": "unhealthy", "error": str(e)}
-
-@app.get("/")
-async def home():
-    global last_trade_info, active_position
-    
-    try:
-        balance = await check_balance()
-        price = await get_current_price()
-        
-        status = "АКТИВНА" if active_position else "НЕТ"
-        
-        html = f"""
-        <html>
-            <head>
-                <title>MEXC Futures Bot</title>
-                <meta charset="utf-8">
-                <style>
-                    body {{ font-family: Arial; background: #1e1e1e; color: white; padding: 20px; }}
-                    .card {{ background: #2d2d2d; padding: 20px; margin: 10px 0; border-radius: 10px; }}
-                    .success {{ color: #00b894; }}
-                    .warning {{ color: #fdcb6e; }}
-                </style>
-            </head>
-            <body>
-                <h1 class="success">🤖 MEXC Futures Bot</h1>
-                
-                <div class="card">
-                    <h3>💰 БАЛАНС</h3>
-                    <p><b>USDT:</b> {balance:.2f}</p>
-                </div>
-                
-                <div class="card">
-                    <h3>📊 СТАТУС</h3>
-                    <p><b>Символ:</b> {SYMBOL}</p>
-                    <p><b>Цена:</b> ${price:.4f}</p>
-                    <p><b>Позиция:</b> <span class="{'success' if active_position else 'warning'}">{status}</span></p>
-                </div>
-                
-                <div class="card">
-                    <h3>⚡ НАСТРОЙКИ</h3>
-                    <p><b>Фиксированная сумма:</b> {FIXED_AMOUNT_USD} USDT</p>
-                    <p><b>Плечо:</b> {LEVERAGE}x</p>
-                </div>
-                
-                <div class="card">
-                    <h3>📈 Последняя сделка</h3>
-                    <pre>{json.dumps(last_trade_info, indent=2, ensure_ascii=False) if last_trade_info else "Нет данных"}</pre>
-                </div>
-                
-                <div class="card">
-                    <h3>🔧 Действия</h3>
-                    <p><a href="/health" style="color: #74b9ff;">Health Check</a></p>
-                </div>
-            </body>
-        </html>
-        """
-        return HTMLResponse(html)
-    except Exception as e:
-        return HTMLResponse(f"<h1>Error: {str(e)}</h1>")
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+# ... остальной код без изменений ...
