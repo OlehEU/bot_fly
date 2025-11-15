@@ -3,3 +3,5 @@ uvicorn[standard]
 python-telegram-bot
 ccxt
 aiogram
+slowapi
+
