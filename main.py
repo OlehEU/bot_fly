@@ -28,12 +28,13 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
 MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", 25))
-LEVERAGE = int(os.getenv("LEVERAGE", 10))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
+# === ФИКСИРОВАННАЯ СУММА ===
+FIXED_AMOUNT_USD = 5  # Всегда торгуем на 5 USDT
+
 # === Символ ===
-SYMBOL = "XRP/USDT"  # Правильный формат для CCXT
+SYMBOL = "XRP/USDT"
 
 logger.info("=== ИНИЦИАЛИЗАЦИЯ MEXC БОТА ===")
 
@@ -45,7 +46,7 @@ exchange = ccxt.mexc({
     'apiKey': MEXC_API_KEY,
     'secret': MEXC_API_SECRET,
     'enableRateLimit': True,
-    'options': {'defaultType': 'swap'},
+    'timeout': 30000,
 })
 
 # === FastAPI ===
@@ -61,7 +62,6 @@ async def error_handler(operation: str):
     except Exception as e:
         error_msg = f"❌ Ошибка в {operation}: {str(e)}"
         logger.error(error_msg)
-        logger.error(traceback.format_exc())
         try:
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=error_msg[:4000])
         except:
@@ -72,68 +72,54 @@ async def get_current_price() -> float:
     async with error_handler("get_current_price"):
         ticker = await exchange.fetch_ticker(SYMBOL)
         price = float(ticker['last'])
-        logger.info(f"Текущая цена {SYMBOL}: {price:.6f}")
+        logger.info(f"💰 Текущая цена {SYMBOL}: {price:.6f}")
         return price
 
 async def check_balance() -> float:
     async with error_handler("check_balance"):
         balance_data = await exchange.fetch_balance()
         usdt = balance_data['total'].get('USDT', 0)
-        logger.info(f"Баланс USDT: {usdt:.4f}")
+        logger.info(f"💳 Баланс USDT: {usdt:.4f}")
         return float(usdt)
 
-async def calculate_qty(usd_amount: float) -> float:
-    async with error_handler("calculate_qty"):
+async def calculate_qty_simple() -> float:
+    """ПРОСТОЙ РАСЧЕТ: фиксированная сумма / текущая цена"""
+    async with error_handler("calculate_qty_simple"):
         price = await get_current_price()
-        if price <= 0:
-            raise ValueError("Не удалось получить цену")
         
-        # Простой расчет количества
-        quantity = usd_amount / price
+        # Простой расчет: 5 USDT / цена
+        quantity = FIXED_AMOUNT_USD / price
         
-        # Округляем до 1 знака (минимальный шаг для XRP)
-        quantity = round(quantity, 1)
+        # Округляем до целых чисел (XRP обычно целыми)
+        quantity = int(quantity)
         
-        # Минимальное количество
-        if quantity < 1.0:
-            quantity = 1.0
+        # Минимум 1 XRP
+        if quantity < 1:
+            quantity = 1
             
-        logger.info(f"Рассчитано количество: {quantity} {SYMBOL} за {usd_amount} USDT")
-        return quantity
+        logger.info(f"📊 Купим {quantity} XRP за {FIXED_AMOUNT_USD} USDT (цена: {price:.4f})")
+        return float(quantity)
 
-async def open_position(signal: str, amount_usd=None):
+async def open_position_simple(signal: str):
     global last_trade_info, active_position
     
-    async with error_handler("open_position"):
-        logger.info(f"🚀 ОТКРЫТИЕ ПОЗИЦИИ {signal.upper()}")
+    async with error_handler("open_position_simple"):
+        logger.info(f"🚀 ОТКРЫТИЕ ПОЗИЦИИ {signal.upper()} на {FIXED_AMOUNT_USD} USDT")
         
         # Проверяем баланс
         balance = await check_balance()
-        logger.info(f"Текущий баланс: {balance:.2f} USDT")
+        if balance < FIXED_AMOUNT_USD:
+            raise ValueError(f"❌ Недостаточно средств. Нужно: {FIXED_AMOUNT_USD} USDT, есть: {balance:.2f} USDT")
+
+        # Рассчитываем количество (ПРОСТОЙ РАСЧЕТ)
+        qty = await calculate_qty_simple()
         
-        if balance <= 5:
-            raise ValueError(f"Недостаточно средств: {balance:.2f} USDT")
-
-        # Рассчитываем сумму для торговли
-        usd = amount_usd or (balance * RISK_PERCENT / 100)
-        logger.info(f"Риск: {RISK_PERCENT}% → {usd:.2f} USDT из {balance:.2f}")
-
-        if usd < 5:
-            usd = 5
-
-        # Рассчитываем количество
-        qty = await calculate_qty(usd)
-        logger.info(f"Рассчитанное количество: {qty}")
-        
-        if qty <= 0:
-            raise ValueError(f"Неверное количество: {qty}")
-
         side = "buy" if signal.lower() == "buy" else "sell"
-        logger.info(f"Открываем {side.upper()} {qty} {SYMBOL}")
+        logger.info(f"🔄 Открываем {side.upper()} {qty} {SYMBOL}")
 
         # Создаем рыночный ордер
         order = await exchange.create_market_order(SYMBOL, side, qty)
-        logger.info(f"Ордер создан: {order['id']}")
+        logger.info(f"✅ Ордер создан: {order['id']}")
 
         # Получаем цену входа
         entry_price = await get_current_price()
@@ -145,17 +131,17 @@ async def open_position(signal: str, amount_usd=None):
             "side": side,
             "qty": qty, 
             "entry": entry_price, 
+            "amount_usd": FIXED_AMOUNT_USD,
             "balance": balance,
             "order_id": order['id'],
-            "timestamp": time.time(),
-            "leverage": LEVERAGE
+            "timestamp": time.time()
         }
 
         msg = (f"✅ {side.upper()} ОТКРЫТА\n"
                f"Символ: {SYMBOL}\n"
-               f"Количество: {qty}\n"
-               f"Вход: ${entry_price:.4f}\n"
-               f"Плечо: {LEVERAGE}x\n"
+               f"Количество: {qty} XRP\n"
+               f"Сумма: {FIXED_AMOUNT_USD} USDT\n"
+               f"Цена: ${entry_price:.4f}\n"
                f"Баланс: {balance:.2f} USDT")
         
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
@@ -170,26 +156,17 @@ async def startup_event():
         balance = await check_balance()
         price = await get_current_price()
         
-        msg = f"""✅ MEXC Futures Bot ЗАПУЩЕН!
+        msg = f"""✅ MEXC Spot Bot ЗАПУЩЕН!
 
 💰 Баланс: {balance:.2f} USDT
 📊 Символ: {SYMBOL}
 💰 Цена: ${price:.4f}
-⚡ Плечо: {LEVERAGE}x
-📈 Риск: {RISK_PERCENT}%
+💵 Фиксированная сумма: {FIXED_AMOUNT_USD} USDT
 
 💡 Готов к работе!"""
         
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         logger.info("🤖 БОТ УСПЕШНО ЗАПУЩЕН")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    logger.info("🛑 ОСТАНОВКА БОТА")
-    try:
-        await exchange.close()
-    except:
-        pass
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -202,17 +179,18 @@ async def webhook(request: Request):
         data = await request.json()
         signal = data.get("signal")
         
-        logger.info(f"Webhook данные: signal={signal}")
+        logger.info(f"📊 Webhook данные: signal={signal}")
         
         if signal not in ["buy", "sell"]:
             return {"status": "error", "message": "signal must be 'buy' or 'sell'"}
         
-        asyncio.create_task(open_position(signal))
+        # Запускаем открытие позиции в фоне
+        asyncio.create_task(open_position_simple(signal))
         
         return {"status": "ok", "message": f"{signal} signal received"}
         
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        logger.error(f"❌ Webhook error: {e}")
         return {"status": "error", "message": str(e)}
 
 @app.get("/health")
@@ -224,15 +202,16 @@ async def health_check():
         return {
             "status": "healthy",
             "exchange_connected": price > 0,
-            "balance_available": balance > 0,
+            "balance_available": balance > FIXED_AMOUNT_USD,
             "active_position": active_position,
             "current_price": price,
             "balance": balance,
+            "fixed_amount": FIXED_AMOUNT_USD,
             "symbol": SYMBOL,
             "timestamp": time.time()
         }
     except Exception as e:
-        logger.error(f"Health check failed: {e}")
+        logger.error(f"❌ Health check failed: {e}")
         return {"status": "unhealthy", "error": str(e)}
 
 @app.get("/")
@@ -248,7 +227,7 @@ async def home():
         html = f"""
         <html>
             <head>
-                <title>MEXC Futures Bot</title>
+                <title>MEXC Simple Bot</title>
                 <meta charset="utf-8">
                 <style>
                     body {{ font-family: Arial; background: #1e1e1e; color: white; padding: 20px; }}
@@ -258,7 +237,7 @@ async def home():
                 </style>
             </head>
             <body>
-                <h1 class="success">🤖 MEXC Futures Bot</h1>
+                <h1 class="success">🤖 MEXC Simple Bot</h1>
                 
                 <div class="card">
                     <h3>💰 БАЛАНС</h3>
@@ -274,8 +253,7 @@ async def home():
                 
                 <div class="card">
                     <h3>⚡ НАСТРОЙКИ</h3>
-                    <p><b>Плечо:</b> {LEVERAGE}x</p>
-                    <p><b>Риск:</b> {RISK_PERCENT}%</p>
+                    <p><b>Фиксированная сумма:</b> {FIXED_AMOUNT_USD} USDT</p>
                 </div>
                 
                 <div class="card">
