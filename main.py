@@ -103,7 +103,6 @@ async def set_leverage_fixed():
             logger.info(f"⚡ Плечо установлено: {LEVERAGE}x (isolated, long)")
         except Exception as e:
             logger.warning(f"⚠️ Не удалось установить плечо: {e}")
-            # Продолжаем без установки плеча - возможно оно уже установлено
 
 async def calculate_qty_simple() -> float:
     """ПРОСТОЙ РАСЧЕТ: фиксированная сумма / цена"""
@@ -265,6 +264,15 @@ async def startup_event():
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         logger.info("🤖 БОТ УСПЕШНО ЗАПУЩЕН")
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("🛑 ОСТАНОВКА БОТА")
+    try:
+        await exchange.close()
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🔴 Бот остановлен")
+    except Exception as e:
+        logger.error(f"Ошибка при остановке: {e}")
+
 @app.post("/webhook")
 async def webhook(request: Request):
     logger.info("📨 ПОЛУЧЕН WEBHOOK ЗАПРОС")
@@ -289,4 +297,88 @@ async def webhook(request: Request):
         logger.error(f"❌ Webhook error: {e}")
         return {"status": "error", "message": str(e)}
 
-# ... остальной код без изменений ...
+@app.get("/health")
+async def health_check():
+    try:
+        price = await get_current_price()
+        balance = await check_balance()
+        
+        return {
+            "status": "healthy",
+            "exchange_connected": price > 0,
+            "balance_available": balance > FIXED_AMOUNT_USD,
+            "active_position": active_position,
+            "current_price": price,
+            "balance": balance,
+            "fixed_amount": FIXED_AMOUNT_USD,
+            "leverage": LEVERAGE,
+            "symbol": SYMBOL,
+            "timestamp": time.time()
+        }
+    except Exception as e:
+        logger.error(f"❌ Health check failed: {e}")
+        return {"status": "unhealthy", "error": str(e)}
+
+@app.get("/")
+async def home():
+    global last_trade_info, active_position
+    
+    try:
+        balance = await check_balance()
+        price = await get_current_price()
+        
+        status = "АКТИВНА" if active_position else "НЕТ"
+        
+        html = f"""
+        <html>
+            <head>
+                <title>MEXC Futures Bot</title>
+                <meta charset="utf-8">
+                <style>
+                    body {{ font-family: Arial; background: #1e1e1e; color: white; padding: 20px; }}
+                    .card {{ background: #2d2d2d; padding: 20px; margin: 10px 0; border-radius: 10px; }}
+                    .success {{ color: #00b894; }}
+                    .warning {{ color: #fdcb6e; }}
+                </style>
+            </head>
+            <body>
+                <h1 class="success">🤖 MEXC Futures Bot</h1>
+                
+                <div class="card">
+                    <h3>💰 БАЛАНС</h3>
+                    <p><b>USDT:</b> {balance:.2f}</p>
+                </div>
+                
+                <div class="card">
+                    <h3>📊 СТАТУС</h3>
+                    <p><b>Символ:</b> {SYMBOL}</p>
+                    <p><b>Цена:</b> ${price:.4f}</p>
+                    <p><b>Позиция:</b> <span class="{'success' if active_position else 'warning'}">{status}</span></p>
+                </div>
+                
+                <div class="card">
+                    <h3>⚡ НАСТРОЙКИ</h3>
+                    <p><b>Фиксированная сумма:</b> {FIXED_AMOUNT_USD} USDT</p>
+                    <p><b>Плечо:</b> {LEVERAGE}x</p>
+                </div>
+                
+                <div class="card">
+                    <h3>📈 Последняя сделка</h3>
+                    <pre>{json.dumps(last_trade_info, indent=2, ensure_ascii=False) if last_trade_info else "Нет данных"}</pre>
+                </div>
+                
+                <div class="card">
+                    <h3>🔧 Действия</h3>
+                    <p><a href="/health" style="color: #74b9ff;">Health Check</a></p>
+                </div>
+            </body>
+        </html>
+        """
+        return HTMLResponse(html)
+    except Exception as e:
+        return HTMLResponse(f"<h1>Error: {str(e)}</h1>")
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
