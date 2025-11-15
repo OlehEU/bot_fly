@@ -5,5 +5,7 @@ ccxt
 aiogram
 slowapi
 requests
+httpx
+
 
 
