@@ -28,14 +28,12 @@ for secret in REQUIRED_SECRETS:
     if not os.getenv(secret):
         raise EnvironmentError(f"ОШИБКА: {secret} не задан в секретах!")
 
-# === НАСТРОЙКИ ИЗ СЕКРЕТОВ (БЕЗ ЗНАЧЕНИЙ ПО УМОЛЧАНИЮ) ===
+# === НАСТРОЙКИ ИЗ СЕКРЕТОВ ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
 MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-
-# === ОСНОВНЫЕ НАСТРОЙКИ ТОЛЬКО ИЗ СЕКРЕТОВ ===
 SYMBOL = os.getenv("SYMBOL")
 FIXED_AMOUNT_USD = float(os.getenv("FIXED_AMOUNT_USD"))
 LEVERAGE = int(os.getenv("LEVERAGE"))
@@ -68,7 +66,7 @@ async def error_handler(operation: str):
     try:
         yield
     except Exception as e:
-        error_msg = f"❌ Ошибка в {operation}: {str(e)}"
+        error_msg = f"❌ Ошибка в {operation}: {str(e)}\n{traceback.format_exc()}"
         logger.error(error_msg)
         try:
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=error_msg[:4000])
@@ -107,36 +105,68 @@ async def calculate_qty_simple() -> float:
         # Расчет с учетом плеча
         quantity = (FIXED_AMOUNT_USD * LEVERAGE) / price
         
+        logger.info(f"🔢 Расчет: ({FIXED_AMOUNT_USD} * {LEVERAGE}) / {price} = {quantity}")
+        
         # Округляем до 1 знака для фьючерсов
         quantity = round(quantity, 1)
         
         # Проверяем минимальное количество
         if quantity < 1.0:
             quantity = 1.0
-            logger.warning(f"⚠️ Количество увеличено до минимального: 1 XRP")
+            logger.warning(f"⚠️ Количество увеличено до минимального: 1")
         
         # Проверяем минимальную сумму (2.2616 USDT)
         order_value = quantity * price
+        logger.info(f"💵 Стоимость ордера: {quantity} * {price} = {order_value:.2f} USDT")
+        
         if order_value < 2.2616:
             min_quantity = 2.2616 / price
             quantity = max(quantity, min_quantity)
             quantity = round(quantity, 1)
             logger.warning(f"⚠️ Количество увеличено для минимальной суммы 2.2616 USDT")
             
-        logger.info(f"📊 Купим {quantity} {SYMBOL} за {FIXED_AMOUNT_USD} USDT с плечом {LEVERAGE}x")
+        logger.info(f"📊 Итоговое количество: {quantity} {SYMBOL}")
         return quantity
+
+async def create_order_with_retry(symbol, side, qty, max_retries=3):
+    """Создать ордер с повторными попытками"""
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"🔄 Попытка {attempt + 1}: {side.upper()} {qty} {symbol}")
+            order = await exchange.create_market_order(symbol, side, qty)
+            logger.info(f"✅ Ордер создан: ID {order['id']}")
+            return order
+            
+        except ccxt.BadRequest as e:
+            error_msg = str(e)
+            logger.error(f"🔴 Ошибка API (BadRequest): {error_msg}")
+            raise e
+            
+        except ccxt.RequestTimeout as e:
+            logger.warning(f"⏰ Таймаут попытки {attempt + 1}")
+            if attempt == max_retries - 1:
+                logger.error("❌ Все попытки завершились таймаутом")
+                raise e
+            await asyncio.sleep(2)
+            
+        except Exception as e:
+            logger.error(f"🔴 Неизвестная ошибка: {e}")
+            logger.error(f"🔴 Traceback: {traceback.format_exc()}")
+            raise e
 
 async def open_position_simple(signal: str):
     global last_trade_info, active_position
     
     async with error_handler("open_position_simple"):
-        logger.info(f"🚀 ОТКРЫТИЕ ПОЗИЦИИ {signal.upper()} на {FIXED_AMOUNT_USD} USDT")
+        logger.info(f"🚀 ОТКРЫТИЕ ПОЗИЦИИ {signal.upper()} на {FIXED_AMOUNT_USD} USDT с плечом {LEVERAGE}x")
         
         # Устанавливаем плечо
         await set_leverage()
         
         # Проверяем баланс
         balance = await check_balance()
+        logger.info(f"💳 Баланс: {balance:.2f} USDT, Требуется: {FIXED_AMOUNT_USD} USDT")
+        
         if balance < FIXED_AMOUNT_USD:
             raise ValueError(f"❌ Недостаточно средств. Нужно: {FIXED_AMOUNT_USD} USDT, есть: {balance:.2f} USDT")
 
@@ -144,11 +174,11 @@ async def open_position_simple(signal: str):
         qty = await calculate_qty_simple()
         
         side = "buy" if signal.lower() == "buy" else "sell"
-        logger.info(f"🔄 Открываем {side.upper()} {qty} {SYMBOL}")
+        logger.info(f"🎯 Финальные параметры: {side.upper()} {qty} {SYMBOL}")
 
         # Создаем рыночный ордер
-        order = await exchange.create_market_order(SYMBOL, side, qty)
-        logger.info(f"✅ Ордер создан: {order['id']}")
+        order = await create_order_with_retry(SYMBOL, side, qty)
+        logger.info(f"✅ Ордер успешно создан: {order['id']}")
 
         # Получаем цену входа
         entry_price = await get_current_price()
