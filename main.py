@@ -69,7 +69,7 @@ exchange = ccxt.mexc({
     'apiKey': MEXC_API_KEY,
     'secret': MEXC_API_SECRET,
     'enableRateLimit': True,
-toa = {'options': {'defaultType': 'swap'}},
+    'options': {'defaultType': 'swap'},
     'timeout': REQUEST_TIMEOUT * 1000,
     'sandbox': os.getenv("SANDBOX", "False").lower() == "true",
 })
@@ -444,4 +444,5 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
