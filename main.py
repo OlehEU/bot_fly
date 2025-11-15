@@ -421,16 +421,14 @@ async def startup_event():
         balance = balance_data['total']
         price = await get_current_price()
         
-        msg = f"""✅ MEXC Futures Bot ЗАПУЩЕН!
-
-💰 Баланс: {balance:.2f} USDT
-📊 Символ: {SYMBOL}
-💰 Цена: ${price:.4f}
-💵 Фиксированная сумма: {FIXED_AMOUNT_USDT} USDT
-⚡ Плечо: {LEVERAGE}x
-🔧 Формат: MEXC Native API
-
-💡 Готов к работе!"""
+        msg = (f"✅ MEXC Futures Bot ЗАПУЩЕН!\n\n"
+               f"💰 Баланс: {balance:.2f} USDT\n"
+               f"📊 Символ: {SYMBOL}\n"
+               f"💰 Цена: ${price:.4f}\n"
+               f"💵 Фиксированная сумма: {FIXED_AMOUNT_USDT} USDT\n"
+               f"⚡ Плечо: {LEVERAGE}x\n"
+               f"🔧 Формат: MEXC Native API\n\n"
+               f"💡 Готов к работе!")
         
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         logger.info("🤖 БОТ УСПЕШНО ЗАПУЩЕН")
@@ -605,7 +603,8 @@ async def home():
         status = "АКТИВНА" if active_position else "НЕТ"
         status_color = "success" if active_position else "warning"
         
-        html = f"""
+        # Исправленная HTML строка без обратных слешей в f-строках
+        html_content = f"""
         <html>
             <head>
                 <title>MEXC Futures Bot</title>
@@ -641,17 +640,18 @@ async def home():
         """
         
         if position_details:
-            html += f"""
+            pnl_class = "success" if position_details['unrealized_pnl'] > 0 else "danger"
+            html_content += f"""
                 <div class="card">
                     <h3>📈 ИНФОРМАЦИЯ О ПОЗИЦИИ</h3>
                     <p><b>Сторона:</b> {position_details['side'].upper()}</p>
                     <p><b>Контракты:</b> {position_details['contracts']}</p>
                     <p><b>Цена входа:</b> ${position_details['entry_price']:.4f}</p>
-                    <p><b>Незакрытый P&L:</b> <span class="{'success' if position_details['unrealized_pnl'] > 0 else 'danger'}">{position_details['unrealized_pnl']:.4f} USDT</span></p>
+                    <p><b>Незакрытый P&L:</b> <span class="{pnl_class}">{position_details['unrealized_pnl']:.4f} USDT</span></p>
                 </div>
             """
         
-        html += f"""
+        html_content += f"""
                 <div class="card">
                     <h3>⚡ НАСТРОЙКИ</h3>
                     <p><b>Фиксированная сумма:</b> {FIXED_AMOUNT_USDT} USDT</p>
@@ -673,25 +673,34 @@ MARGIN_CROSS = {MARGIN_CROSS}</pre>
         """
         
         if last_trade_info:
-            html += f"""
+            html_content += f"""
                 <div class="card">
                     <h3>📈 Последняя сделка</h3>
                     <pre>{json.dumps(last_trade_info, indent=2, ensure_ascii=False, default=str)}</pre>
                 </div>
             """
         
-        html += f"""
+        # Исправленная часть с кнопками
+        close_button = ""
+        if active_position:
+            close_button = '<form action="/close" method="post" style="margin: 10px 0;"><button type="submit" class="danger-btn">🔒 Принудительно закрыть позицию</button></form>'
+        
+        order_link = ""
+        if last_trade_info and 'order_id' in last_trade_info:
+            order_link = f'<p><a href="/order/{last_trade_info["order_id"]}" style="color: #74b9ff;">🔍 Проверить статус ордера</a></p>'
+        
+        html_content += f"""
                 <div class="card">
                     <h3>🔧 Действия</h3>
                     <p><a href="/health" style="color: #74b9ff;">Health Check</a></p>
-                    {"<form action=\"/close\" method=\"post\" style=\"margin: 10px 0;\">" + 
-                     "<button type=\"submit\" class=\"danger-btn\">🔒 Принудительно закрыть позицию</button>" + 
-                     "</form>" if active_position else ""}
+                    {close_button}
+                    {order_link}
                 </div>
             </body>
         </html>
         """
-        return HTMLResponse(html)
+        
+        return HTMLResponse(html_content)
     except Exception as e:
         return HTMLResponse(f"<h1>Error: {str(e)}</h1>")
 
