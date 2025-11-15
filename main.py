@@ -18,36 +18,41 @@ logging.basicConfig(
 logger = logging.getLogger("mexc-bot")
 
 # === Проверка секретов ===
-REQUIRED_SECRETS = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "MEXC_API_KEY", "MEXC_API_SECRET", "WEBHOOK_SECRET"]
+REQUIRED_SECRETS = [
+    "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "MEXC_API_KEY", 
+    "MEXC_API_SECRET", "WEBHOOK_SECRET", "SYMBOL", 
+    "FIXED_AMOUNT_USD", "LEVERAGE"
+]
+
 for secret in REQUIRED_SECRETS:
     if not os.getenv(secret):
-        raise EnvironmentError(f"ОШИБКА: {secret} не задан!")
+        raise EnvironmentError(f"ОШИБКА: {secret} не задан в секретах!")
 
-# === Настройки ===
+# === НАСТРОЙКИ ИЗ СЕКРЕТОВ (БЕЗ ЗНАЧЕНИЙ ПО УМОЛЧАНИЮ) ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
 MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-# === ФИКСИРОВАННАЯ СУММА ===
-FIXED_AMOUNT_USD = 5  # Всегда торгуем на 5 USDT
-
-# === Символ (ФЬЮЧЕРСЫ) ===
-SYMBOL = "XRP/USDT"  # ФЬЮЧЕРСНЫЙ формат
+# === ОСНОВНЫЕ НАСТРОЙКИ ТОЛЬКО ИЗ СЕКРЕТОВ ===
+SYMBOL = os.getenv("SYMBOL")
+FIXED_AMOUNT_USD = float(os.getenv("FIXED_AMOUNT_USD"))
+LEVERAGE = int(os.getenv("LEVERAGE"))
 
 logger.info("=== ИНИЦИАЛИЗАЦИЯ MEXC БОТА ===")
+logger.info(f"📊 Настройки: Символ={SYMBOL}, Сумма={FIXED_AMOUNT_USD}, Плечо={LEVERAGE}")
 
 # === Telegram ===
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# === MEXC Exchange (ФЬЮЧЕРСЫ) ===
+# === MEXC Exchange ===
 exchange = ccxt.mexc({
     'apiKey': MEXC_API_KEY,
     'secret': MEXC_API_SECRET,
     'enableRateLimit': True,
     'options': {
-        'defaultType': 'swap',  # ФЬЮЧЕРСЫ
+        'defaultType': 'swap',
     },
     'timeout': 30000,
 })
@@ -85,22 +90,40 @@ async def check_balance() -> float:
         logger.info(f"💳 Баланс USDT: {usdt:.4f}")
         return float(usdt)
 
+async def set_leverage():
+    """Установить кредитное плечо"""
+    async with error_handler("set_leverage"):
+        try:
+            await exchange.set_leverage(LEVERAGE, SYMBOL)
+            logger.info(f"⚡ Плечо установлено: {LEVERAGE}x")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось установить плечо: {e}")
+
 async def calculate_qty_simple() -> float:
-    """ПРОСТОЙ РАСЧЕТ: фиксированная сумма / текущая цена"""
+    """ПРОСТОЙ РАСЧЕТ: фиксированная сумма / цена"""
     async with error_handler("calculate_qty_simple"):
         price = await get_current_price()
         
-        # Простой расчет: 5 USDT / цена
-        quantity = FIXED_AMOUNT_USD / price
+        # Расчет с учетом плеча
+        quantity = (FIXED_AMOUNT_USD * LEVERAGE) / price
         
         # Округляем до 1 знака для фьючерсов
         quantity = round(quantity, 1)
         
-        # Минимум 1.0 XRP
+        # Проверяем минимальное количество
         if quantity < 1.0:
             quantity = 1.0
+            logger.warning(f"⚠️ Количество увеличено до минимального: 1 XRP")
+        
+        # Проверяем минимальную сумму (2.2616 USDT)
+        order_value = quantity * price
+        if order_value < 2.2616:
+            min_quantity = 2.2616 / price
+            quantity = max(quantity, min_quantity)
+            quantity = round(quantity, 1)
+            logger.warning(f"⚠️ Количество увеличено для минимальной суммы 2.2616 USDT")
             
-        logger.info(f"📊 Купим {quantity} XRP за {FIXED_AMOUNT_USD} USDT (цена: {price:.4f})")
+        logger.info(f"📊 Купим {quantity} {SYMBOL} за {FIXED_AMOUNT_USD} USDT с плечом {LEVERAGE}x")
         return quantity
 
 async def open_position_simple(signal: str):
@@ -109,12 +132,15 @@ async def open_position_simple(signal: str):
     async with error_handler("open_position_simple"):
         logger.info(f"🚀 ОТКРЫТИЕ ПОЗИЦИИ {signal.upper()} на {FIXED_AMOUNT_USD} USDT")
         
+        # Устанавливаем плечо
+        await set_leverage()
+        
         # Проверяем баланс
         balance = await check_balance()
         if balance < FIXED_AMOUNT_USD:
             raise ValueError(f"❌ Недостаточно средств. Нужно: {FIXED_AMOUNT_USD} USDT, есть: {balance:.2f} USDT")
 
-        # Рассчитываем количество (ПРОСТОЙ РАСЧЕТ)
+        # Рассчитываем количество
         qty = await calculate_qty_simple()
         
         side = "buy" if signal.lower() == "buy" else "sell"
@@ -135,17 +161,21 @@ async def open_position_simple(signal: str):
             "qty": qty, 
             "entry": entry_price, 
             "amount_usd": FIXED_AMOUNT_USD,
+            "leverage": LEVERAGE,
             "balance": balance,
             "order_id": order['id'],
             "timestamp": time.time()
         }
 
+        position_size = qty * entry_price
+        
         msg = (f"✅ {side.upper()} ОТКРЫТА\n"
                f"Символ: {SYMBOL}\n"
-               f"Количество: {qty} XRP\n"
-               f"Сумма: {FIXED_AMOUNT_USD} USDT\n"
-               f"Цена: ${entry_price:.4f}\n"
-               f"Баланс: {balance:.2f} USDT")
+               f"Количество: {qty}\n"
+               f"Депозит: {FIXED_AMOUNT_USD} USDT\n"
+               f"Плечо: {LEVERAGE}x\n"
+               f"Размер позиции: {position_size:.2f} USDT\n"
+               f"Цена: ${entry_price:.4f}")
         
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         logger.info("🎉 ПОЗИЦИЯ УСПЕШНО ОТКРЫТА!")
@@ -156,6 +186,9 @@ async def startup_event():
     async with error_handler("startup"):
         logger.info("🚀 ЗАПУСК БОТА")
         
+        # Устанавливаем плечо при старте
+        await set_leverage()
+        
         balance = await check_balance()
         price = await get_current_price()
         
@@ -165,11 +198,21 @@ async def startup_event():
 📊 Символ: {SYMBOL}
 💰 Цена: ${price:.4f}
 💵 Фиксированная сумма: {FIXED_AMOUNT_USD} USDT
+⚡ Плечо: {LEVERAGE}x
 
 💡 Готов к работе!"""
         
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         logger.info("🤖 БОТ УСПЕШНО ЗАПУЩЕН")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("🛑 ОСТАНОВКА БОТА")
+    try:
+        await exchange.close()
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🔴 Бот остановлен")
+    except Exception as e:
+        logger.error(f"Ошибка при остановке: {e}")
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -187,7 +230,6 @@ async def webhook(request: Request):
         if signal not in ["buy", "sell"]:
             return {"status": "error", "message": "signal must be 'buy' or 'sell'"}
         
-        # Запускаем открытие позиции в фоне
         asyncio.create_task(open_position_simple(signal))
         
         return {"status": "ok", "message": f"{signal} signal received"}
@@ -210,6 +252,7 @@ async def health_check():
             "current_price": price,
             "balance": balance,
             "fixed_amount": FIXED_AMOUNT_USD,
+            "leverage": LEVERAGE,
             "symbol": SYMBOL,
             "timestamp": time.time()
         }
@@ -257,11 +300,17 @@ async def home():
                 <div class="card">
                     <h3>⚡ НАСТРОЙКИ</h3>
                     <p><b>Фиксированная сумма:</b> {FIXED_AMOUNT_USD} USDT</p>
+                    <p><b>Плечо:</b> {LEVERAGE}x</p>
                 </div>
                 
                 <div class="card">
                     <h3>📈 Последняя сделка</h3>
                     <pre>{json.dumps(last_trade_info, indent=2, ensure_ascii=False) if last_trade_info else "Нет данных"}</pre>
+                </div>
+                
+                <div class="card">
+                    <h3>🔧 Действия</h3>
+                    <p><a href="/health" style="color: #74b9ff;">Health Check</a></p>
                 </div>
             </body>
         </html>
@@ -274,4 +323,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
