@@ -34,7 +34,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 FIXED_AMOUNT_USD = 5  # Всегда торгуем на 5 USDT
 
 # === Символ (ФЬЮЧЕРСЫ) ===
-SYMBOL = "XRP/USDT:USDT"  # ФЬЮЧЕРСНЫЙ формат
+SYMBOL = "XRP/USDT"  # ФЬЮЧЕРСНЫЙ формат
 
 logger.info("=== ИНИЦИАЛИЗАЦИЯ MEXC БОТА ===")
 
@@ -274,3 +274,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
