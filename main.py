@@ -34,7 +34,6 @@ LEVERAGE = int(os.getenv("LEVERAGE", 10))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 # === Исправленный формат символов для CCXT ===
-# CCXT использует стандартный формат для фьючерсов MEXC
 SYMBOL = "XRP/USDT:USDT"  # Правильный формат для CCXT
 
 logger.info("=== ИНИЦИАЛИЗАЦИЯ MEXC БОТА ===")
@@ -81,7 +80,6 @@ async def error_handler(operation: str):
 
 async def load_markets_once():
     """Загрузить рынки один раз при старте"""
-    global markets_loaded
     if not hasattr(load_markets_once, 'markets'):
         logger.info("Загрузка информации о рынках...")
         load_markets_once.markets = await exchange.load_markets()
@@ -130,13 +128,7 @@ async def calculate_qty(usd_amount: float) -> float:
         if SYMBOL not in markets:
             available_symbols = [sym for sym in markets.keys() if 'XRP' in sym and 'USDT' in sym]
             logger.warning(f"Символ {SYMBOL} не найден. Доступные символы с XRP: {available_symbols[:5]}")
-            # Используем первый доступный символ с XRP если наш не найден
-            if available_symbols:
-                global SYMBOL
-                SYMBOL = available_symbols[0]
-                logger.info(f"Автоматически выбран символ: {SYMBOL}")
-            else:
-                raise ValueError(f"Символ {SYMBOL} не найден и нет альтернатив")
+            raise ValueError(f"Символ {SYMBOL} не найден. Доступные: {available_symbols[:3]}")
         
         symbol_info = markets[SYMBOL]
         
@@ -144,11 +136,7 @@ async def calculate_qty(usd_amount: float) -> float:
         amount_precision = symbol_info.get('precision', {}).get('amount')
         if amount_precision:
             # Округляем до нужной точности
-            if isinstance(amount_precision, (int, float)):
-                quantity = round(quantity, amount_precision)
-            else:
-                # Для сложной precision (например, шаг 0.1)
-                quantity = exchange.amount_to_precision(SYMBOL, quantity)
+            quantity = exchange.amount_to_precision(SYMBOL, quantity)
         
         quantity = float(quantity)
         
@@ -157,12 +145,6 @@ async def calculate_qty(usd_amount: float) -> float:
         if quantity < min_amount:
             quantity = min_amount
             logger.warning(f"Количество увеличено до минимального: {min_amount}")
-        
-        # Проверяем максимальное количество (если есть)
-        max_amount = symbol_info.get('limits', {}).get('amount', {}).get('max')
-        if max_amount and quantity > max_amount:
-            quantity = max_amount
-            logger.warning(f"Количество уменьшено до максимального: {max_amount}")
         
         logger.info(f"Рассчитано количество: {quantity} {SYMBOL} за {usd_amount} USDT (цена: {price})")
         return quantity
@@ -204,7 +186,7 @@ async def handle_pending_order(order_id: str, timeout: int = 30):
             return None
         
         logger.info(f"Ордер в статусе: {order['status']}, ждем...")
-        await asyncio.sleep(2)  # Проверяем каждые 2 секунды
+        await asyncio.sleep(2)
     
     logger.error("⏰ Таймаут ожидания ордера")
     return None
@@ -286,7 +268,7 @@ async def open_position(signal: str, amount_usd=None):
         # Проверяем, есть ли активная позиция
         if active_position:
             await close_position()
-            await asyncio.sleep(1)  # Даем время на закрытие
+            await asyncio.sleep(1)
         
         # Устанавливаем плечо
         await set_leverage()
