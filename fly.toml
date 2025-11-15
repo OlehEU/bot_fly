@@ -8,9 +8,7 @@ from contextlib import asynccontextmanager
 import ccxt.async_support as ccxt
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
-from telegram import Bot, Update
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Bot
 
 # === Настройка логирования ===
 logging.basicConfig(
@@ -90,16 +88,12 @@ async def check_balance() -> float:
         logger.info(f"💳 Баланс USDT: {usdt:.4f}")
         return float(usdt)
 
-async def set_leverage_fixed():
-    """Установить кредитное плечо с правильными параметрами для MEXC"""
+async def set_leverage():
+    """Установить кредитное плечо"""
     async with error_handler("set_leverage"):
         try:
-            params = {
-                'openType': 1,  # isolated margin
-                'positionType': 1,  # long position
-            }
-            await exchange.set_leverage(LEVERAGE, SYMBOL, params)
-            logger.info(f"⚡ Плечо установлено: {LEVERAGE}x (isolated, long)")
+            await exchange.set_leverage(LEVERAGE, SYMBOL)
+            logger.info(f"⚡ Плечо установлено: {LEVERAGE}x")
         except Exception as e:
             logger.warning(f"⚠️ Не удалось установить плечо: {e}")
 
@@ -134,46 +128,31 @@ async def calculate_qty_simple() -> float:
         logger.info(f"📊 Итоговое количество: {quantity} {SYMBOL}")
         return quantity
 
-async def create_order_with_debug(symbol, side, qty):
-    """Создать ордер с максимально детальным дебагом"""
-    try:
-        logger.info(f"🎯 Создание ордера:")
-        logger.info(f"   Символ: {symbol}")
-        logger.info(f"   Сторона: {side}") 
-        logger.info(f"   Количество: {qty}")
-        logger.info(f"   Тип: market")
-        
-        # Параметры для MEXC фьючерсов
-        params = {
-            'positionType': 1 if side == 'buy' else 2,  # 1 = long, 2 = short
-        }
-        
-        logger.info(f"   Параметры: {params}")
-        
-        # Создаем ордер
-        order = await exchange.create_market_order(symbol, side, qty, None, params)
-        
-        logger.info(f"✅ Ордер создан успешно!")
-        logger.info(f"   ID ордера: {order['id']}")
-        logger.info(f"   Статус: {order['status']}")
-        logger.info(f"   Исполнено: {order.get('filled', 0)}")
-        
-        return order
-        
-    except ccxt.BadRequest as e:
-        logger.error(f"🔴 ОШИБКА BadRequest:")
-        logger.error(f"   Сообщение: {str(e)}")
-        logger.error(f"   Аргументы: {e.args}")
-        if hasattr(e, 'response'):
-            logger.error(f"   Response: {e.response}")
-        raise
-        
-    except Exception as e:
-        logger.error(f"🔴 ОШИБКА при создании ордера:")
-        logger.error(f"   Тип: {type(e).__name__}")
-        logger.error(f"   Сообщение: {str(e)}")
-        logger.error(f"   Traceback:\n{traceback.format_exc()}")
-        raise
+async def create_order_with_retry(symbol, side, qty, max_retries=3):
+    """Создать ордер с повторными попытками"""
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"🔄 Попытка {attempt + 1}: {side.upper()} {qty} {symbol}")
+            order = await exchange.create_market_order(symbol, side, qty)
+            logger.info(f"✅ Ордер создан: ID {order['id']}")
+            return order
+            
+        except ccxt.BadRequest as e:
+            error_msg = str(e)
+            logger.error(f"🔴 Ошибка API (BadRequest): {error_msg}")
+            raise e
+            
+        except ccxt.RequestTimeout as e:
+            logger.warning(f"⏰ Таймаут попытки {attempt + 1}")
+            if attempt == max_retries - 1:
+                logger.error("❌ Все попытки завершились таймаутом")
+                raise e
+            await asyncio.sleep(2)
+            
+        except Exception as e:
+            logger.error(f"🔴 Неизвестная ошибка: {e}")
+            logger.error(f"🔴 Traceback: {traceback.format_exc()}")
+            raise e
 
 async def open_position_simple(signal: str):
     global last_trade_info, active_position
@@ -181,11 +160,8 @@ async def open_position_simple(signal: str):
     async with error_handler("open_position_simple"):
         logger.info(f"🚀 ОТКРЫТИЕ ПОЗИЦИИ {signal.upper()} на {FIXED_AMOUNT_USD} USDT с плечом {LEVERAGE}x")
         
-        # Устанавливаем плечо (пропускаем ошибку если не получается)
-        try:
-            await set_leverage_fixed()
-        except Exception as e:
-            logger.warning(f"⚠️ Продолжаем без установки плеча: {e}")
+        # Устанавливаем плечо
+        await set_leverage()
         
         # Проверяем баланс
         balance = await check_balance()
@@ -198,10 +174,10 @@ async def open_position_simple(signal: str):
         qty = await calculate_qty_simple()
         
         side = "buy" if signal.lower() == "buy" else "sell"
-        logger.info(f"🎯 Финальные параметры ордера: {side.upper()} {qty} {SYMBOL}")
+        logger.info(f"🎯 Финальные параметры: {side.upper()} {qty} {SYMBOL}")
 
-        # Создаем рыночный ордер с ДЕТАЛЬНЫМ дебагом
-        order = await create_order_with_debug(SYMBOL, side, qty)
+        # Создаем рыночный ордер
+        order = await create_order_with_retry(SYMBOL, side, qty)
         logger.info(f"✅ Ордер успешно создан: {order['id']}")
 
         # Получаем цену входа
@@ -234,120 +210,17 @@ async def open_position_simple(signal: str):
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         logger.info("🎉 ПОЗИЦИЯ УСПЕШНО ОТКРЫТА!")
 
-# === Telegram Menu Functions ===
-async def send_main_menu(chat_id: int):
-    """Отправить главное меню"""
-    keyboard = [
-        [InlineKeyboardButton("💰 Баланс", callback_data="balance")],
-        [InlineKeyboardButton("📊 Цена", callback_data="price")],
-        [InlineKeyboardButton("🚀 BUY", callback_data="buy")],
-        [InlineKeyboardButton("🔻 SELL", callback_data="sell")],
-        [InlineKeyboardButton("📈 Статус", callback_data="status")],
-        [InlineKeyboardButton("⚡ Настройки", callback_data="settings")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await bot.send_message(
-        chat_id=chat_id,
-        text="🤖 MEXC Futures Bot - Главное меню:\nВыберите действие:",
-        reply_markup=reply_markup
-    )
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик нажатий на кнопки меню"""
-    query = update.callback_query
-    await query.answer()
-    
-    callback_data = query.data
-    chat_id = query.message.chat_id
-    
-    try:
-        if callback_data == "balance":
-            balance = await check_balance()
-            await query.edit_message_text(f"💰 Баланс: {balance:.2f} USDT")
-            
-        elif callback_data == "price":
-            price = await get_current_price()
-            await query.edit_message_text(f"📊 Цена {SYMBOL}: ${price:.4f}")
-            
-        elif callback_data == "buy":
-            await query.edit_message_text("🔄 Открываю BUY позицию...")
-            await open_position_simple("buy")
-            await query.edit_message_text("✅ BUY позиция открыта!")
-            
-        elif callback_data == "sell":
-            await query.edit_message_text("🔄 Открываю SELL позицию...")
-            await open_position_simple("sell")
-            await query.edit_message_text("✅ SELL позиция открыта!")
-            
-        elif callback_data == "status":
-            status = "АКТИВНА" if active_position else "НЕТ"
-            price = await get_current_price()
-            balance = await check_balance()
-            
-            status_text = f"""📊 СТАТУС БОТА:
-
-💰 Баланс: {balance:.2f} USDT
-📊 Символ: {SYMBOL}
-💰 Цена: ${price:.4f}
-📈 Позиция: {status}"""
-
-            if last_trade_info:
-                status_text += f"\n\n📈 Последняя сделка:\n"
-                status_text += f"Сторона: {last_trade_info['side'].upper()}\n"
-                status_text += f"Количество: {last_trade_info['qty']}\n"
-                status_text += f"Цена: ${last_trade_info['entry']:.4f}"
-                
-            await query.edit_message_text(status_text)
-            
-        elif callback_data == "settings":
-            settings_text = f"""⚡ НАСТРОЙКИ БОТА:
-
-📊 Символ: {SYMBOL}
-💵 Сумма: {FIXED_AMOUNT_USD} USDT
-⚡ Плечо: {LEVERAGE}x
-🔐 Webhook: {'✅' if WEBHOOK_SECRET else '❌'}"""
-            
-            await query.edit_message_text(settings_text)
-            
-        # После выполнения действия показываем меню снова
-        await send_main_menu(chat_id)
-        
-    except Exception as e:
-        error_msg = f"❌ Ошибка: {str(e)}"
-        await query.edit_message_text(error_msg)
-        await send_main_menu(chat_id)
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start"""
-    await send_main_menu(update.effective_chat.id)
-
 # === FastAPI Routes ===
 @app.on_event("startup")
 async def startup_event():
     async with error_handler("startup"):
         logger.info("🚀 ЗАПУСК БОТА")
         
-        # Пытаемся установить плечо (игнорируем ошибки)
-        try:
-            await set_leverage_fixed()
-        except:
-            logger.warning("⚠️ Плечо не установлено при старте - продолжим без него")
+        # Устанавливаем плечо при старте
+        await set_leverage()
         
         balance = await check_balance()
         price = await get_current_price()
-        
-        # Создаем приложение для обработки команд
-        app.bot_app = Application.builder().token(TELEGRAM_TOKEN).build()
-        
-        # Добавляем обработчики
-        app.bot_app.add_handler(CommandHandler("start", start_command))
-        app.bot_app.add_handler(CallbackQueryHandler(handle_callback))
-        
-        # Запускаем бота
-        await app.bot_app.initialize()
-        await app.bot_app.start()
-        await app.bot_app.updater.start_polling()
         
         msg = f"""✅ MEXC Futures Bot ЗАПУЩЕН!
 
@@ -357,7 +230,7 @@ async def startup_event():
 💵 Фиксированная сумма: {FIXED_AMOUNT_USD} USDT
 ⚡ Плечо: {LEVERAGE}x
 
-💡 Используйте /start для открытия меню!"""
+💡 Готов к работе!"""
         
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
         logger.info("🤖 БОТ УСПЕШНО ЗАПУЩЕН")
@@ -366,10 +239,6 @@ async def startup_event():
 async def shutdown_event():
     logger.info("🛑 ОСТАНОВКА БОТА")
     try:
-        if hasattr(app, 'bot_app'):
-            await app.bot_app.updater.stop()
-            await app.bot_app.stop()
-            await app.bot_app.shutdown()
         await exchange.close()
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🔴 Бот остановлен")
     except Exception as e:
