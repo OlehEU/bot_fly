@@ -38,12 +38,14 @@ FIXED_AMOUNT_USD = float(os.getenv("FIXED_AMOUNT_USD", "10"))
 LEVERAGE = int(os.getenv("LEVERAGE", "5"))
 MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "2.2616"))
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "25"))
-CONTRACT_SIZE = float(os.getenv("CONTRACT_SIZE", "0.01"))
 
 # -------------------------
 # Logging
 # -------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger("mexc-bot")
 
 # -------------------------
@@ -52,14 +54,19 @@ logger = logging.getLogger("mexc-bot")
 bot = Bot(token=TELEGRAM_TOKEN)
 
 async def tg_send(text: str):
-    def sync_send():
-        try:
-            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML", disable_web_page_preview=True)
-            logger.info("INFO: Сообщение отправлено в Telegram")
-        except Exception as e:
-            logger.error(f"ERROR: Не удалось отправить в Telegram: {e}")
-
-    await asyncio.to_thread(sync_send)
+    """
+    Async telegram send (await Bot.send_message)
+    """
+    try:
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        logger.info("INFO: Сообщение отправлено в Telegram")
+    except Exception as e:
+        logger.error(f"ERROR: Не удалось отправить в Telegram: {e}\n{traceback.format_exc()}")
 
 # -------------------------
 # MEXC (ccxt async)
@@ -111,7 +118,7 @@ async def amount_precision(symbol: str, amount: float) -> float:
     return round(amount, 6)
 
 # -------------------------
-# Leverage / Position helpers
+# Leverage / Position helpers (USDT-M)
 # -------------------------
 async def set_leverage_usdt(symbol: str, leverage: int, position_side: str):
     try:
@@ -128,13 +135,14 @@ async def create_market_position_usdt(symbol: str, side: str, qty: float, levera
     positionSide = "LONG" if side == "buy" else "SHORT"
     await exchange.load_markets()
     await set_leverage_usdt(symbol, leverage, positionSide)
+
     params = {"positionSide": positionSide}
     logger.info(f"Создаю рыночный ордер: {side} {qty} {symbol} params={params}")
     order = await exchange.create_market_order(symbol, side, qty, None, params)
     logger.info(f"Order response: {order}")
     return order
 
-async def create_tp_sl_limit(symbol: str, close_side: str, qty: float, price: float, positionSide: str):
+async def create_tp_sl_limit(symbol: str, close_side: str, qty: float, price: float, positionSide:str):
     params = {"reduceOnly": True, "positionSide": positionSide}
     logger.info(f"Создаю limit закрывающий ордер {close_side} {qty} @ {price} params={params}")
     order = await exchange.create_order(symbol, "limit", close_side, qty, price, params)
@@ -180,6 +188,7 @@ async def open_position_from_signal(signal: str, fixed_amount_usd: Optional[floa
         close_side = "sell" if side == "buy" else "buy"
 
         order = await create_market_position_usdt(SYMBOL, side, qty, LEVERAGE)
+
         entry_price = order.get("average") or order.get("price") or await fetch_price(SYMBOL)
 
         if side == "buy":
@@ -225,7 +234,7 @@ async def open_position_from_signal(signal: str, fixed_amount_usd: Optional[floa
         raise
 
 # -------------------------
-# FastAPI lifespan
+# FastAPI with lifespan
 # -------------------------
 from contextlib import asynccontextmanager
 
@@ -238,6 +247,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             balance = None
             logger.warning(f"Не удалось получить баланс при старте: {e}")
+
         try:
             price = await fetch_price(SYMBOL)
         except Exception:
@@ -256,6 +266,7 @@ async def lifespan(app: FastAPI):
             await tg_send(start_msg)
         except Exception as e:
             logger.warning(f"Не удалось отправить стартовое сообщение в tg: {e}")
+
         yield
     finally:
         logger.info("🛑 ОСТАНОВКА БОТА (lifespan shutdown)")
@@ -275,19 +286,62 @@ app = FastAPI(lifespan=lifespan)
 # -------------------------
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    balance = await fetch_balance_usdt()
-    price = await fetch_price(SYMBOL)
+    try:
+        balance = await fetch_balance_usdt()
+    except Exception as e:
+        balance = None
+        logger.warning(f"Home: cannot fetch balance: {e}")
+
+    try:
+        price = await fetch_price(SYMBOL)
+    except Exception:
+        price = None
+
     status = "АКТИВНА" if active_position else "НЕТ"
+
     html = f"""
     <html>
-    <head><meta charset="utf-8"/><title>MEXC Futures Bot</title></head>
-    <body>
-    <h1>🤖 MEXC Futures Bot</h1>
-    <p>Баланс: {balance}</p>
-    <p>Цена: {price}</p>
-    <p>Позиция: {status}</p>
-    <pre>{json.dumps(last_trade_info, indent=2, ensure_ascii=False) if last_trade_info else "Нет данных"}</pre>
-    </body>
+      <head>
+        <meta charset="utf-8"/>
+        <title>MEXC Futures Bot</title>
+        <style>
+          body {{ font-family: Arial, sans-serif; background: #0f1720; color:#e6eef8; padding:20px }}
+          .card {{ background:#111827; padding:16px; border-radius:8px; margin-bottom:12px }}
+          a {{ color:#7dd3fc }}
+        </style>
+      </head>
+      <body>
+        <h1>🤖 MEXC Futures Bot</h1>
+        <div class="card">
+          <h3>Баланс</h3>
+          <p><b>USDT:</b> {balance if balance is not None else 'N/A'}</p>
+        </div>
+
+        <div class="card">
+          <h3>Статус</h3>
+          <p><b>Символ:</b> {SYMBOL}</p>
+          <p><b>Цена:</b> {price if price is not None else 'N/A'}</p>
+          <p><b>Позиция:</b> {status}</p>
+        </div>
+
+        <div class="card">
+          <h3>Настройки</h3>
+          <p><b>Фиксированная сумма:</b> {FIXED_AMOUNT_USD} USDT</p>
+          <p><b>Плечо:</b> {LEVERAGE}x</p>
+        </div>
+
+        <div class="card">
+          <h3>Последняя сделка</h3>
+          <pre>{json.dumps(last_trade_info, indent=2, ensure_ascii=False) if last_trade_info else "Нет данных"}</pre>
+        </div>
+
+        <div class="card">
+          <h3>Webhook</h3>
+          <p>TradingView -> <code>POST https://{os.getenv('FLY_APP_NAME','bot-fly-oz')}.fly.dev/webhook</code></p>
+          <p>Header: <code>X-Webhook-Secret: {WEBHOOK_SECRET}</code></p>
+          <p>Body (json): <code>{{"signal":"buy"}}</code> or <code>{{"signal":"sell"}}</code></p>
+        </div>
+      </body>
     </html>
     """
     return HTMLResponse(html)
@@ -324,11 +378,21 @@ async def health():
     try:
         price = await fetch_price(SYMBOL)
         balance = await fetch_balance_usdt()
-        return {"status": "ok", "symbol": SYMBOL, "price": price, "balance": balance, "active_position": active_position, "timestamp": time.time()}
+        return {
+            "status": "ok",
+            "symbol": SYMBOL,
+            "price": price,
+            "balance": balance,
+            "active_position": active_position,
+            "timestamp": time.time()
+        }
     except Exception as e:
         logger.error(f"Health failed: {e}")
         return {"status": "error", "error": str(e)}
 
+# -------------------------
+# Run (if executed directly)
+# -------------------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
