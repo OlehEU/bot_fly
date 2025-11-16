@@ -26,9 +26,9 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 FIXED_AMOUNT_USD = float(os.getenv("FIXED_AMOUNT_USD", "10"))
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TP_PERCENT = float(os.getenv("TP_PERCENT", "0.5"))
-SL_PERCENT = float(os.getenv("SL_PERCENT", "1.0"))  # ← SL -1%
+SL_PERCENT = float(os.getenv("SL_PERCENT", "1.0"))
 MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "1.0"))
-AUTO_CLOSE_MINUTES = 10  # ← Автозакрытие
+AUTO_CLOSE_MINUTES = 10
 
 # -------------------------
 # Logging
@@ -110,7 +110,7 @@ async def calculate_qty(symbol: str, usd: float, lev: int) -> float:
     return qty
 
 # -------------------------
-# Market Order (ВСЕГДА РАБОТАЕТ)
+# Market Order
 # -------------------------
 async def create_market_position_usdt(symbol: str, qty: float, leverage: int):
     query = {
@@ -181,6 +181,7 @@ async def create_sl_limit(symbol: str, qty: float, price: float, leverage: int):
 # Auto-close
 # -------------------------
 async def auto_close_position():
+    global active_position  # ← global В НАЧАЛЕ!
     await asyncio.sleep(AUTO_CLOSE_MINUTES * 60)
     if not active_position:
         return
@@ -194,7 +195,6 @@ async def auto_close_position():
                 await exchange.create_order(SYMBOL, "market", "sell", qty, None, {"reduceOnly": True})
                 await tg_send(f"Автозакрытие: LONG закрыт по рынку\nQty: {qty}")
                 break
-        global active_position
         active_position = False
     except Exception as e:
         await tg_send(f"Ошибка автозакрытия: {e}")
@@ -202,7 +202,7 @@ async def auto_close_position():
 # -------------------------
 # Main Logic
 # -------------------------
-active_position = False
+active_position = False  # ← Объявлена ДО использования
 
 async def open_position():
     global active_position
