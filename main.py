@@ -35,7 +35,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 FIXED_AMOUNT_USD = float(os.getenv("FIXED_AMOUNT_USD", "10"))   # $10
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))                     # 10x
 TP_PERCENT = float(os.getenv("TP_PERCENT", "0.5"))               # +0.5%
-MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "2.2616"))
+MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "1.0"))        # уменьшено для теста
 
 # -------------------------
 # Logging
@@ -148,11 +148,12 @@ async def check_active_position(symbol: str) -> bool:
     if positions:
         for pos in positions:
             if float(pos.get('contracts', 0)) != 0:
+                logger.info(f"Active position: {pos.get('contracts')} {symbol}")
                 return True
     return False
 
 # -------------------------
-# Orders (CRITICAL: query + leverage)
+# Orders (query + leverage + execution wait)
 # -------------------------
 async def create_market_position_usdt(symbol: str, side: str, qty: float, leverage: int):
     positionSide = "LONG" if side == "buy" else "SHORT"
@@ -162,16 +163,41 @@ async def create_market_position_usdt(symbol: str, side: str, qty: float, levera
         "positionType": 1 if positionSide == "LONG" else 2,
         "leverage": leverage
     }
-    logger.info(f"Market order: {side} {qty} {symbol} | leverage {leverage}x")
+    logger.info(f"ОТПРАВЛЯЮ РЫНОЧНЫЙ ОРДЕР: {side} {qty} {symbol} | leverage {leverage}x | query: {query}")
+    
     order = await safe_ccxt_call(
         exchange.create_order,
         symbol, "market", side, qty, None, query
     )
+    
     if not order:
-        raise Exception("Market order failed")
-    avg = order.get("average") or order.get("price")
-    logger.info(f"Executed: ID {order.get('id')} @ {avg}")
-    return order
+        error_msg = "РЫНОЧНЫЙ ОРДЕР НЕ СОЗДАН"
+        logger.error(error_msg)
+        await tg_send(f"Error: {error_msg}")
+        raise Exception(error_msg)
+
+    order_id = order.get('id')
+    status = order.get('status', 'unknown')
+    avg_price = order.get('average') or order.get('price')
+    filled = order.get('filled', 0)
+
+    logger.info(f"ОРДЕР СОЗДАН: ID={order_id} | status={status} | filled={filled} | avg={avg_price}")
+
+    # Ждём исполнения
+    for i in range(10):
+        await asyncio.sleep(1)
+        try:
+            fetched = await safe_ccxt_call(exchange.fetch_order, order_id, symbol)
+            if fetched and fetched.get('status') == 'closed':
+                avg_price = fetched.get('average') or avg_price
+                logger.info(f"ОРДЕР ИСПОЛНЕН: {avg_price}")
+                break
+        except:
+            pass
+    else:
+        logger.warning("Ордер не исполнен за 10 сек")
+
+    return {'average': avg_price, 'id': order_id}
 
 async def create_tp_limit(symbol: str, qty: float, price: float, leverage: int):
     query = {
@@ -181,13 +207,15 @@ async def create_tp_limit(symbol: str, qty: float, price: float, leverage: int):
         "positionType": 1,
         "leverage": leverage
     }
-    logger.info(f"TP: sell {qty} @ {price}")
+    logger.info(f"УСТАНАВЛИВАЮ TP: sell {qty} @ {price}")
     order = await safe_ccxt_call(
         exchange.create_order,
         symbol, "limit", "sell", qty, price, query
     )
     if not order:
         await tg_send(f"Warning: TP не установлен: {price}")
+    else:
+        logger.info(f"TP ордер создан: ID {order.get('id')}")
     return order
 
 # -------------------------
@@ -210,7 +238,10 @@ async def open_position_from_signal(symbol_base: str = "XRP", amount_usd: float 
 
         qty = await calculate_qty_for_usd(SYMBOL, usd, LEVERAGE)
         order = await create_market_position_usdt(SYMBOL, "buy", qty, LEVERAGE)
-        entry = order.get("average") or await fetch_price(SYMBOL)
+        entry = order.get("average")
+        if not entry:
+            entry = await fetch_price(SYMBOL)
+
         info = await get_market_info(SYMBOL)
         tp_price = round(entry * (1 + TP_PERCENT / 100), info['price_scale'])
         await create_tp_limit(SYMBOL, qty, tp_price, LEVERAGE)
@@ -224,9 +255,11 @@ async def open_position_from_signal(symbol_base: str = "XRP", amount_usd: float 
             f"Qty: <code>{qty}</code>\n"
             f"Entry: <code>{entry:.4f}</code>\n"
             f"TP (+{TP_PERCENT}%): <code>{tp_price:.4f}</code>\n"
+            f"Order ID: <code>{order.get('id')}</code>\n"
             f"SL: <i>не установлен</i>"
         )
         await tg_send(msg)
+        logger.info("ПОЗИЦИЯ УСПЕШНО ОТКРЫТА")
 
     except Exception as e:
         logger.error(f"Error: {e}\n{traceback.format_exc()}")
