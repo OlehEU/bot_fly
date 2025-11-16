@@ -11,6 +11,7 @@ import ccxt.async_support as ccxt
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from telegram import Bot
+import math
 
 # -------------------------
 # Config / Secrets
@@ -82,18 +83,15 @@ def short_exc() -> str:
     return traceback.format_exc()
 
 async def safe_ccxt_call(fn, *args, **kwargs):
-    """
-    Обертка для вызовов ccxt: логируем все ошибки, возвращаем None при критичной ошибке.
-    """
     try:
         result = await fn(*args, **kwargs)
-        logger.info(f"CCXT call success: {fn.__name__} args={args} kwargs={kwargs} result={result}")
+        logger.info(f"CCXT call success: {fn.__name__} args={args} kwargs={kwargs}")
         return result
     except ccxt.BaseError as e:
-        logger.error(f"CCXT error in {fn.__name__} args={args} kwargs={kwargs}: {str(e)}\n{traceback.format_exc()}")
+        logger.error(f"CCXT error in {fn.__name__}: {e}\n{traceback.format_exc()}")
         return None
     except Exception as e:
-        logger.error(f"Unexpected error in {fn.__name__}: {str(e)}\n{traceback.format_exc()}")
+        logger.error(f"Unexpected error in {fn.__name__}: {e}\n{traceback.format_exc()}")
         return None
 
 # -------------------------
@@ -115,16 +113,33 @@ async def fetch_price(symbol: str) -> float:
     logger.info(f"Текущая цена {symbol}: {price}")
     return price
 
-async def amount_precision(symbol: str, amount: float) -> float:
-    try:
-        await exchange.load_markets()
-        if symbol in exchange.markets:
-            prec_str = exchange.markets[symbol].get('precision', {}).get('amount')
-            if prec_str is not None:
-                return float(exchange.amount_to_precision(symbol, amount))
-    except Exception:
-        pass
-    return round(amount, 6)
+async def get_market_info(symbol: str) -> dict:
+    await exchange.load_markets()
+    market = exchange.markets.get(symbol)
+    if not market:
+        raise Exception(f"Market {symbol} not found")
+    info = market.get('info', {})
+    vol_unit = float(info.get('volUnit', 1))
+    min_vol = float(info.get('minVol', 1))
+    price_scale = int(info.get('priceScale', 2))
+    return {"vol_unit": vol_unit, "min_vol": min_vol, "price_scale": price_scale}
+
+async def calculate_qty_for_usd(symbol: str, usd_amount: float, leverage: int) -> float:
+    price = await fetch_price(symbol)
+    market_info = await get_market_info(symbol)
+    vol_unit = market_info['vol_unit']
+    min_vol = market_info['min_vol']
+
+    qty = (usd_amount * leverage) / price
+    if qty * price < MIN_ORDER_USD:
+        qty = (MIN_ORDER_USD / price)
+
+    # округление по шагу volUnit
+    qty = math.floor(qty / vol_unit) * vol_unit
+    if qty < min_vol:
+        qty = min_vol
+    logger.info(f"Расчитанное количество: {qty} (USD {usd_amount} * L{leverage} / price {price})")
+    return qty
 
 # -------------------------
 # Leverage / Position helpers
@@ -135,7 +150,7 @@ async def set_leverage_usdt(symbol: str, leverage: int, position_side: str):
         await safe_ccxt_call(exchange.set_leverage, leverage, symbol, params)
         logger.info(f"Плечо установлено: {leverage}x для {position_side}")
     except Exception as e:
-        logger.warning(f"Не удалось установить плечо: {e} — продолжим (не критично)")
+        logger.warning(f"Не удалось установить плечо: {e} — продолжим")
 
 # -------------------------
 # Order creation
@@ -167,17 +182,6 @@ async def create_tp_sl_limit(symbol: str, close_side: str, qty: float, price: fl
 last_trade_info: Optional[dict] = None
 active_position = False
 
-async def calculate_qty_for_usd(symbol: str, usd_amount: float, leverage: int) -> float:
-    price = await fetch_price(symbol)
-    qty = (usd_amount * leverage) / price
-    if qty * price < MIN_ORDER_USD:
-        qty = (MIN_ORDER_USD / price)
-    qty = await amount_precision(symbol, qty)
-    if qty < 0.000001:
-        qty = 0.000001
-    logger.info(f"Расчитанное количество: {qty} (USD {usd_amount} * L{leverage} / price {price})")
-    return qty
-
 async def open_position_from_signal(signal: str, fixed_amount_usd: Optional[float] = None):
     global active_position, last_trade_info
     try:
@@ -202,13 +206,15 @@ async def open_position_from_signal(signal: str, fixed_amount_usd: Optional[floa
         order = await create_market_position_usdt(SYMBOL, side, qty, LEVERAGE)
 
         entry_price = order.get("average") or order.get("price") or await fetch_price(SYMBOL)
+        market_info = await get_market_info(SYMBOL)
+        price_scale = market_info['price_scale']
 
         if side == "buy":
-            tp_price = round(entry_price * 1.015, 6)
-            sl_price = round(entry_price * 0.99, 6)
+            tp_price = round(entry_price * 1.015, price_scale)
+            sl_price = round(entry_price * 0.99, price_scale)
         else:
-            tp_price = round(entry_price * 0.985, 6)
-            sl_price = round(entry_price * 1.01, 6)
+            tp_price = round(entry_price * 0.985, price_scale)
+            sl_price = round(entry_price * 1.01, price_scale)
 
         try:
             await create_tp_sl_limit(SYMBOL, close_side, qty, tp_price, positionSide)
