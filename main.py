@@ -82,10 +82,6 @@ exchange = ccxt.mexc({
 _cached_markets: Optional[Dict[str, str]] = None
 
 async def resolve_symbol(base: str) -> str:
-    """
-    Преобразует короткий символ (например XRP) в правильный контракт swap на MEXC.
-    Кэширует список доступных пар.
-    """
     global _cached_markets
     if _cached_markets is None:
         await exchange.load_markets()
@@ -165,7 +161,8 @@ async def set_leverage_usdt(symbol: str, leverage: int, positionSide: str):
     positionSide: "LONG" или "SHORT"
     """
     try:
-        await safe_ccxt_call(exchange.set_leverage, leverage, symbol, {"positionSide": positionSide})
+        params = {"positionSide": positionSide, "openType": 1, "positionType": 1 if positionSide=="LONG" else 2}
+        await safe_ccxt_call(exchange.set_leverage, leverage, symbol, params)
         logger.info(f"Плечо установлено: {leverage}x для {positionSide}")
     except Exception as e:
         logger.warning(f"Не удалось установить плечо: {e} — продолжим")
@@ -176,8 +173,17 @@ async def set_leverage_usdt(symbol: str, leverage: int, positionSide: str):
 async def create_market_position_usdt(symbol: str, side: str, qty: float, leverage: int):
     positionSide = "LONG" if side == "buy" else "SHORT"
     await exchange.load_markets()
+
+    # MEXC требует сначала установить плечо
     await set_leverage_usdt(symbol, leverage, positionSide)
-    params = {"positionSide": positionSide, "openType": 1, "positionType": 1 if positionSide == "LONG" else 2}
+
+    # Параметры для изолированной позиции
+    params = {
+        "positionSide": positionSide,
+        "openType": 1,                     # 1=isolated
+        "positionType": 1 if positionSide=="LONG" else 2,
+        "leverage": leverage               # ОБЯЗАТЕЛЬНО для create_market_order
+    }
 
     logger.info(f"Создаю рыночный ордер: {side} {qty} {symbol} params={params}")
     order = await safe_ccxt_call(exchange.create_market_order, symbol, side, qty, None, params)
