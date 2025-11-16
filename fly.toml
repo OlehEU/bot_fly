@@ -1,6 +1,6 @@
 @@ -1,18 +1,19 @@
 # fly.toml
-app = "bot-fly-b7iqvq"
+app = "bot-fly-oz"
 primary_region = "fra"
 
 [processes]
