@@ -1,165 +1,144 @@
-# main.py
-import uvicorn
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse
-import httpx
+import asyncio
+import time
 import hmac
 import hashlib
-import time
+import json
+import httpx
 import logging
-from pydantic import BaseModel
-import asyncio
+from aiogram import Bot
 
-# === НАСТРОЙКИ ===
-API_KEY = "ВАШ_API_KEY"          # ← Замени
-API_SECRET = "ВАШ_API_SECRET"    # ← Замени
-BASE_URL = "https://contract.mexc.com"
+# ==================== НАСТРОЙКИ ====================
+MEXC_API_KEY = "ВАШ_API_KEY"
+MEXC_API_SECRET = "ВАШ_API_SECRET"
 SYMBOL = "XRP_USDT"
-VOLUME = 4.0
-LEVERAGE = 1
+USDT_AMOUNT = 5  # размер сделки
+LEVERAGE = 10
+TP_PERCENT = 0.5  # Take Profit в процентах
 
-# Логирование
-logging.basicConfig(level=logging.INFO)
+TELEGRAM_TOKEN = "ВАШ_TELEGRAM_BOT_TOKEN"
+CHAT_ID = "ВАШ_CHAT_ID"
+
+REQUEST_TIMEOUT = 10
+
+# ==================== ЛОГИРОВАНИЕ ====================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(message)s")
 logger = logging.getLogger("mexc-bot")
 
-app = FastAPI()
+# ==================== TELEGRAM ====================
+bot = Bot(token=TELEGRAM_TOKEN)
 
-# === Модель ордера ===
-class OrderRequest(BaseModel):
-    action: str = "open"  # open / close
+async def send_telegram(msg: str):
+    try:
+        await bot.send_message(CHAT_ID, msg)
+    except Exception as e:
+        logger.error(f"Ошибка отправки в Telegram: {e}")
 
-# === Подпись запроса ===
-def sign_request(params: dict, timestamp: str) -> str:
-    param_str = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
-    sign_str = f"{param_str}&timestamp={timestamp}"
-    return hmac.new(API_SECRET.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
+# ==================== MEXC API ====================
+async def get_price(symbol=SYMBOL):
+    """Получение текущей цены"""
+    url = f"https://contract.mexc.com/api/v1/contract/ticker?symbol={symbol}"
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        resp = await client.get(url)
+        data = resp.json()
+        price = float(data['data']['lastPrice'])
+        logger.info(f"Цена {symbol}: {price}")
+        return price
 
-# === Отправка ордера ===
-async def place_mexc_order():
-    url = f"{BASE_URL}/api/v1/private/order/submit"
+async def check_balance():
+    """Проверка баланса USDT с безопасным логированием UTF-8"""
+    url = "https://contract.mexc.com/api/v1/private/account/asset/USDT"
     timestamp = str(int(time.time() * 1000))
-
-    order = {
-        "symbol": SYMBOL,
-        "volume": VOLUME,
-        "leverage": LEVERAGE,
-        "side": "OPEN_LONG",
-        "type": "MARKET",
-        "openType": "ISOLATED",
-        "positionMode": "ONE_WAY_MODE",
-        "externalOid": f"bot_open_{int(time.time())}_buy"
-    }
-
-    signature = sign_request(order, timestamp)
-
-    headers = {
-        "X-MEXC-APIKEY": API_KEY,
-        "timestamp": timestamp,
-        "signature": signature,
-        "Content-Type": "application/json"
-    }
-
-    logger.info(f"Ордер MEXC: {order}")
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        for attempt in range(1, 4):
-            logger.info(f"Попытка {attempt}/3 (async HTTPS)")
-            try:
-                response = await client.post(url, json=order, headers=headers)
-                if response.status_code == 200:
-                    result = response.json()
-                    if result.get("success"):
-                        logger.info(f"УСПЕХ! Ордер ID: {result['data']}")
-                        return result
-                    else:
-                        logger.warning(f"MEXC ошибка: {result}")
-                        return result
-                else:
-                    text = response.text
-                    logger.error(f"HTTP {response.status_code}: {text}")
-                    if attempt == 3:
-                        raise HTTPException(status_code=500, detail=f"MEXC API error: {text}")
-            except httpx.TimeoutException:
-                logger.warning(f"ТАЙМАУТ на попытке {attempt}")
-                if attempt < 3:
-                    await asyncio.sleep(2)
-                continue
-            except Exception as e:
-                logger.error(f"Ошибка: {e}")
-                if attempt == 3:
-                    raise
-
-    raise HTTPException(status_code=500, detail="Не удалось отправить ордер")
-
-# === Получение баланса ===
-async def get_balance():
-    url = f"{BASE_URL}/api/v1/private/account/assets"
-    timestamp = str(int(time.time() * 1000))
-    signature = hmac.new(API_SECRET.encode(), f"timestamp={timestamp}".encode(), hashlib.sha256).hexdigest()
-
-    headers = {
-        "X-MEXC-APIKEY": API_KEY,
-        "timestamp": timestamp,
-        "signature": signature
-    }
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    body = ""
+    sign_str = MEXC_API_KEY + timestamp + body
+    signature = hmac.new(
+        MEXC_API_SECRET.encode('utf-8'),
+        sign_str.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+    headers = {"ApiKey": MEXC_API_KEY, "Request-Time": timestamp, "Signature": signature}
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        resp = await client.get(url, headers=headers)
+        data = resp.json()
         try:
-            response = await client.get(url, headers=headers)
-            if response.status_code == 200:
-                data = response.json()
-                usdt = next((x for x in data["data"] if x["currency"] == "USDT"), None)
-                if usdt:
-                    total = float(usdt["positionMargin"]) + float(usdt["availableBalance"])
-                    free = float(usdt["availableBalance"])
-                    frozen = float(usdt["frozenBalance"])
-                    logger.info(f"Баланс: Всего {total:.4f}, Свободно {free:.4f}, Занято {frozen:.4f}")
-                    return {"total": total, "free": free, "frozen": frozen}
+            free = float(data['data']['available'])
+            total = float(data['data']['total'])
+            used = total - free
+            logger.info(f"Баланс: total={total}, free={free}, used={used}")
+            return {"total": total, "free": free, "used": used}
         except Exception as e:
-            logger.error(f"Ошибка баланса: {e}")
-    return {"total": 0, "free": 0, "frozen": 0}
+            logger.error(f"Ошибка баланса: {str(e)} — raw data: {json.dumps(data, ensure_ascii=False)}")
+            return {"total": 0, "free": 0, "used": 0}
 
-# === Получение цены ===
-async def get_price():
-    url = f"https://contract.mexc.com/api/v1/contract/ticker?symbol={SYMBOL}"
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        try:
-            response = await client.get(url)
-            if response.status_code == 200:
-                data = response.json()
-                price = data["data"]["fairPrice"]
-                logger.info(f"Цена {SYMBOL}: {price}")
-                return price
-        except Exception as e:
-            logger.error(f"Ошибка цены: {e}")
-    return None
-
-# === Веб-страница ===
-@app.get("/", response_class=HTMLResponse)
-async def home(request: Request):
-    balance = await get_balance()
+async def open_order(side: str):
+    """Открытие ордера на MEXC"""
     price = await get_price()
-    return f"""
-    <h1>MEXC Futures Bot (XRP/USDT)</h1>
-    <p><strong>Баланс:</strong> Всего {balance['total']:.4f} USDT | Свободно {balance['free']:.4f}</p>
-    <p><strong>Цена:</strong> {price or '—'} USDT</p>
-    <form method="post" action="/order">
-        <button type="submit">Открыть ордер (4 USDT, Long)</button>
-    </form>
-    <pre id="log"></pre>
-    <script>
-        setInterval(() => location.reload(), 10000);
-    </script>
-    """
+    quantity = round(USDT_AMOUNT * LEVERAGE / price, 4)  # количество монеты
+    timestamp = str(int(time.time() * 1000))
+    body = json.dumps({
+        "symbol": SYMBOL,
+        "price": str(price),
+        "vol": str(quantity),
+        "side": side.upper(),  # BUY или SELL
+        "type": "LIMIT",
+        "open_type": "CROSS",
+        "position_id": 0,
+        "leverage": LEVERAGE,
+        "external_oid": f"{int(time.time())}"
+    })
+    sign_str = MEXC_API_KEY + timestamp + body
+    signature = hmac.new(
+        MEXC_API_SECRET.encode('utf-8'),
+        sign_str.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+    headers = {"ApiKey": MEXC_API_KEY, "Request-Time": timestamp, "Signature": signature, "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        resp = await client.post("https://contract.mexc.com/api/v1/private/order/submit", headers=headers, data=body)
+        data = resp.json()
+        logger.info(f"Открытие ордера: {json.dumps(data, ensure_ascii=False)}")
+        await send_telegram(f"Открыт ордер {side.upper()} {SYMBOL} цена {price}")
+        return data
 
-# === API: Открыть ордер ===
-@app.post("/order")
-async def create_order():
-    await get_balance()
-    await get_price()
-    result = await place_mexc_order()
-    return result
+async def check_position():
+    """Проверка активных позиций"""
+    url = f"https://contract.mexc.com/api/v1/private/position/list?symbol={SYMBOL}"
+    timestamp = str(int(time.time() * 1000))
+    body = ""
+    sign_str = MEXC_API_KEY + timestamp + body
+    signature = hmac.new(
+        MEXC_API_SECRET.encode('utf-8'),
+        sign_str.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+    headers = {"ApiKey": MEXC_API_KEY, "Request-Time": timestamp, "Signature": signature}
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        resp = await client.get(url, headers=headers)
+        data = resp.json()
+        positions = data.get("data", [])
+        return positions
 
-# === Запуск ===
+async def main():
+    last_order_closed = True
+    while True:
+        # Тут должна быть логика получения сигнала из TradingView
+        # Для примера:
+        signal = "buy"  # пример сигнала
+        if signal == "buy" and last_order_closed:
+            balance = await check_balance()
+            if balance['free'] >= USDT_AMOUNT:
+                await open_order("BUY")
+                last_order_closed = False
+        elif signal == "sell" and last_order_closed:
+            balance = await check_balance()
+            if balance['free'] >= USDT_AMOUNT:
+                await open_order("SELL")
+                last_order_closed = False
+        
+        # Проверяем позиции, чтобы понять закрыт ли ордер
+        positions = await check_position()
+        if not positions:
+            last_order_closed = True
+        await asyncio.sleep(10)
+
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    asyncio.run(main())
