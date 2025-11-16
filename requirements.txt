@@ -7,6 +7,7 @@ slowapi
 requests
 httpx
 pydantic
+python-dotenv
 
 
 
