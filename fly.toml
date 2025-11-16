@@ -14,12 +14,12 @@ primary_region = "fra"
   # Fly сам соберёт образ из Dockerfile
 
 [[services]]
-  process = "app"
+  processes = ["app"]      # ← Привязываем сервис к процессу
   internal_port = 8000
   protocol = "tcp"
 
   [[services.ports]]
-    port = 8000           # открываем порт 8000
+    port = 8000
     handlers = ["tcp"]
 
   [services.concurrency]
