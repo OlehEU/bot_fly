@@ -5,7 +5,7 @@ import time
 import traceback
 import logging
 import asyncio
-from typing import Optional
+from typing import Optional, Dict
 import math
 
 import ccxt.async_support as ccxt
@@ -35,7 +35,6 @@ MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-BASE_SYMBOL = os.getenv("BASE_SYMBOL", "XRP")  # базовый актив
 FIXED_AMOUNT_USD = float(os.getenv("FIXED_AMOUNT_USD", "10"))
 LEVERAGE = int(os.getenv("LEVERAGE", "5"))
 MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "2.2616"))
@@ -78,6 +77,25 @@ exchange = ccxt.mexc({
 })
 
 # -------------------------
+# Symbol auto-detection
+# -------------------------
+_cached_markets: Optional[Dict[str, str]] = None
+
+async def resolve_symbol(base: str) -> str:
+    """
+    Преобразует короткий символ (например XRP) в правильный контракт swap на MEXC.
+    Кэширует список доступных пар.
+    """
+    global _cached_markets
+    if _cached_markets is None:
+        await exchange.load_markets()
+        _cached_markets = {m.split("/")[0]: m for m in exchange.markets.keys() if m.endswith(":USDT")}
+    symbol = _cached_markets.get(base.upper())
+    if not symbol:
+        raise Exception(f"Symbol {base} not found in available swap markets")
+    return symbol
+
+# -------------------------
 # Utilities
 # -------------------------
 async def safe_ccxt_call(fn, *args, **kwargs):
@@ -91,26 +109,6 @@ async def safe_ccxt_call(fn, *args, **kwargs):
     except Exception as e:
         logger.error(f"Unexpected error in {fn.__name__}: {e}\n{traceback.format_exc()}")
         return None
-
-# -------------------------
-# Авто-выбор символа по базовой монете
-# -------------------------
-def find_swap_symbol(base: str) -> Optional[str]:
-    """
-    Находит первую доступную USDT swap пару для базового актива
-    """
-    for symbol, market in exchange.markets.items():
-        if market['base'] == base and market['quote'] == 'USDT' and market['type'] == 'swap':
-            return symbol
-    return None
-
-async def get_correct_symbol(base_symbol: str) -> str:
-    await exchange.load_markets()
-    symbol = find_swap_symbol(base_symbol)
-    if not symbol:
-        raise Exception(f"No USDT swap contract found for {base_symbol}")
-    logger.info(f"Используемый символ: {symbol}")
-    return symbol
 
 # -------------------------
 # Balance / Price helpers
@@ -161,11 +159,14 @@ async def calculate_qty_for_usd(symbol: str, usd_amount: float, leverage: int) -
 # -------------------------
 # Leverage / Position helpers
 # -------------------------
-async def set_leverage_usdt(symbol: str, leverage: int, position_side: str):
+async def set_leverage_usdt(symbol: str, leverage: int, positionSide: str):
+    """
+    Устанавливает плечо для позиции на MEXC swap.
+    positionSide: "LONG" или "SHORT"
+    """
     try:
-        params = {"positionSide": position_side}
-        await safe_ccxt_call(exchange.set_leverage, leverage, symbol, params)
-        logger.info(f"Плечо установлено: {leverage}x для {position_side}")
+        await safe_ccxt_call(exchange.set_leverage, leverage, symbol, {"positionSide": positionSide})
+        logger.info(f"Плечо установлено: {leverage}x для {positionSide}")
     except Exception as e:
         logger.warning(f"Не удалось установить плечо: {e} — продолжим")
 
@@ -176,8 +177,8 @@ async def create_market_position_usdt(symbol: str, side: str, qty: float, levera
     positionSide = "LONG" if side == "buy" else "SHORT"
     await exchange.load_markets()
     await set_leverage_usdt(symbol, leverage, positionSide)
+    params = {"positionSide": positionSide, "openType": 1, "positionType": 1 if positionSide == "LONG" else 2}
 
-    params = {"positionSide": positionSide}
     logger.info(f"Создаю рыночный ордер: {side} {qty} {symbol} params={params}")
     order = await safe_ccxt_call(exchange.create_market_order, symbol, side, qty, None, params)
     if order is None:
@@ -186,7 +187,7 @@ async def create_market_position_usdt(symbol: str, side: str, qty: float, levera
     return order
 
 async def create_tp_sl_limit(symbol: str, close_side: str, qty: float, price: float, positionSide:str):
-    params = {"reduceOnly": True, "positionSide": positionSide}
+    params = {"reduceOnly": True, "positionSide": positionSide, "openType": 1, "positionType": 1 if positionSide == "LONG" else 2}
     logger.info(f"Создаю limit закрывающий ордер {close_side} {qty} @ {price} params={params}")
     order = await safe_ccxt_call(exchange.create_order, symbol, "limit", close_side, qty, price, params)
     if order is None:
@@ -199,16 +200,15 @@ async def create_tp_sl_limit(symbol: str, close_side: str, qty: float, price: fl
 last_trade_info: Optional[dict] = None
 active_position = False
 
-async def open_position_from_signal(signal: str, fixed_amount_usd: Optional[float] = None):
-    global active_position, last_trade_info, SYMBOL
+async def open_position_from_signal(signal: str, symbol_base: str = "XRP", fixed_amount_usd: Optional[float] = None):
+    global active_position, last_trade_info
     try:
         if active_position:
             logger.info("Позиция уже активна — пропускаем открытие.")
             await tg_send("⚠️ Позиция уже активна — новый сигнал проигнорирован.")
             return
 
-        SYMBOL = await get_correct_symbol(BASE_SYMBOL)  # подставляем символ автоматически
-
+        SYMBOL = await resolve_symbol(symbol_base)
         balance = await fetch_balance_usdt()
         usd_amount = fixed_amount_usd if fixed_amount_usd and fixed_amount_usd > 0 else (balance * RISK_PERCENT / 100)
         if usd_amount < MIN_ORDER_USD:
@@ -217,7 +217,6 @@ async def open_position_from_signal(signal: str, fixed_amount_usd: Optional[floa
             return
 
         qty = await calculate_qty_for_usd(SYMBOL, usd_amount, LEVERAGE)
-
         side = "buy" if signal.lower() == "buy" else "sell"
         positionSide = "LONG" if side == "buy" else "SHORT"
         close_side = "sell" if side == "buy" else "buy"
@@ -247,6 +246,7 @@ async def open_position_from_signal(signal: str, fixed_amount_usd: Optional[floa
             "tp": tp_price,
             "sl": sl_price,
             "order": order,
+            "symbol": SYMBOL,
             "timestamp": time.time()
         }
 
@@ -273,12 +273,12 @@ async def open_position_from_signal(signal: str, fixed_amount_usd: Optional[floa
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
-        SYMBOL = await get_correct_symbol(BASE_SYMBOL)
         logger.info("🚀 ЗАПУСК БОТА (lifespan startup)")
         try:
             balance = await fetch_balance_usdt()
         except Exception:
             balance = None
+        SYMBOL = await resolve_symbol("XRP")
         try:
             price = await fetch_price(SYMBOL)
         except Exception:
@@ -316,14 +316,13 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/", response_class=HTMLResponse)
 async def home():
     try:
+        SYMBOL = await resolve_symbol("XRP")
         balance = await fetch_balance_usdt()
-    except Exception:
-        balance = None
-    try:
         price = await fetch_price(SYMBOL)
     except Exception:
+        SYMBOL = "XRP"
+        balance = None
         price = None
-    global last_trade_info, active_position
     status = "АКТИВНА" if active_position else "НЕТ"
     html = f"<html><body><h1>🤖 MEXC Futures Bot</h1><p>Символ: {SYMBOL}</p><p>Баланс: {balance}</p><p>Цена: {price}</p><p>Позиция: {status}</p></body></html>"
     return HTMLResponse(html)
@@ -344,18 +343,20 @@ async def webhook(request: Request):
         raise HTTPException(400, "Invalid JSON")
 
     signal = payload.get("signal")
+    symbol_base = payload.get("symbol", "XRP")
     custom_amount = payload.get("fixed_amount_usd")
 
     if signal not in ("buy", "sell"):
         raise HTTPException(400, "signal must be 'buy' or 'sell'")
 
-    asyncio.create_task(open_position_from_signal(signal, fixed_amount_usd=custom_amount))
-    await tg_send(f"📨 Received signal: {signal.upper()}. Открытие позиции запланировано.")
-    return {"status": "accepted", "signal": signal}
+    asyncio.create_task(open_position_from_signal(signal, symbol_base=symbol_base, fixed_amount_usd=custom_amount))
+    await tg_send(f"📨 Received signal: {signal.upper()} for {symbol_base}. Открытие позиции запланировано.")
+    return {"status": "accepted", "signal": signal, "symbol": symbol_base}
 
 @app.get("/health")
 async def health():
     try:
+        SYMBOL = await resolve_symbol("XRP")
         price = await fetch_price(SYMBOL)
         balance = await fetch_balance_usdt()
         return {
