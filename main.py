@@ -35,8 +35,7 @@ MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-# ⚠ Используем правильный swap-контракт
-SYMBOL = os.getenv("SYMBOL", "XRP_USDT")  
+BASE_SYMBOL = os.getenv("BASE_SYMBOL", "XRP")  # базовый актив
 FIXED_AMOUNT_USD = float(os.getenv("FIXED_AMOUNT_USD", "10"))
 LEVERAGE = int(os.getenv("LEVERAGE", "5"))
 MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "2.2616"))
@@ -94,6 +93,26 @@ async def safe_ccxt_call(fn, *args, **kwargs):
         return None
 
 # -------------------------
+# Авто-выбор символа по базовой монете
+# -------------------------
+def find_swap_symbol(base: str) -> Optional[str]:
+    """
+    Находит первую доступную USDT swap пару для базового актива
+    """
+    for symbol, market in exchange.markets.items():
+        if market['base'] == base and market['quote'] == 'USDT' and market['type'] == 'swap':
+            return symbol
+    return None
+
+async def get_correct_symbol(base_symbol: str) -> str:
+    await exchange.load_markets()
+    symbol = find_swap_symbol(base_symbol)
+    if not symbol:
+        raise Exception(f"No USDT swap contract found for {base_symbol}")
+    logger.info(f"Используемый символ: {symbol}")
+    return symbol
+
+# -------------------------
 # Balance / Price helpers
 # -------------------------
 async def fetch_balance_usdt() -> float:
@@ -142,17 +161,11 @@ async def calculate_qty_for_usd(symbol: str, usd_amount: float, leverage: int) -
 # -------------------------
 # Leverage / Position helpers
 # -------------------------
-async def set_leverage_usdt(symbol: str, leverage: int, positionSide: str):
-    """
-    Устанавливает плечо для позиции на MEXC swap.
-    positionSide: "LONG" или "SHORT"
-    """
+async def set_leverage_usdt(symbol: str, leverage: int, position_side: str):
     try:
-        openType = 1  # изолированная позиция
-        positionType = 1 if positionSide == "LONG" else 2
-        params = {"openType": openType, "positionType": positionType}
+        params = {"positionSide": position_side}
         await safe_ccxt_call(exchange.set_leverage, leverage, symbol, params)
-        logger.info(f"Плечо установлено: {leverage}x для {positionSide}")
+        logger.info(f"Плечо установлено: {leverage}x для {position_side}")
     except Exception as e:
         logger.warning(f"Не удалось установить плечо: {e} — продолжим")
 
@@ -160,18 +173,11 @@ async def set_leverage_usdt(symbol: str, leverage: int, positionSide: str):
 # Order creation
 # -------------------------
 async def create_market_position_usdt(symbol: str, side: str, qty: float, leverage: int):
-    """
-    Создает рыночную позицию (фьючерс) на MEXC swap.
-    side: "buy" или "sell"
-    """
     positionSide = "LONG" if side == "buy" else "SHORT"
     await exchange.load_markets()
     await set_leverage_usdt(symbol, leverage, positionSide)
 
-    openType = 1  # isolated
-    positionType = 1 if positionSide == "LONG" else 2
-    params = {"positionSide": positionSide, "openType": openType, "positionType": positionType}
-
+    params = {"positionSide": positionSide}
     logger.info(f"Создаю рыночный ордер: {side} {qty} {symbol} params={params}")
     order = await safe_ccxt_call(exchange.create_market_order, symbol, side, qty, None, params)
     if order is None:
@@ -180,9 +186,7 @@ async def create_market_position_usdt(symbol: str, side: str, qty: float, levera
     return order
 
 async def create_tp_sl_limit(symbol: str, close_side: str, qty: float, price: float, positionSide:str):
-    openType = 1  # изолированная
-    positionType = 1 if positionSide == "LONG" else 2
-    params = {"reduceOnly": True, "positionSide": positionSide, "openType": openType, "positionType": positionType}
+    params = {"reduceOnly": True, "positionSide": positionSide}
     logger.info(f"Создаю limit закрывающий ордер {close_side} {qty} @ {price} params={params}")
     order = await safe_ccxt_call(exchange.create_order, symbol, "limit", close_side, qty, price, params)
     if order is None:
@@ -196,12 +200,14 @@ last_trade_info: Optional[dict] = None
 active_position = False
 
 async def open_position_from_signal(signal: str, fixed_amount_usd: Optional[float] = None):
-    global active_position, last_trade_info
+    global active_position, last_trade_info, SYMBOL
     try:
         if active_position:
             logger.info("Позиция уже активна — пропускаем открытие.")
             await tg_send("⚠️ Позиция уже активна — новый сигнал проигнорирован.")
             return
+
+        SYMBOL = await get_correct_symbol(BASE_SYMBOL)  # подставляем символ автоматически
 
         balance = await fetch_balance_usdt()
         usd_amount = fixed_amount_usd if fixed_amount_usd and fixed_amount_usd > 0 else (balance * RISK_PERCENT / 100)
@@ -267,6 +273,7 @@ async def open_position_from_signal(signal: str, fixed_amount_usd: Optional[floa
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
+        SYMBOL = await get_correct_symbol(BASE_SYMBOL)
         logger.info("🚀 ЗАПУСК БОТА (lifespan startup)")
         try:
             balance = await fetch_balance_usdt()
@@ -369,4 +376,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
-
