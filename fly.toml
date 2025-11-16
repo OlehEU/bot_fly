@@ -1,10 +1,9 @@
 # fly.toml
-app = "bot-fly-oz"        # название приложения на Fly.io
-primary_region = "fra"     # регион запуска
+app = "bot-fly-oz"
+primary_region = "fra"
 
 [processes]
-  # Запуск основного скрипта бота
-  app = "python3 main.py"
+  app = "python3 main.py"  # запускаем скрипт бота
 
 [vm]
   memory = "1gb"
@@ -13,12 +12,15 @@ primary_region = "fra"     # регион запуска
 
 [build]
   # Fly сам соберёт образ из Dockerfile
-  # Ничего не указываем — используем Dockerfile
 
 [[services]]
-  internal_port = 8080       # порт для health check (можно любой, если бот без HTTP)
-  protocol = "tcp"
   process = "app"
+  internal_port = 8000
+  protocol = "tcp"
+
+  [[services.ports]]
+    port = 8000           # открываем порт 8000
+    handlers = ["tcp"]
 
   [services.concurrency]
     type = "connections"
