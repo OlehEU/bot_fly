@@ -36,7 +36,7 @@ MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 # ⚠ Используем правильный swap-контракт
-SYMBOL = os.getenv("SYMBOL", "XRP/USDT:USDT")  
+SYMBOL = os.getenv("SYMBOL", "XRP_USDT")  
 FIXED_AMOUNT_USD = float(os.getenv("FIXED_AMOUNT_USD", "10"))
 LEVERAGE = int(os.getenv("LEVERAGE", "5"))
 MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "2.2616"))
@@ -369,3 +369,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
+
