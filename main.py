@@ -165,6 +165,7 @@ app = FastAPI()
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
+    balance = await check_balance()
     return f"""
     <html>
     <body style="font-family:Arial;background:#111;color:#eee;padding:20px;">
@@ -172,6 +173,7 @@ async def home():
       <p><b>Символ:</b> {SYMBOL}</p>
       <p><b>Риск:</b> {RISK_PERCENT}%</p>
       <p><b>Плечо:</b> {LEVERAGE}x</p>
+      <p><b>Баланс:</b> {balance:.2f} USDT</p>
       <p><b>Позиция активна:</b> {active_position}</p>
       <h3>Последняя сделка:</h3>
       <pre>{json.dumps(last_trade_info, indent=2, ensure_ascii=False) if last_trade_info else "Нет"}</pre>
@@ -196,6 +198,13 @@ async def webhook(request: Request):
 
     asyncio.create_task(open_position(signal))
     return {"status": "accepted", "signal": signal}
+
+# === Startup event: уведомление в Telegram ===
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Бот запущен")
+    balance = await check_balance()
+    await tg_send(f"🚀 Бот запущен!\nБаланс: {balance:.2f} USDT")
 
 if __name__ == "__main__":
     import uvicorn
