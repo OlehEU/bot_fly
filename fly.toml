@@ -1,16 +1,12 @@
 app = "bot-fly-oz"
 primary_region = "fra"
 
-[processes]
-  app = "uvicorn main:app --host 0.0.0.0 --port 8000"
-
-[vm]
-  memory = "1gb"
-  cpu_kind = "shared"
-  cpus = 1
-
 [build]
-  image = "registry.fly.io/bot-fly-oz:latest"
+  dockerfile = "Dockerfile"
+
+[processes]
+  # Запуск FastAPI приложения через uvicorn
+  app = "uvicorn main:app --host 0.0.0.0 --port 8000"
 
 [[services]]
   processes = ["app"]
