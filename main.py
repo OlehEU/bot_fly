@@ -142,11 +142,17 @@ async def calculate_qty_for_usd(symbol: str, usd_amount: float, leverage: int) -
 # -------------------------
 # Leverage / Position helpers
 # -------------------------
-async def set_leverage_usdt(symbol: str, leverage: int, position_side: str):
+async def set_leverage_usdt(symbol: str, leverage: int, positionSide: str):
+    """
+    Устанавливает плечо для позиции на MEXC swap.
+    positionSide: "LONG" или "SHORT"
+    """
     try:
-        params = {"positionSide": position_side}
+        openType = 1  # изолированная позиция
+        positionType = 1 if positionSide == "LONG" else 2
+        params = {"openType": openType, "positionType": positionType}
         await safe_ccxt_call(exchange.set_leverage, leverage, symbol, params)
-        logger.info(f"Плечо установлено: {leverage}x для {position_side}")
+        logger.info(f"Плечо установлено: {leverage}x для {positionSide}")
     except Exception as e:
         logger.warning(f"Не удалось установить плечо: {e} — продолжим")
 
@@ -154,11 +160,18 @@ async def set_leverage_usdt(symbol: str, leverage: int, position_side: str):
 # Order creation
 # -------------------------
 async def create_market_position_usdt(symbol: str, side: str, qty: float, leverage: int):
+    """
+    Создает рыночную позицию (фьючерс) на MEXC swap.
+    side: "buy" или "sell"
+    """
     positionSide = "LONG" if side == "buy" else "SHORT"
     await exchange.load_markets()
     await set_leverage_usdt(symbol, leverage, positionSide)
 
-    params = {"positionSide": positionSide}
+    openType = 1  # isolated
+    positionType = 1 if positionSide == "LONG" else 2
+    params = {"positionSide": positionSide, "openType": openType, "positionType": positionType}
+
     logger.info(f"Создаю рыночный ордер: {side} {qty} {symbol} params={params}")
     order = await safe_ccxt_call(exchange.create_market_order, symbol, side, qty, None, params)
     if order is None:
@@ -167,7 +180,9 @@ async def create_market_position_usdt(symbol: str, side: str, qty: float, levera
     return order
 
 async def create_tp_sl_limit(symbol: str, close_side: str, qty: float, price: float, positionSide:str):
-    params = {"reduceOnly": True, "positionSide": positionSide}
+    openType = 1  # изолированная
+    positionType = 1 if positionSide == "LONG" else 2
+    params = {"reduceOnly": True, "positionSide": positionSide, "openType": openType, "positionType": positionType}
     logger.info(f"Создаю limit закрывающий ордер {close_side} {qty} @ {price} params={params}")
     order = await safe_ccxt_call(exchange.create_order, symbol, "limit", close_side, qty, price, params)
     if order is None:
