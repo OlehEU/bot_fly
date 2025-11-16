@@ -26,7 +26,9 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 FIXED_AMOUNT_USD = float(os.getenv("FIXED_AMOUNT_USD", "10"))
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 TP_PERCENT = float(os.getenv("TP_PERCENT", "0.5"))
+SL_PERCENT = float(os.getenv("SL_PERCENT", "1.0"))  # ← SL -1%
 MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "1.0"))
+AUTO_CLOSE_MINUTES = 10  # ← Автозакрытие
 
 # -------------------------
 # Logging
@@ -108,7 +110,7 @@ async def calculate_qty(symbol: str, usd: float, lev: int) -> float:
     return qty
 
 # -------------------------
-# Market Order (ФИНАЛЬНАЯ ВЕРСИЯ — РАБОТАЕТ ВСЕГДА)
+# Market Order (ВСЕГДА РАБОТАЕТ)
 # -------------------------
 async def create_market_position_usdt(symbol: str, qty: float, leverage: int):
     query = {
@@ -137,7 +139,7 @@ async def create_market_position_usdt(symbol: str, qty: float, leverage: int):
     return {'average': entry_price, 'id': order_id}
 
 # -------------------------
-# TP Limit
+# TP + SL
 # -------------------------
 async def create_tp_limit(symbol: str, qty: float, price: float, leverage: int):
     query = {
@@ -156,6 +158,46 @@ async def create_tp_limit(symbol: str, qty: float, price: float, leverage: int):
     except Exception as e:
         logger.warning(f"TP failed: {e}")
         await tg_send(f"Warning: TP не установлен: {price}")
+
+async def create_sl_limit(symbol: str, qty: float, price: float, leverage: int):
+    query = {
+        "reduceOnly": True,
+        "positionSide": "LONG",
+        "openType": 1,
+        "positionType": 1,
+        "leverage": leverage
+    }
+    try:
+        await asyncio.wait_for(
+            exchange.create_order(symbol, "limit", "sell", qty, price, query),
+            timeout=8
+        )
+        logger.info(f"SL SET @ {price}")
+    except Exception as e:
+        logger.warning(f"SL failed: {e}")
+        await tg_send(f"Warning: SL не установлен: {price}")
+
+# -------------------------
+# Auto-close
+# -------------------------
+async def auto_close_position():
+    await asyncio.sleep(AUTO_CLOSE_MINUTES * 60)
+    if not active_position:
+        return
+
+    try:
+        SYMBOL = await resolve_symbol("XRP")
+        positions = await exchange.fetch_positions([SYMBOL])
+        for pos in positions:
+            if pos.get('side') == 'long' and float(pos.get('contracts', 0)) > 0:
+                qty = float(pos['contracts'])
+                await exchange.create_order(SYMBOL, "market", "sell", qty, None, {"reduceOnly": True})
+                await tg_send(f"Автозакрытие: LONG закрыт по рынку\nQty: {qty}")
+                break
+        global active_position
+        active_position = False
+    except Exception as e:
+        await tg_send(f"Ошибка автозакрытия: {e}")
 
 # -------------------------
 # Main Logic
@@ -176,7 +218,10 @@ async def open_position():
 
         info = await get_market_info(SYMBOL)
         tp = round(entry * (1 + TP_PERCENT / 100), info['price_scale'])
+        sl = round(entry * (1 - SL_PERCENT / 100), info['price_scale'])
+
         await create_tp_limit(SYMBOL, qty, tp, LEVERAGE)
+        await create_sl_limit(SYMBOL, qty, sl, LEVERAGE)
 
         active_position = True
         msg = (
@@ -185,9 +230,13 @@ async def open_position():
             f"${FIXED_AMOUNT_USD} | {LEVERAGE}x\n"
             f"Qty: <code>{qty}</code>\n"
             f"Entry: <code>{entry:.4f}</code>\n"
-            f"TP: <code>{tp:.4f}</code>"
+            f"TP (+{TP_PERCENT}%): <code>{tp:.4f}</code>\n"
+            f"SL (-{SL_PERCENT}%): <code>{sl:.4f}</code>\n"
+            f"Автозакрытие: через {AUTO_CLOSE_MINUTES} мин"
         )
         await tg_send(msg)
+
+        asyncio.create_task(auto_close_position())
 
     except Exception as e:
         await tg_send(f"Error: {e}")
@@ -198,7 +247,7 @@ async def open_position():
 # -------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await tg_send("Bot started | XRP Long | $10 | 10x | TP +0.5%")
+    await tg_send("Bot started | XRP Long | $10 | 10x | TP +0.5% | SL -1% | Автозакрытие 10 мин")
     yield
     await exchange.close()
     await tg_send("Bot stopped")
