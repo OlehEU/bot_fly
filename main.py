@@ -63,16 +63,22 @@ exchange = ccxt.mexc({
 })
 
 # -------------------------
-# Symbol
+# Symbol Cache (GLOBAL!)
 # -------------------------
-_cached_markets: Dict[str, str] = {}
+_cached_markets: Dict[str, str] = {}  # ← ГЛОБАЛЬНАЯ!
+
 async def resolve_symbol(base: str) -> str:
+    global _cached_markets  # ← Объявляем global
     if not _cached_markets:
         await exchange.load_markets()
-        _cached_markets = {m.split("/")[0]: m for m in exchange.markets.keys() if m.endswith(":USDT")}
+        _cached_markets = {
+            m.split("/")[0]: m
+            for m in exchange.markets.keys()
+            if m.endswith(":USDT")
+        }
     symbol = _cached_markets.get(base.upper())
     if not symbol:
-        raise Exception("Symbol not found")
+        raise Exception(f"Symbol not found: {base}")
     return symbol
 
 # -------------------------
@@ -82,7 +88,8 @@ async def fetch_price(symbol: str) -> float:
     try:
         ticker = await asyncio.wait_for(exchange.fetch_ticker(symbol), timeout=8)
         return float(ticker.get("last", 0))
-    except:
+    except Exception as e:
+        logger.warning(f"Price fetch failed: {e}")
         return 0.0
 
 async def get_market_info(symbol: str) -> dict:
@@ -129,6 +136,8 @@ async def create_market_position_usdt(symbol: str, qty: float, leverage: int):
         )
     except Exception as e:
         logger.warning(f"create_order failed: {e}")
+        await tg_send(f"Ошибка создания рыночного ордера: buy {qty} {symbol}")
+        raise
 
     entry_price = await fetch_price(symbol)
     order_id = order.get('id') if order else "FORCED"
@@ -181,7 +190,7 @@ async def create_sl_limit(symbol: str, qty: float, price: float, leverage: int):
 # Auto-close
 # -------------------------
 async def auto_close_position():
-    global active_position  # ← global В НАЧАЛЕ!
+    global active_position
     await asyncio.sleep(AUTO_CLOSE_MINUTES * 60)
     if not active_position:
         return
@@ -202,7 +211,7 @@ async def auto_close_position():
 # -------------------------
 # Main Logic
 # -------------------------
-active_position = False  # ← Объявлена ДО использования
+active_position = False
 
 async def open_position():
     global active_position
@@ -239,7 +248,7 @@ async def open_position():
         asyncio.create_task(auto_close_position())
 
     except Exception as e:
-        await tg_send(f"Error: {e}")
+        await tg_send(f"Ошибка при открытии позиции: {e}")
         active_position = False
 
 # -------------------------
