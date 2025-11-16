@@ -2,7 +2,7 @@ app = "bot-fly-oz"
 primary_region = "fra"
 
 [processes]
-  app = "python3 main.py"  # или uvicorn main:app --host 0.0.0.0 --port 8000 если веб
+  app = "uvicorn main:app --host 0.0.0.0 --port 8000"
 
 [vm]
   memory = "1gb"
@@ -10,7 +10,7 @@ primary_region = "fra"
   cpus = 1
 
 [build]
-  # Fly сам соберёт образ из Dockerfile
+  image = "registry.fly.io/bot-fly-oz:latest"
 
 [[services]]
   processes = ["app"]
@@ -18,8 +18,12 @@ primary_region = "fra"
   protocol = "tcp"
 
   [[services.ports]]
-    port = 8000
-    handlers = ["http"]  # <-- исправлено с tcp на http
+    handlers = ["http"]
+    port = 80
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
 
   [services.concurrency]
     type = "connections"
