@@ -1,10 +1,10 @@
-@@ -1,18 +1,19 @@
 # fly.toml
-app = "bot-fly-oz"
-primary_region = "fra"
+app = "bot-fly-oz"        # название приложения на Fly.io
+primary_region = "fra"     # регион запуска
 
 [processes]
-  app = "uvicorn main:app --host 0.0.0.0 --port 8000"
+  # Запуск основного скрипта бота
+  app = "python3 main.py"
 
 [vm]
   memory = "1gb"
@@ -16,16 +16,17 @@ primary_region = "fra"
   # Ничего не указываем — используем Dockerfile
 
 [[services]]
-  internal_port = 8000
+  internal_port = 8080       # порт для health check (можно любой, если бот без HTTP)
   protocol = "tcp"
-  process = "app"  # ← КРИТИЧНО! Привязка процесса к сервису
+  process = "app"
 
   [services.concurrency]
     type = "connections"
-@@ -40,3 +41,6 @@ primary_region = "fra"
-    path = "/"
-    protocol = "http"
-    timeout = "2s"
-    tls_skip_verify = false
+    soft_limit = 25
+    hard_limit = 50
 
-    [services.http_checks.headers]
+  [services.tcp_checks]
+    interval = "10s"
+    timeout = "2s"
+    grace_period = "5s"
+    restart_limit = 0
