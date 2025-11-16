@@ -6,12 +6,12 @@ import traceback
 import logging
 import asyncio
 from typing import Optional
+import math
 
 import ccxt.async_support as ccxt
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from telegram import Bot
-import math
 
 # -------------------------
 # Config / Secrets
@@ -145,22 +145,40 @@ async def calculate_qty_for_usd(symbol: str, usd_amount: float, leverage: int) -
 # Leverage / Position helpers
 # -------------------------
 async def set_leverage_usdt(symbol: str, leverage: int, position_side: str):
+    """
+    Устанавливаем плечо для USDT-фьючерсов MEXC.
+    position_side: 'LONG' или 'SHORT'
+    """
     try:
-        params = {"positionSide": position_side}
+        params = {
+            "positionSide": position_side,
+            "openType": 2,  # cross
+            "positionType": 1 if position_side == "LONG" else 2
+        }
         await safe_ccxt_call(exchange.set_leverage, leverage, symbol, params)
         logger.info(f"Плечо установлено: {leverage}x для {position_side}")
     except Exception as e:
-        logger.warning(f"Не удалось установить плечо: {e} — продолжим")
+        logger.warning(f"Не удалось установить плечо: {e} — продолжаем без прерывания")
 
 # -------------------------
 # Order creation
 # -------------------------
 async def create_market_position_usdt(symbol: str, side: str, qty: float, leverage: int):
-    positionSide = "LONG" if side == "buy" else "SHORT"
+    position_side = "LONG" if side == "buy" else "SHORT"
     await exchange.load_markets()
-    await set_leverage_usdt(symbol, leverage, positionSide)
+    await set_leverage_usdt(symbol, leverage, position_side)
 
-    params = {"positionSide": positionSide}
+    # Получаем минимальный шаг объёма и minVol
+    market_info = await get_market_info(symbol)
+    vol_unit = market_info['vol_unit']
+    min_vol = market_info['min_vol']
+
+    # Округляем количество по шагу volUnit
+    qty = math.floor(qty / vol_unit) * vol_unit
+    if qty < min_vol:
+        qty = min_vol
+
+    params = {"positionSide": position_side}
     logger.info(f"Создаю рыночный ордер: {side} {qty} {symbol} params={params}")
     order = await safe_ccxt_call(exchange.create_market_order, symbol, side, qty, None, params)
     if order is None:
@@ -168,8 +186,8 @@ async def create_market_position_usdt(symbol: str, side: str, qty: float, levera
         raise Exception(f"Market order failed: {side} {qty} {symbol}")
     return order
 
-async def create_tp_sl_limit(symbol: str, close_side: str, qty: float, price: float, positionSide:str):
-    params = {"reduceOnly": True, "positionSide": positionSide}
+async def create_tp_sl_limit(symbol: str, close_side: str, qty: float, price: float, position_side: str):
+    params = {"reduceOnly": True, "positionSide": position_side}
     logger.info(f"Создаю limit закрывающий ордер {close_side} {qty} @ {price} params={params}")
     order = await safe_ccxt_call(exchange.create_order, symbol, "limit", close_side, qty, price, params)
     if order is None:
@@ -200,7 +218,7 @@ async def open_position_from_signal(signal: str, fixed_amount_usd: Optional[floa
         qty = await calculate_qty_for_usd(SYMBOL, usd_amount, LEVERAGE)
 
         side = "buy" if signal.lower() == "buy" else "sell"
-        positionSide = "LONG" if side == "buy" else "SHORT"
+        position_side = "LONG" if side == "buy" else "SHORT"
         close_side = "sell" if side == "buy" else "buy"
 
         order = await create_market_position_usdt(SYMBOL, side, qty, LEVERAGE)
@@ -217,8 +235,8 @@ async def open_position_from_signal(signal: str, fixed_amount_usd: Optional[floa
             sl_price = round(entry_price * 1.01, price_scale)
 
         try:
-            await create_tp_sl_limit(SYMBOL, close_side, qty, tp_price, positionSide)
-            await create_tp_sl_limit(SYMBOL, close_side, qty, sl_price, positionSide)
+            await create_tp_sl_limit(SYMBOL, close_side, qty, tp_price, position_side)
+            await create_tp_sl_limit(SYMBOL, close_side, qty, sl_price, position_side)
         except Exception as e:
             logger.warning(f"Не удалось выставить TP/SL: {e}\n{traceback.format_exc()}")
 
