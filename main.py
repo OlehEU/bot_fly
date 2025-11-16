@@ -5,7 +5,6 @@ import time
 import traceback
 import logging
 import asyncio
-from contextlib import asynccontextmanager
 from typing import Optional
 
 import ccxt.async_support as ccxt
@@ -22,7 +21,6 @@ REQUIRED_SECRETS = [
     "MEXC_API_KEY",
     "MEXC_API_SECRET",
     "WEBHOOK_SECRET",
-    # optional: SYMBOL, FIXED_AMOUNT_USD, LEVERAGE
 ]
 
 missing = [s for s in REQUIRED_SECRETS if not os.getenv(s)]
@@ -35,20 +33,17 @@ MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-# Defaults (can be overridden via env)
-SYMBOL = os.getenv("SYMBOL", "XRP/USDT")  # use ccxt symbol format like "XRP/USDT"
-FIXED_AMOUNT_USD = float(os.getenv("FIXED_AMOUNT_USD", "10"))  # fixed USD per trade
+SYMBOL = os.getenv("SYMBOL", "XRP/USDT")
+FIXED_AMOUNT_USD = float(os.getenv("FIXED_AMOUNT_USD", "10"))
 LEVERAGE = int(os.getenv("LEVERAGE", "5"))
-MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "2.2616"))  # minimal order value
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", "25"))  # if no fixed amount, portion of balance
+MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "2.2616"))
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "25"))
+CONTRACT_SIZE = float(os.getenv("CONTRACT_SIZE", "0.01"))
 
 # -------------------------
 # Logging
 # -------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("mexc-bot")
 
 # -------------------------
@@ -57,9 +52,6 @@ logger = logging.getLogger("mexc-bot")
 bot = Bot(token=TELEGRAM_TOKEN)
 
 async def tg_send(text: str):
-    """
-    Use asyncio.to_thread to call synchronous telegram Bot safely.
-    """
     def sync_send():
         try:
             bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML", disable_web_page_preview=True)
@@ -76,7 +68,7 @@ exchange = ccxt.mexc({
     "apiKey": MEXC_API_KEY,
     "secret": MEXC_API_SECRET,
     "enableRateLimit": True,
-    "options": {"defaultType": "swap"},  # use swap for futures USDT-M
+    "options": {"defaultType": "swap"},
 })
 
 # -------------------------
@@ -108,29 +100,21 @@ async def fetch_price(symbol: str) -> float:
     return price
 
 async def amount_precision(symbol: str, amount: float) -> float:
-    # ccxt provided helper may need markets loaded
     try:
         await exchange.load_markets()
         if symbol in exchange.markets:
             prec_str = exchange.markets[symbol].get('precision', {}).get('amount')
             if prec_str is not None:
-                # ccxt expects string rounding via amount_to_precision
                 return float(exchange.amount_to_precision(symbol, amount))
     except Exception:
         pass
-    # fallback rounding to 6 decimals
     return round(amount, 6)
 
 # -------------------------
-# Leverage / Position helpers (USDT-M)
+# Leverage / Position helpers
 # -------------------------
 async def set_leverage_usdt(symbol: str, leverage: int, position_side: str):
-    """
-    Try to set leverage for USDT-M futures.
-    position_side: "LONG" or "SHORT" (some endpoints require)
-    """
     try:
-        # Many exchanges expect set_leverage(leverage, symbol, params={...})
         params = {"positionSide": position_side}
         await exchange.set_leverage(leverage, symbol, params)
         logger.info(f"Плечо установлено: {leverage}x для {position_side}")
@@ -141,33 +125,16 @@ async def set_leverage_usdt(symbol: str, leverage: int, position_side: str):
 # Order creation (market + TP/SL)
 # -------------------------
 async def create_market_position_usdt(symbol: str, side: str, qty: float, leverage: int):
-    """
-    Create a market position for USDT-M:
-      - side: 'buy' => open LONG, 'sell' => open SHORT
-      - qty: amount (base)
-    Returns order dict or raises.
-    """
     positionSide = "LONG" if side == "buy" else "SHORT"
-    # Ensure markets loaded
     await exchange.load_markets()
-    # Set leverage (best-effort)
     await set_leverage_usdt(symbol, leverage, positionSide)
-
-    params = {
-        "positionSide": positionSide,
-        # 'reduceOnly': False,  # not needed for opening
-    }
-
+    params = {"positionSide": positionSide}
     logger.info(f"Создаю рыночный ордер: {side} {qty} {symbol} params={params}")
     order = await exchange.create_market_order(symbol, side, qty, None, params)
     logger.info(f"Order response: {order}")
     return order
 
-async def create_tp_sl_limit(symbol: str, close_side: str, qty: float, price: float, positionSide:str):
-    """
-    Create a limit order for TP/SL using reduceOnly param (common pattern).
-    reduceOnly true to close position.
-    """
+async def create_tp_sl_limit(symbol: str, close_side: str, qty: float, price: float, positionSide: str):
     params = {"reduceOnly": True, "positionSide": positionSide}
     logger.info(f"Создаю limit закрывающий ордер {close_side} {qty} @ {price} params={params}")
     order = await exchange.create_order(symbol, "limit", close_side, qty, price, params)
@@ -183,22 +150,16 @@ active_position = False
 async def calculate_qty_for_usd(symbol: str, usd_amount: float, leverage: int) -> float:
     price = await fetch_price(symbol)
     qty = (usd_amount * leverage) / price
-    # Ensure minimal order value
     if qty * price < MIN_ORDER_USD:
         qty = (MIN_ORDER_USD / price)
     qty = await amount_precision(symbol, qty)
-    # If exchange requires minimum amount 1, ensure >=1 (some markets)
     if qty < 0.000001:
         qty = 0.000001
     logger.info(f"Расчитанное количество: {qty} (USD {usd_amount} * L{leverage} / price {price})")
     return qty
 
 async def open_position_from_signal(signal: str, fixed_amount_usd: Optional[float] = None):
-    """
-    Main entry to open a position. signal: 'buy' or 'sell'
-    """
     global active_position, last_trade_info
-
     try:
         if active_position:
             logger.info("Позиция уже активна — пропускаем открытие.")
@@ -218,17 +179,9 @@ async def open_position_from_signal(signal: str, fixed_amount_usd: Optional[floa
         positionSide = "LONG" if side == "buy" else "SHORT"
         close_side = "sell" if side == "buy" else "buy"
 
-        # Create market order
         order = await create_market_position_usdt(SYMBOL, side, qty, LEVERAGE)
+        entry_price = order.get("average") or order.get("price") or await fetch_price(SYMBOL)
 
-        # Determine entry price
-        # many exchanges return 'average' after fill, fallback to ticker last
-        entry_price = None
-        entry_price = order.get("average") or order.get("price")
-        if not entry_price:
-            entry_price = await fetch_price(SYMBOL)
-
-        # Compute TP & SL (example: TP = +1.5%, SL = -1%)
         if side == "buy":
             tp_price = round(entry_price * 1.015, 6)
             sl_price = round(entry_price * 0.99, 6)
@@ -236,7 +189,6 @@ async def open_position_from_signal(signal: str, fixed_amount_usd: Optional[floa
             tp_price = round(entry_price * 0.985, 6)
             sl_price = round(entry_price * 1.01, 6)
 
-        # Place TP and SL as reduce-only limit orders
         try:
             await create_tp_sl_limit(SYMBOL, close_side, qty, tp_price, positionSide)
             await create_tp_sl_limit(SYMBOL, close_side, qty, sl_price, positionSide)
@@ -255,7 +207,6 @@ async def open_position_from_signal(signal: str, fixed_amount_usd: Optional[floa
             "timestamp": time.time()
         }
 
-        # Notify in Telegram
         msg = (
             f"✅ <b>{side.upper()} OPENED</b>\n"
             f"Символ: <code>{SYMBOL}</code>\n"
@@ -274,23 +225,19 @@ async def open_position_from_signal(signal: str, fixed_amount_usd: Optional[floa
         raise
 
 # -------------------------
-# FastAPI with lifespan
+# FastAPI lifespan
 # -------------------------
-from fastapi import FastAPI
 from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # startup
     try:
         logger.info("🚀 ЗАПУСК БОТА (lifespan startup)")
-        # quick checks
         try:
             balance = await fetch_balance_usdt()
         except Exception as e:
             balance = None
             logger.warning(f"Не удалось получить баланс при старте: {e}")
-
         try:
             price = await fetch_price(SYMBOL)
         except Exception:
@@ -305,15 +252,12 @@ async def lifespan(app: FastAPI):
             f"Плечо: {LEVERAGE}x\n"
             f"Webhook: /webhook (X-Webhook-Secret header required)\n"
         )
-        # send startup message (best-effort)
         try:
             await tg_send(start_msg)
         except Exception as e:
             logger.warning(f"Не удалось отправить стартовое сообщение в tg: {e}")
-
         yield
     finally:
-        # shutdown
         logger.info("🛑 ОСТАНОВКА БОТА (lifespan shutdown)")
         try:
             await exchange.close()
@@ -331,96 +275,45 @@ app = FastAPI(lifespan=lifespan)
 # -------------------------
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    try:
-        balance = await fetch_balance_usdt()
-    except Exception as e:
-        balance = None
-        logger.warning(f"Home: cannot fetch balance: {e}")
-
-    try:
-        price = await fetch_price(SYMBOL)
-    except Exception:
-        price = None
-
-    global last_trade_info, active_position
+    balance = await fetch_balance_usdt()
+    price = await fetch_price(SYMBOL)
     status = "АКТИВНА" if active_position else "НЕТ"
-
     html = f"""
     <html>
-      <head>
-        <meta charset="utf-8"/>
-        <title>MEXC Futures Bot</title>
-        <style>
-          body {{ font-family: Arial, sans-serif; background: #0f1720; color:#e6eef8; padding:20px }}
-          .card {{ background:#111827; padding:16px; border-radius:8px; margin-bottom:12px }}
-          a {{ color:#7dd3fc }}
-        </style>
-      </head>
-      <body>
-        <h1>🤖 MEXC Futures Bot</h1>
-        <div class="card">
-          <h3>Баланс</h3>
-          <p><b>USDT:</b> {balance if balance is not None else 'N/A'}</p>
-        </div>
-
-        <div class="card">
-          <h3>Статус</h3>
-          <p><b>Символ:</b> {SYMBOL}</p>
-          <p><b>Цена:</b> {price if price is not None else 'N/A'}</p>
-          <p><b>Позиция:</b> {status}</p>
-        </div>
-
-        <div class="card">
-          <h3>Настройки</h3>
-          <p><b>Фиксированная сумма:</b> {FIXED_AMOUNT_USD} USDT</p>
-          <p><b>Плечо:</b> {LEVERAGE}x</p>
-        </div>
-
-        <div class="card">
-          <h3>Последняя сделка</h3>
-          <pre>{json.dumps(last_trade_info, indent=2, ensure_ascii=False) if last_trade_info else "Нет данных"}</pre>
-        </div>
-
-        <div class="card">
-          <h3>Webhook</h3>
-          <p>TradingView -> <code>POST https://{os.getenv('FLY_APP_NAME','bot-fly-oz')}.fly.dev/webhook</code></p>
-          <p>Header: <code>X-Webhook-Secret: {WEBHOOK_SECRET}</code></p>
-          <p>Body (json): <code>{{"signal":"buy"}}</code> or <code>{{"signal":"sell"}}</code></p>
-        </div>
-      </body>
+    <head><meta charset="utf-8"/><title>MEXC Futures Bot</title></head>
+    <body>
+    <h1>🤖 MEXC Futures Bot</h1>
+    <p>Баланс: {balance}</p>
+    <p>Цена: {price}</p>
+    <p>Позиция: {status}</p>
+    <pre>{json.dumps(last_trade_info, indent=2, ensure_ascii=False) if last_trade_info else "Нет данных"}</pre>
+    </body>
     </html>
     """
     return HTMLResponse(html)
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    # Validate secret header
     provided = request.headers.get("X-Webhook-Secret") or request.headers.get("Authorization")
-    # Accept either X-Webhook-Secret or Authorization: Bearer <secret>
     if provided is None:
         raise HTTPException(403, "No webhook secret provided")
-
-    # normalize Authorization header if used
     if provided.startswith("Bearer "):
         provided = provided.split(" ", 1)[1]
-
     if provided != WEBHOOK_SECRET:
         logger.warning("Invalid webhook secret")
         raise HTTPException(403, "Invalid webhook secret")
 
-    # parse body
     try:
         payload = await request.json()
     except Exception:
         raise HTTPException(400, "Invalid JSON")
 
     signal = payload.get("signal")
-    custom_amount = payload.get("fixed_amount_usd")  # optional override
+    custom_amount = payload.get("fixed_amount_usd")
 
     if signal not in ("buy", "sell"):
         raise HTTPException(400, "signal must be 'buy' or 'sell'")
 
-    # schedule opening task
     asyncio.create_task(open_position_from_signal(signal, fixed_amount_usd=custom_amount))
     logger.info(f"Webhook accepted: {signal}")
     await tg_send(f"📨 Received signal: {signal.upper()}. Открытие позиции запланировано.")
@@ -431,21 +324,11 @@ async def health():
     try:
         price = await fetch_price(SYMBOL)
         balance = await fetch_balance_usdt()
-        return {
-            "status": "ok",
-            "symbol": SYMBOL,
-            "price": price,
-            "balance": balance,
-            "active_position": active_position,
-            "timestamp": time.time()
-        }
+        return {"status": "ok", "symbol": SYMBOL, "price": price, "balance": balance, "active_position": active_position, "timestamp": time.time()}
     except Exception as e:
         logger.error(f"Health failed: {e}")
         return {"status": "error", "error": str(e)}
 
-# -------------------------
-# Run (if executed directly)
-# -------------------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
