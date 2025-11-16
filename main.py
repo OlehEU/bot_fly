@@ -156,12 +156,8 @@ async def calculate_qty_for_usd(symbol: str, usd_amount: float, leverage: int) -
 # Leverage / Position helpers
 # -------------------------
 async def set_leverage_usdt(symbol: str, leverage: int, positionSide: str):
-    """
-    Устанавливает плечо для позиции на MEXC swap.
-    positionSide: "LONG" или "SHORT"
-    """
     try:
-        params = {"positionSide": positionSide, "openType": 1, "positionType": 1 if positionSide=="LONG" else 2}
+        params = {"openType": 1, "positionType": 1 if positionSide=="LONG" else 2}
         await safe_ccxt_call(exchange.set_leverage, leverage, symbol, params)
         logger.info(f"Плечо установлено: {leverage}x для {positionSide}")
     except Exception as e:
@@ -173,27 +169,29 @@ async def set_leverage_usdt(symbol: str, leverage: int, positionSide: str):
 async def create_market_position_usdt(symbol: str, side: str, qty: float, leverage: int):
     positionSide = "LONG" if side == "buy" else "SHORT"
     await exchange.load_markets()
-
-    # MEXC требует сначала установить плечо
     await set_leverage_usdt(symbol, leverage, positionSide)
-
-    # Параметры для изолированной позиции
     params = {
         "positionSide": positionSide,
-        "openType": 1,                     # 1=isolated
+        "openType": 1,
         "positionType": 1 if positionSide=="LONG" else 2,
-        "leverage": leverage               # ОБЯЗАТЕЛЬНО для create_market_order
+        "leverage": leverage
     }
-
     logger.info(f"Создаю рыночный ордер: {side} {qty} {symbol} params={params}")
     order = await safe_ccxt_call(exchange.create_market_order, symbol, side, qty, None, params)
     if order is None:
         await tg_send(f"❌ Ошибка создания рыночного ордера: {side} {qty} {symbol}")
         raise Exception(f"Market order failed: {side} {qty} {symbol}")
-    return order
+    return {
+        "orderId": order.get("id") or order.get("orderId"),
+        "positionId": order.get("positionId"),
+        "price": order.get("average") or order.get("price"),
+        "qty": qty,
+        "side": positionSide,
+        "leverage": leverage
+    }
 
 async def create_tp_sl_limit(symbol: str, close_side: str, qty: float, price: float, positionSide:str):
-    params = {"reduceOnly": True, "positionSide": positionSide, "openType": 1, "positionType": 1 if positionSide == "LONG" else 2}
+    params = {"reduceOnly": True, "positionSide": positionSide, "openType": 1, "positionType": 1 if positionSide=="LONG" else 2}
     logger.info(f"Создаю limit закрывающий ордер {close_side} {qty} @ {price} params={params}")
     order = await safe_ccxt_call(exchange.create_order, symbol, "limit", close_side, qty, price, params)
     if order is None:
@@ -201,7 +199,7 @@ async def create_tp_sl_limit(symbol: str, close_side: str, qty: float, price: fl
     return order
 
 # -------------------------
-# Position high-level logic
+# Position logic
 # -------------------------
 last_trade_info: Optional[dict] = None
 active_position = False
@@ -210,67 +208,42 @@ async def open_position_from_signal(signal: str, symbol_base: str = "XRP", fixed
     global active_position, last_trade_info
     try:
         if active_position:
-            logger.info("Позиция уже активна — пропускаем открытие.")
-            await tg_send("⚠️ Позиция уже активна — новый сигнал проигнорирован.")
+            await tg_send("⚠️ Позиция уже активна — сигнал проигнорирован.")
             return
 
         SYMBOL = await resolve_symbol(symbol_base)
         balance = await fetch_balance_usdt()
-        usd_amount = fixed_amount_usd if fixed_amount_usd and fixed_amount_usd > 0 else (balance * RISK_PERCENT / 100)
+        usd_amount = fixed_amount_usd if fixed_amount_usd and fixed_amount_usd>0 else balance*RISK_PERCENT/100
         if usd_amount < MIN_ORDER_USD:
-            logger.warning(f"Недостаточный объём для открытия позиции: {usd_amount} USD")
             await tg_send(f"❗ Недостаточный объём для открытия: {usd_amount:.2f} USDT (min {MIN_ORDER_USD})")
             return
 
         qty = await calculate_qty_for_usd(SYMBOL, usd_amount, LEVERAGE)
-        side = "buy" if signal.lower() == "buy" else "sell"
-        positionSide = "LONG" if side == "buy" else "SHORT"
-        close_side = "sell" if side == "buy" else "buy"
+        side = "buy" if signal.lower()=="buy" else "sell"
+        positionSide = "LONG" if side=="buy" else "SHORT"
+        close_side = "sell" if side=="buy" else "buy"
 
         order = await create_market_position_usdt(SYMBOL, side, qty, LEVERAGE)
-
-        entry_price = order.get("average") or order.get("price") or await fetch_price(SYMBOL)
+        entry_price = order.get("price") or await fetch_price(SYMBOL)
         market_info = await get_market_info(SYMBOL)
         price_scale = market_info['price_scale']
 
-        if side == "buy":
-            tp_price = round(entry_price * 1.015, price_scale)
-            sl_price = round(entry_price * 0.99, price_scale)
-        else:
-            tp_price = round(entry_price * 0.985, price_scale)
-            sl_price = round(entry_price * 1.01, price_scale)
+        tp_price = round(entry_price*1.015, price_scale) if side=="buy" else round(entry_price*0.985, price_scale)
+        sl_price = round(entry_price*0.99, price_scale) if side=="buy" else round(entry_price*1.01, price_scale)
 
         await create_tp_sl_limit(SYMBOL, close_side, qty, tp_price, positionSide)
         await create_tp_sl_limit(SYMBOL, close_side, qty, sl_price, positionSide)
 
         active_position = True
-        last_trade_info = {
-            "signal": signal,
-            "side": side,
-            "qty": qty,
-            "entry": entry_price,
-            "tp": tp_price,
-            "sl": sl_price,
-            "order": order,
-            "symbol": SYMBOL,
-            "timestamp": time.time()
-        }
+        last_trade_info = {"signal": signal, "side": side, "qty": qty, "entry": entry_price,
+                           "tp": tp_price, "sl": sl_price, "order": order, "symbol": SYMBOL, "timestamp": time.time()}
 
-        msg = (
-            f"✅ <b>{side.upper()} OPENED</b>\n"
-            f"Символ: <code>{SYMBOL}</code>\n"
-            f"Qty: <code>{qty}</code>\n"
-            f"Entry: <code>{entry_price}</code>\n"
-            f"TP: <code>{tp_price}</code>\n"
-            f"SL: <code>{sl_price}</code>\n"
-            f"Баланс: {balance:.2f} USDT\n"
-            f"Плечо: {LEVERAGE}x\n"
+        await tg_send(
+            f"✅ <b>{side.upper()} OPENED</b>\nСимвол: {SYMBOL}\nQty: {qty}\nEntry: {entry_price}\nTP: {tp_price}\nSL: {sl_price}\nБаланс: {balance:.2f} USDT\nПлечо: {LEVERAGE}x"
         )
-        await tg_send(msg)
-        logger.info("ПОЗИЦИЯ ОТКРЫТА и уведомление отправлено.")
     except Exception as e:
-        logger.error(f"Ошибка при открытии позиции: {e}\n{traceback.format_exc()}")
         await tg_send(f"❌ Ошибка при открытии позиции: {str(e)}")
+        logger.error(f"Ошибка при открытии позиции: {e}\n{traceback.format_exc()}")
         raise
 
 # -------------------------
@@ -279,40 +252,17 @@ async def open_position_from_signal(signal: str, symbol_base: str = "XRP", fixed
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
-        logger.info("🚀 ЗАПУСК БОТА (lifespan startup)")
-        try:
-            balance = await fetch_balance_usdt()
-        except Exception:
-            balance = None
+        balance = await fetch_balance_usdt()
         SYMBOL = await resolve_symbol("XRP")
-        try:
-            price = await fetch_price(SYMBOL)
-        except Exception:
-            price = None
-        start_msg = (
-            f"✅ Bot started\n"
-            f"Символ: {SYMBOL}\n"
-            f"Баланс: {balance if balance is not None else 'N/A'} USDT\n"
-            f"Цена: {price if price is not None else 'N/A'}\n"
-            f"Фиксированная сумма: {FIXED_AMOUNT_USD} USDT\n"
-            f"Плечо: {LEVERAGE}x\n"
-            f"Webhook: /webhook (X-Webhook-Secret header required)\n"
-        )
-        try:
-            await tg_send(start_msg)
-        except Exception:
-            pass
+        price = await fetch_price(SYMBOL)
+        await tg_send(f"✅ Bot started\nСимвол: {SYMBOL}\nБаланс: {balance} USDT\nЦена: {price}\nФиксированная сумма: {FIXED_AMOUNT_USD} USDT\nПлечо: {LEVERAGE}x")
         yield
     finally:
-        logger.info("🛑 ОСТАНОВКА БОТА (lifespan shutdown)")
         try:
             await exchange.close()
         except Exception:
             pass
-        try:
-            await tg_send("🔴 Бот остановлен")
-        except Exception:
-            pass
+        await tg_send("🔴 Бот остановлен")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -321,17 +271,11 @@ app = FastAPI(lifespan=lifespan)
 # -------------------------
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    try:
-        SYMBOL = await resolve_symbol("XRP")
-        balance = await fetch_balance_usdt()
-        price = await fetch_price(SYMBOL)
-    except Exception:
-        SYMBOL = "XRP"
-        balance = None
-        price = None
+    SYMBOL = await resolve_symbol("XRP")
+    balance = await fetch_balance_usdt()
+    price = await fetch_price(SYMBOL)
     status = "АКТИВНА" if active_position else "НЕТ"
-    html = f"<html><body><h1>🤖 MEXC Futures Bot</h1><p>Символ: {SYMBOL}</p><p>Баланс: {balance}</p><p>Цена: {price}</p><p>Позиция: {status}</p></body></html>"
-    return HTMLResponse(html)
+    return HTMLResponse(f"<html><body><h1>🤖 MEXC Futures Bot</h1><p>Символ: {SYMBOL}</p><p>Баланс: {balance}</p><p>Цена: {price}</p><p>Позиция: {status}</p></body></html>")
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -339,47 +283,31 @@ async def webhook(request: Request):
     if provided is None:
         raise HTTPException(403, "No webhook secret provided")
     if provided.startswith("Bearer "):
-        provided = provided.split(" ", 1)[1]
+        provided = provided.split(" ",1)[1]
     if provided != WEBHOOK_SECRET:
         raise HTTPException(403, "Invalid webhook secret")
 
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(400, "Invalid JSON")
-
+    payload = await request.json()
     signal = payload.get("signal")
     symbol_base = payload.get("symbol", "XRP")
     custom_amount = payload.get("fixed_amount_usd")
-
-    if signal not in ("buy", "sell"):
+    if signal not in ("buy","sell"):
         raise HTTPException(400, "signal must be 'buy' or 'sell'")
 
     asyncio.create_task(open_position_from_signal(signal, symbol_base=symbol_base, fixed_amount_usd=custom_amount))
     await tg_send(f"📨 Received signal: {signal.upper()} for {symbol_base}. Открытие позиции запланировано.")
-    return {"status": "accepted", "signal": signal, "symbol": symbol_base}
+    return {"status":"accepted","signal":signal,"symbol":symbol_base}
 
 @app.get("/health")
 async def health():
-    try:
-        SYMBOL = await resolve_symbol("XRP")
-        price = await fetch_price(SYMBOL)
-        balance = await fetch_balance_usdt()
-        return {
-            "status": "ok",
-            "symbol": SYMBOL,
-            "price": price,
-            "balance": balance,
-            "active_position": active_position,
-            "timestamp": time.time()
-        }
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+    SYMBOL = await resolve_symbol("XRP")
+    price = await fetch_price(SYMBOL)
+    balance = await fetch_balance_usdt()
+    return {"status":"ok","symbol":SYMBOL,"price":price,"balance":balance,"active_position":active_position,"timestamp":time.time()}
 
 # -------------------------
 # Run
 # -------------------------
-if __name__ == "__main__":
+if __name__=="__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT",8000)), log_level="info")
