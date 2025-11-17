@@ -1,4 +1,4 @@
-# main.py — 100% РАБОЧИЙ (XRP LONG $10 × 10x | TP +0.5% | SL -1% | Автозакрытие 10 мин)
+# main.py — ФИНАЛЬНАЯ РАБОЧАЯ ВЕРСИЯ (XRP LONG $10 × 10x)
 import os
 import logging
 import asyncio
@@ -48,7 +48,7 @@ exchange = ccxt.mexc({
     'secret': MEXC_API_SECRET,
     'enableRateLimit': True,
     'options': {'defaultType': 'swap'},
-    'timeout': 20000,
+    'timeout': 30000,
 })
 
 _cached_markets: Dict[str, str] = {}
@@ -79,95 +79,79 @@ async def calculate_qty(symbol: str) -> float:
     qty = math.ceil(raw_qty / contract_size) * contract_size
     return max(qty, min_qty)
 
-# Глобальное состояние
 position_active = False
 
 async def open_long():
     global position_active
     if position_active:
-        await tg_send("⚠️ Позиция уже открыта!")
+        await tg_send("Позиция уже открыта!")
         return
 
     try:
         symbol = await resolve_symbol(BASE_COIN)
         qty = await calculate_qty(symbol)
 
-        # Плечо (с параметрами для MEXC)
-        await exchange.set_leverage(
-            LEVERAGE, 
-            symbol, 
-            params={
-                "openType": 1,      # isolated margin
-                "positionType": 1   # long position
-            }
-        )
+        # Устанавливаем плечо (обязательно!)
+        await exchange.set_leverage(LEVERAGE, symbol, params={
+            "openType": 1,
+            "positionType": 1
+        })
 
-        # Баланс
+        # Проверка баланса
         bal = await exchange.fetch_balance()
-        usdt = float(bal['total'].get('USDT', 0))
-        if usdt < 3:
-            await tg_send(f"❌ Недостаточно USDT: {usdt:.2f}")
+16        usdt = float(bal['total'].get('USDT', 0))
+        if usdt < 5:
+            await tg_send(f"Недостаточно USDT: {usdt:.2f}")
             return
 
-        # Рыночный ордер LONG (КРИТИЧНО: leverage в params!)
-        params_order = {
-            "openType": 1,      # isolated
-            "positionType": 1,  # long
-            "leverage": LEVERAGE  # ← ЭТО ИСПРАВЛЯЕТ ОШИБКУ!
+        # КЛЮЧЕВОЙ ПАТЧ — все нужные параметры в ордере!
+        order_params = {
+            "openType": 1,        # isolated
+            "positionType": 1,    # long
+            "leverage": LEVERAGE, # ← обязательно!
+            "volSide": 1          # 1 = открытие позиции
         }
+
         order = await exchange.create_order(
             symbol=symbol,
             type='market',
             side='buy',
             amount=qty,
-            params=params_order
+            params=order_params
         )
 
         entry = await fetch_price(symbol)
         tp_price = round(entry * (1 + TP_PERCENT/100), 4)
         sl_price = round(entry * (1 - SL_PERCENT/100), 4)
 
-        # TP (take profit)
-        params_tp = {'reduceOnly': True}
-        await exchange.create_order(
-            symbol=symbol,
-            type='limit',
-            side='sell',
-            amount=qty,
-            price=tp_price,
-            params=params_tp
-        )
-
-        # SL (stop loss)
-        params_sl = {'reduceOnly': True}
-        await exchange.create_order(
-            symbol=symbol,
-            type='limit',
-            side='sell',
-            amount=qty,
-            price=sl_price,
-            params=params_sl
-        )
+        # TP / SL
+        for price, label in [(tp_price, "TP"), (sl_price, "SL")]:
+            await exchange.create_order(
+                symbol=symbol,
+                type='limit',
+                side='sell',
+                amount=qty,
+                price=price,
+                params={'reduceOnly': True}
+            )
 
         position_active = True
 
         msg = f"""
-🚀 <b>LONG ОТКРЫТ</b>
-<b>{symbol}</b> | ${FIXED_AMOUNT_USD} × {LEVERAGE}x
-📍 Entry: <code>{entry:.4f}</code>
-🎯 TP (+{TP_PERCENT}%): <code>{tp_price:.4f}</code>
-🛑 SL (-{SL_PERCENT}%): <code>{sl_price:.4f}</code>
-⏱ Автозакрытие: через {AUTO_CLOSE_MINUTES} мин
+LONG ОТКРЫТ
+{symbol} | ${FIXED_AMOUNT_USD} × {LEVERAGE}x
+Entry: <code>{entry:.4f}</code>
+TP (+{TP_PERCENT}%): <code>{tp_price:.4f}</code>
+SL (-{SL_PERCENT}%): <code>{sl_price:.4f}</code>
+Автозакрытие: через {AUTO_CLOSE_MINUTES} мин
         """
         await tg_send(msg.strip())
-
-        # Автозакрытие
         asyncio.create_task(auto_close(symbol, qty))
 
     except Exception as e:
-        err_msg = str(e)
-        logger.error(f"Ошибка открытия LONG: {err_msg}")
-        await tg_send(f"❌ Ошибка открытия LONG:\n<code>{err_msg}</code>")
+        err = str(e)
+        logger.error(f"Ошибка: {err}")
+        await tg_send(f"Ошибка открытия LONG:\n<code>{err}</code>")
         position_active = False
 
 async def auto_close(symbol: str, qty: float):
@@ -176,14 +160,8 @@ async def auto_close(symbol: str, qty: float):
     if not position_active:
         return
     try:
-        await exchange.create_order(
-            symbol=symbol,
-            type='market',
-            side='sell',
-            amount=qty,
-            params={'reduceOnly': True}
-        )
-        await tg_send("⏰ Автозакрытие: позиция закрыта по рынку")
+        await exchange.create_order(symbol, 'market', 'sell', qty, params={'reduceOnly': True})
+        await tg_send("Автозакрытие: позиция закрыта")
     except Exception as e:
         await tg_send(f"Ошибка автозакрытия: {e}")
     finally:
@@ -192,7 +170,7 @@ async def auto_close(symbol: str, qty: float):
 # ====================== FASTAPI ======================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await tg_send(f"🤖 Bot запущен | {BASE_COIN} LONG | ${FIXED_AMOUNT_USD} × {LEVERAGE}x | TP +{TP_PERCENT}% | SL -{SL_PERCENT}%")
+    await tg_send(f"Bot запущен | {BASE_COIN} LONG | ${FIXED_AMOUNT_USD} × {LEVERAGE}x")
     yield
     await exchange.close()
 
@@ -200,23 +178,18 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>🤖 MEXC XRP Bot — ONLINE</h1><p>Готов к BUY сигналам</p>")
-
-@app.get("/status")
-async def status():
-    return {"coin": BASE_COIN, "position": "Открыта" if position_active else "Нет", "leverage": LEVERAGE}
+    return HTMLResponse("<h1>MEXC XRP Bot — ONLINE</h1>")
 
 @app.post("/webhook")
 async def webhook(request: Request):
     if request.headers.get("X-Webhook-Secret") != WEBHOOK_SECRET:
-        raise HTTPException(403, "Неверный секрет")
+        raise HTTPException(403)
     data = await request.json()
     if data.get("signal") == "buy":
-        await tg_send("📨 BUY сигнал получен")
+        await tg_send("BUY сигнал получен")
         asyncio.create_task(open_long())
-    return {"status": "ok"}
+    return {"ok": True}
 
-# ====================== ЛОКАЛЬНЫЙ ЗАПУСК ======================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
