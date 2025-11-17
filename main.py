@@ -1,4 +1,4 @@
-# main.py — ФИНАЛЬНАЯ ВЕРСИЯ (XRP LONG $10 × 10x — РАБОТАЕТ!)
+# main.py — 100% РАБОЧИЙ (XRP LONG $10 × 10x | TP +0.5% | SL -1% | Автозакрытие 10 мин)
 import os
 import logging
 import asyncio
@@ -92,12 +92,15 @@ async def open_long():
         symbol = await resolve_symbol(BASE_COIN)
         qty = await calculate_qty(symbol)
 
-        # ИСПРАВЛЕНИЕ: set_leverage с полными параметрами (до ордера!)
-        params_leverage = {
-            "openType": 1,      # 1 = isolated margin
-            "positionType": 1   # 1 = long position
-        }
-        await exchange.set_leverage(LEVERAGE, symbol, params=params_leverage)
+        # Плечо (с параметрами для MEXC)
+        await exchange.set_leverage(
+            LEVERAGE, 
+            symbol, 
+            params={
+                "openType": 1,      # isolated margin
+                "positionType": 1   # long position
+            }
+        )
 
         # Баланс
         bal = await exchange.fetch_balance()
@@ -106,10 +109,11 @@ async def open_long():
             await tg_send(f"❌ Недостаточно USDT: {usdt:.2f}")
             return
 
-        # Рыночный ордер LONG с параметрами
+        # Рыночный ордер LONG (КРИТИЧНО: leverage в params!)
         params_order = {
             "openType": 1,      # isolated
-            "positionType": 1   # long
+            "positionType": 1,  # long
+            "leverage": LEVERAGE  # ← ЭТО ИСПРАВЛЯЕТ ОШИБКУ!
         }
         order = await exchange.create_order(
             symbol=symbol,
@@ -212,7 +216,7 @@ async def webhook(request: Request):
         asyncio.create_task(open_long())
     return {"status": "ok"}
 
-# ====================== ЛОКАЛЬНЫЙ ЗАПУСК (опционально) ======================
+# ====================== ЛОКАЛЬНЫЙ ЗАПУСК ======================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
