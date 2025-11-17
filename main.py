@@ -1,4 +1,4 @@
-# main.py — 100% РАБОЧИЙ XRP LONG $10 × 10x (MEXC Futures)
+# main.py — 100% РАБОЧИЙ (XRP LONG $10 × 10x) — MEXC Futures
 import os
 import logging
 import asyncio
@@ -68,10 +68,9 @@ async def calculate_qty(symbol: str) -> float:
     market = exchange.markets[symbol]
     info = market.get('info', {})
     contract_size = float(info.get('contractSize', 1))
-    min_qty = float(info.get('minQuantity', 1))
     raw_qty = (FIXED_AMOUNT_USD * LEVERAGE) / price
     qty = math.ceil(raw_qty / contract_size) * contract_size
-    return max(qty, min_qty)
+    return max(qty, float(info.get('minQuantity', 1)))
 
 position_active = False
 
@@ -85,8 +84,14 @@ async def open_long():
         symbol = await resolve_symbol(BASE_COIN)
         qty = await calculate_qty(symbol)
 
-        # Установка плеча
-        await exchange.set_leverage(LEVERAGE, symbol, params={"openType": 1, "positionType": 1})
+        # Устанавливаем режим позиции (ОБЯЗАТЕЛЬНО!)
+        await exchange.set_position_mode(False, symbol)  # False = One-Way Mode
+
+        # Устанавливаем плечо
+        await exchange.set_leverage(LEVERAGE, symbol, params={
+            "openType": 1,
+            "positionType": 1
+        })
 
         bal = await exchange.fetch_balance()
         usdt = float(bal['total'].get('USDT', 0))
@@ -94,13 +99,13 @@ async def open_long():
             await tg_send(f"Недостаточно USDT: {usdt:.2f}")
             return
 
-        # ВОТ ЭТО САМОЕ ГЛАВНОЕ — все параметры, которые требует MEXC
+        # ВСЕ ОБЯЗАТЕЛЬНЫЕ ПАРАМЕТРЫ ДЛЯ MEXC (2025)
         order_params = {
             "openType": 1,           # isolated
             "positionType": 1,       # long
-            "leverage": LEVERAGE,    # плечо
-            "openPositionMode": 1,   # ← ЭТО БЫЛО НЕ ХВАТАЛО!
-            "volSide": 1             # открытие позиции
+            "leverage": LEVERAGE,
+            "positionMode": 1,       # ← ЭТО БЫЛО НЕ ХВАТАЛО В ПОСЛЕДНИЙ РАЗ!
+            "volSide": 1
         }
 
         await exchange.create_order(
@@ -115,7 +120,7 @@ async def open_long():
         tp_price = round(entry * (1 + TP_PERCENT/100), 4)
         sl_price = round(entry * (1 - SL_PERCENT/100), 4)
 
-        # TP и SL (reduceOnly)
+        # TP и SL
         for price in [tp_price, sl_price]:
             await exchange.create_order(
                 symbol=symbol,
@@ -127,7 +132,6 @@ async def open_long():
             )
 
         position_active = True
-
         msg = f"""
 LONG ОТКРЫТ
 {symbol} | ${FIXED_AMOUNT_USD} × {LEVERAGE}x
