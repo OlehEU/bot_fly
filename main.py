@@ -1,4 +1,4 @@
-# main.py — 100% РАБОЧИЙ XRP LONG $10 × 10x | TP +0.5% | SL -1% | Автозакрытие 10 мин
+# main.py — 100% РАБОЧИЙ XRP LONG $10 × 10x (MEXC Futures)
 import os
 import logging
 import asyncio
@@ -29,20 +29,16 @@ SL_PERCENT = float(os.getenv("SL_PERCENT", "1.0"))
 AUTO_CLOSE_MINUTES = 10
 BASE_COIN = "XRP"
 
-# ====================== ЛОГИ ======================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mexc-bot")
 
-# ====================== TELEGRAM ======================
 bot = Bot(token=TELEGRAM_TOKEN)
 async def tg_send(text: str):
     try:
         await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
-        logger.info("Telegram sent")
     except Exception as e:
-        logger.error(f"Telegram error: {e}")
+        logger.error(f"TG error: {e}")
 
-# ====================== MEXC ======================
 exchange = ccxt.mexc({
     'apiKey': MEXC_API_KEY,
     'secret': MEXC_API_SECRET,
@@ -69,17 +65,14 @@ async def fetch_price(symbol: str) -> float:
 
 async def calculate_qty(symbol: str) -> float:
     price = await fetch_price(symbol)
-    await exchange.load_markets()
     market = exchange.markets[symbol]
     info = market.get('info', {})
     contract_size = float(info.get('contractSize', 1))
     min_qty = float(info.get('minQuantity', 1))
-    
     raw_qty = (FIXED_AMOUNT_USD * LEVERAGE) / price
     qty = math.ceil(raw_qty / contract_size) * contract_size
     return max(qty, min_qty)
 
-# Глобальное состояние
 position_active = False
 
 async def open_long():
@@ -93,24 +86,21 @@ async def open_long():
         qty = await calculate_qty(symbol)
 
         # Установка плеча
-        await exchange.set_leverage(LEVERAGE, symbol, params={
-            "openType": 1,
-            "positionType": 1
-        })
+        await exchange.set_leverage(LEVERAGE, symbol, params={"openType": 1, "positionType": 1})
 
-        # Проверка баланса
         bal = await exchange.fetch_balance()
         usdt = float(bal['total'].get('USDT', 0))
         if usdt < 5:
             await tg_send(f"Недостаточно USDT: {usdt:.2f}")
             return
 
-        # ОТКРЫТИЕ LONG — ВСЕ ОБЯЗАТЕЛЬНЫЕ ПАРАМЕТРЫ!
+        # ВОТ ЭТО САМОЕ ГЛАВНОЕ — все параметры, которые требует MEXC
         order_params = {
-            "openType": 1,        # isolated
-            "positionType": 1,    # long
-            "leverage": LEVERAGE, # ← ЭТО ГЛАВНОЕ!
-            "volSide": 1          # открытие позиции
+            "openType": 1,           # isolated
+            "positionType": 1,       # long
+            "leverage": LEVERAGE,    # плечо
+            "openPositionMode": 1,   # ← ЭТО БЫЛО НЕ ХВАТАЛО!
+            "volSide": 1             # открытие позиции
         }
 
         await exchange.create_order(
@@ -125,7 +115,7 @@ async def open_long():
         tp_price = round(entry * (1 + TP_PERCENT/100), 4)
         sl_price = round(entry * (1 - SL_PERCENT/100), 4)
 
-        # TP и SL
+        # TP и SL (reduceOnly)
         for price in [tp_price, sl_price]:
             await exchange.create_order(
                 symbol=symbol,
@@ -147,13 +137,12 @@ SL (-{SL_PERCENT}%): <code>{sl_price:.4f}</code>
 Автозакрытие через {AUTO_CLOSE_MINUTES} мин
         """
         await tg_send(msg.strip())
-
         asyncio.create_task(auto_close(symbol, qty))
 
     except Exception as e:
         err = str(e)
-        logger.error(f"Ошибка открытия: {err}")
-        await tg_send(f"Ошибка:\n<code>{err}</code>")
+        logger.error(f"Ошибка: {err}")
+        await tg_send(f"Ошибка открытия LONG:\n<code>{err}</code>")
         position_active = False
 
 async def auto_close(symbol: str, qty: float):
@@ -169,7 +158,6 @@ async def auto_close(symbol: str, qty: float):
     finally:
         position_active = False
 
-# ====================== FASTAPI ======================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await tg_send(f"Bot запущен | {BASE_COIN} LONG | ${FIXED_AMOUNT_USD} × {LEVERAGE}x")
@@ -192,7 +180,6 @@ async def webhook(request: Request):
         asyncio.create_task(open_long())
     return {"ok": True}
 
-# Локальный запуск
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
