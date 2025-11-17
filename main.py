@@ -1,4 +1,4 @@
-# main.py — ФИНАЛЬНАЯ РАБОЧАЯ ВЕРСИЯ (XRP LONG $10 × 10x)
+# main.py — 100% РАБОЧИЙ XRP LONG $10 × 10x | TP +0.5% | SL -1% | Автозакрытие 10 мин
 import os
 import logging
 import asyncio
@@ -79,6 +79,7 @@ async def calculate_qty(symbol: str) -> float:
     qty = math.ceil(raw_qty / contract_size) * contract_size
     return max(qty, min_qty)
 
+# Глобальное состояние
 position_active = False
 
 async def open_long():
@@ -91,7 +92,7 @@ async def open_long():
         symbol = await resolve_symbol(BASE_COIN)
         qty = await calculate_qty(symbol)
 
-        # Устанавливаем плечо (обязательно!)
+        # Установка плеча
         await exchange.set_leverage(LEVERAGE, symbol, params={
             "openType": 1,
             "positionType": 1
@@ -99,20 +100,20 @@ async def open_long():
 
         # Проверка баланса
         bal = await exchange.fetch_balance()
-16        usdt = float(bal['total'].get('USDT', 0))
+        usdt = float(bal['total'].get('USDT', 0))
         if usdt < 5:
             await tg_send(f"Недостаточно USDT: {usdt:.2f}")
             return
 
-        # КЛЮЧЕВОЙ ПАТЧ — все нужные параметры в ордере!
+        # ОТКРЫТИЕ LONG — ВСЕ ОБЯЗАТЕЛЬНЫЕ ПАРАМЕТРЫ!
         order_params = {
             "openType": 1,        # isolated
             "positionType": 1,    # long
-            "leverage": LEVERAGE, # ← обязательно!
-            "volSide": 1          # 1 = открытие позиции
+            "leverage": LEVERAGE, # ← ЭТО ГЛАВНОЕ!
+            "volSide": 1          # открытие позиции
         }
 
-        order = await exchange.create_order(
+        await exchange.create_order(
             symbol=symbol,
             type='market',
             side='buy',
@@ -124,8 +125,8 @@ async def open_long():
         tp_price = round(entry * (1 + TP_PERCENT/100), 4)
         sl_price = round(entry * (1 - SL_PERCENT/100), 4)
 
-        # TP / SL
-        for price, label in [(tp_price, "TP"), (sl_price, "SL")]:
+        # TP и SL
+        for price in [tp_price, sl_price]:
             await exchange.create_order(
                 symbol=symbol,
                 type='limit',
@@ -143,15 +144,16 @@ LONG ОТКРЫТ
 Entry: <code>{entry:.4f}</code>
 TP (+{TP_PERCENT}%): <code>{tp_price:.4f}</code>
 SL (-{SL_PERCENT}%): <code>{sl_price:.4f}</code>
-Автозакрытие: через {AUTO_CLOSE_MINUTES} мин
+Автозакрытие через {AUTO_CLOSE_MINUTES} мин
         """
         await tg_send(msg.strip())
+
         asyncio.create_task(auto_close(symbol, qty))
 
     except Exception as e:
         err = str(e)
-        logger.error(f"Ошибка: {err}")
-        await tg_send(f"Ошибка открытия LONG:\n<code>{err}</code>")
+        logger.error(f"Ошибка открытия: {err}")
+        await tg_send(f"Ошибка:\n<code>{err}</code>")
         position_active = False
 
 async def auto_close(symbol: str, qty: float):
@@ -190,6 +192,7 @@ async def webhook(request: Request):
         asyncio.create_task(open_long())
     return {"ok": True}
 
+# Локальный запуск
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
