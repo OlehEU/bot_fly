@@ -1,4 +1,4 @@
-# main.py — 100% РАБОЧАЯ ВЕРСИЯ (MEXC Futures 2025)
+## main.py — ИСПРАВЛЕННАЯ И РАБОЧАЯ ВЕРСИЯ (MEXC Futures 2025)
 import os
 import logging
 import asyncio
@@ -9,6 +9,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from telegram import Bot
 from contextlib import asynccontextmanager
+
 
 # ====================== КОНФИГ ======================
 required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "MEXC_API_KEY", "MEXC_API_SECRET", "WEBHOOK_SECRET"]
@@ -31,14 +32,16 @@ BASE_COIN = "XRP"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mexc-bot")
-
 bot = Bot(token=TELEGRAM_TOKEN)
+
+
 async def tg_send(text: str):
     try:
         await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
         logger.info("Telegram sent")
     except Exception as e:
         logger.error(f"TG error: {e}")
+
 
 exchange = ccxt.mexc({
     'apiKey': MEXC_API_KEY,
@@ -49,21 +52,26 @@ exchange = ccxt.mexc({
 })
 
 _cached_markets: Dict[str, str] = {}
-position_active = False  # глобально объявлена
+position_active = False  # глобальная переменная
+
 
 async def resolve_symbol(base: str) -> str:
     global _cached_markets
     if not _cached_markets:
         await exchange.load_markets()
-        _cached_markets = {s.split("/")[0]: s for s in exchange.markets.keys() if s.endswith(":USDT")}
+        _cached_markets = {
+            s.split("/")[0]: s for s in exchange.markets.keys() if s.endswith(":USDT")
+        }
     symbol = _cached_markets.get(base.upper())
     if not symbol:
         raise ValueError(f"Символ {base} не найден")
     return symbol
 
+
 async def fetch_price(symbol: str) -> float:
     ticker = await exchange.fetch_ticker(symbol)
     return float(ticker['last'])
+
 
 async def calculate_qty(symbol: str) -> float:
     price = await fetch_price(symbol)
@@ -72,6 +80,7 @@ async def calculate_qty(symbol: str) -> float:
     raw_qty = (FIXED_AMOUNT_USD * LEVERAGE) / price
     qty = math.ceil(raw_qty / contract_size) * contract_size
     return max(qty, market['limits']['amount']['min'])
+
 
 async def open_long():
     global position_active
@@ -89,7 +98,6 @@ async def open_long():
             await tg_send(f"Недостаточно USDT: {usdt:.2f}")
             return
 
-        # РАБОЧИЙ НАБОР ПАРАМЕТРОВ ДЛЯ MEXC 2025
         order_params = {
             "openType": 1,
             "positionType": 1,
@@ -102,14 +110,14 @@ async def open_long():
         await exchange.create_order(
             symbol=symbol,
             type='market',
-            side='open_long',      # ← КЛЮЧЕВОЕ!
+            side='open_long',
             amount=qty,
             params=order_params
         )
 
         entry = await fetch_price(symbol)
-        tp_price = round(entry * (1 + TP_PERCENT/100), 4)
-        sl_price = round(entry * (1 - SL_PERCENT/100), 4)
+        tp_price = round(entry * (1 + TP_PERCENT / 100), 4)
+        sl_price = round(entry * (1 - SL_PERCENT / 100), 4)
 
         for price in [tp_price, sl_price]:
             await exchange.create_order(
@@ -135,22 +143,34 @@ SL (-{SL_PERCENT}%): <code>{sl_price:.4f}</code>
 
     except Exception as e:
         err = str(e)
-        logger.error(f"Ошибка: {err}")
+        logger.error(f"Ошибка открытия позиции: {err}")
         await tg_send(f"Ошибка:\n<code>{err}</code>")
         position_active = False
 
+
 async def auto_close(symbol: str, qty: float):
     await asyncio.sleep(AUTO_CLOSE_MINUTES * 60)
+
+    # ← ИСПРАВЛЕНО: global сразу в начале функции!
+    global position_active
+
     if not position_active:
         return
+
     try:
-        await exchange.create_order(symbol, 'market', 'close_long', qty, params={'reduceOnly': True})
+        await exchange.create_order(
+            symbol=symbol,
+            type='market',
+            side='close_long',
+            amount=qty,
+            params={'reduceOnly': True}
+        )
         await tg_send("Автозакрытие: позиция закрыта")
     except Exception as e:
         await tg_send(f"Ошибка автозакрытия: {e}")
     finally:
-        global position_active
-        position_active = False   # теперь можно, потому что выше уже использовали
+        position_active = False
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -158,21 +178,27 @@ async def lifespan(app: FastAPI):
     yield
     await exchange.close()
 
+
 app = FastAPI(lifespan=lifespan)
+
 
 @app.get("/")
 async def root():
     return HTMLResponse("<h1>MEXC XRP Bot — ONLINE</h1>")
 
+
 @app.post("/webhook")
 async def webhook(request: Request):
     if request.headers.get("X-Webhook-Secret") != WEBHOOK_SECRET:
         raise HTTPException(403)
+
     data = await request.json()
     if data.get("signal") == "buy":
         await tg_send("BUY сигнал получен")
         asyncio.create_task(open_long())
+
     return {"ok": True}
+
 
 if __name__ == "__main__":
     import uvicorn
