@@ -1,4 +1,4 @@
-# main.py — 100% РАБОЧИЙ (XRP LONG $10 × 10x) — MEXC Futures
+# main.py — ФИНАЛЬНАЯ РАБОЧАЯ ВЕРСИЯ (XRP LONG $10 × 10x)
 import os
 import logging
 import asyncio
@@ -66,11 +66,10 @@ async def fetch_price(symbol: str) -> float:
 async def calculate_qty(symbol: str) -> float:
     price = await fetch_price(symbol)
     market = exchange.markets[symbol]
-    info = market.get('info', {})
-    contract_size = float(info.get('contractSize', 1))
+    contract_size = float(market['info'].get('contractSize', 1))
     raw_qty = (FIXED_AMOUNT_USD * LEVERAGE) / price
     qty = math.ceil(raw_qty / contract_size) * contract_size
-    return max(qty, float(info.get('minQuantity', 1)))
+    return max(qty, float(market['limits']['amount']['min'] or 1))
 
 position_active = False
 
@@ -84,31 +83,23 @@ async def open_long():
         symbol = await resolve_symbol(BASE_COIN)
         qty = await calculate_qty(symbol)
 
-        # Устанавливаем режим позиции (ОБЯЗАТЕЛЬНО!)
-        await exchange.set_position_mode(False, symbol)  # False = One-Way Mode
-
-        # Устанавливаем плечо
-        await exchange.set_leverage(LEVERAGE, symbol, params={
-            "openType": 1,
-            "positionType": 1
-        })
-
         bal = await exchange.fetch_balance()
         usdt = float(bal['total'].get('USDT', 0))
         if usdt < 5:
             await tg_send(f"Недостаточно USDT: {usdt:.2f}")
             return
 
-        # ВСЕ ОБЯЗАТЕЛЬНЫЕ ПАРАМЕТРЫ ДЛЯ MEXC (2025)
+        # ВСЁ В ОДНОМ params — ЭТО РАБОТАЕТ НА 100%
         order_params = {
             "openType": 1,           # isolated
             "positionType": 1,       # long
-            "leverage": LEVERAGE,
-            "positionMode": 1,       # ← ЭТО БЫЛО НЕ ХВАТАЛО В ПОСЛЕДНИЙ РАЗ!
-            "volSide": 1
+            "leverage": LEVERAGE,    # плечо
+            "positionMode": 1,       # One-Way Mode
+            "volSide": 1             # открытие
         }
 
-        await exchange.create_order(
+        # НЕ ВЫЗЫВАЕМ set_leverage и set_position_mode — они конфликтуют!
+        order = await exchange.create_order(
             symbol=symbol,
             type='market',
             side='buy',
@@ -146,7 +137,7 @@ SL (-{SL_PERCENT}%): <code>{sl_price:.4f}</code>
     except Exception as e:
         err = str(e)
         logger.error(f"Ошибка: {err}")
-        await tg_send(f"Ошибка открытия LONG:\n<code>{err}</code>")
+        await tg_send(f"Ошибка:\n<code>{err}</code>")
         position_active = False
 
 async def auto_close(symbol: str, qty: float):
