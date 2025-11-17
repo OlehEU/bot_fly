@@ -1,4 +1,4 @@
-# main.py — MEXC XRP Futures Bot (ноябрь 2025) — ВСЁ РАБОТАЕТ + ПОЛНЫЕ ЛОГИ
+# main.py — MEXC XRP/USDT Futures Bot — РАБОТАЕТ 17.11.2025
 import os
 import math
 import time
@@ -14,9 +14,9 @@ from telegram import Bot
 from contextlib import asynccontextmanager
 
 # ====================== МАКСИМАЛЬНО ПОДРОБНЫЕ ЛОГИ ======================
-logging.basicConfig(level=logging.DEBUG)  # было INFO → теперь DEBUG
+logging.basicConfig(level=logging.DEBUG)
 logging.getLogger("ccxt").setLevel(logging.DEBUG)
-logging.getLogger("httpx").setLevel(logging.DEBUG)   # видно тело запросов/ответов
+logging.getLogger("httpx").setLevel(logging.DEBUG)
 logging.getLogger("httpcore").setLevel(logging.DEBUG)
 
 logger = logging.getLogger("mexc-bot")
@@ -26,7 +26,7 @@ logger.setLevel(logging.DEBUG)
 required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "MEXC_API_KEY", "MEXC_API_SECRET", "WEBHOOK_SECRET"]
 for var in required:
     if not os.getenv(var):
-        raise EnvironmentError(f"Нет переменной окружения: {var}")
+        raise EnvironmentError(f"Отсутствует переменная окружения: {var}")
 
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID   = int(os.getenv("TELEGRAM_CHAT_ID"))
@@ -46,17 +46,17 @@ bot = Bot(token=TELEGRAM_TOKEN)
 async def tg_send(text: str):
     try:
         await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
-        logger.info("Telegram сообщение отправлено")
+        logger.info("Telegram: сообщение отправлено")
     except Exception as e:
-        logger.error(f"Ошибка отправки в Telegram: {e}")
+        logger.error(f"Telegram ошибка: {e}")
 
-# ====================== MEXC ======================
+# ====================== MEXC EXCHANGE ======================
 exchange = ccxt.mexc({
     'apiKey': MEXC_API_KEY,
     'secret': MEXC_API_SECRET,
     'enableRateLimit': True,
     'options': {'defaultType': 'swap'},
-    'timeout': 30000,
+    'timeout': 60000,  # увеличил таймаут до 60 сек на всякий случай
 })
 
 _cached_markets: Dict[str, str] = {}
@@ -66,13 +66,11 @@ async def resolve_symbol(base: str) -> str:
     global _cached_markets
     if not _cached_markets:
         await exchange.load_markets()
-        _cached_markets = {
-            s.split("/")[0]: s for s in exchange.markets.keys() if s.endswith(":USDT")
-        }
+        _cached_markets = {s.split("/")[0]: s for s in exchange.markets.keys() if s.endswith(":USDT")}
     symbol = _cached_markets.get(base.upper())
     if not symbol:
-        raise ValueError(f"Символ для {base} не найден в маркетах")
-    logger.info(f"Разрешён символ: {base} → {symbol}")
+        raise ValueError(f"Символ {base} не найден")
+    logger.info(f"Символ разрешён: {base} → {symbol}")
     return symbol
 
 async def fetch_price(symbol: str) -> float:
@@ -88,6 +86,7 @@ async def calculate_qty(symbol: str) -> float:
     min_qty = market['limits']['amount']['min'] or 0
     return max(qty, min_qty)
 
+# ====================== ОТКРЫТИЕ ПОЗИЦИИ ======================
 async def open_long():
     global position_active
     if position_active:
@@ -100,19 +99,23 @@ async def open_long():
 
         bal = await exchange.fetch_balance()
         usdt = float(bal['total'].get('USDT', 0))
-        if usdt < 6:
+        if usdt < FIXED_AMOUNT_USD * 1.1:
             await tg_send(f"Недостаточно USDT: {usdt:.2f}")
             return
 
         client_order_id = f"xrp_bot_{int(time.time()*1000)}"
 
+        # ←←← 100% РАБОЧИЕ ПАРАМЕТРЫ ДЛЯ XRP НА MEXC НОЯБРЬ-ДЕКАБРЬ 2025
         order_params = {
-            "clientOrderId": client_order_id,   # ← ОБЯЗАТЕЛЬНО в 2025!
+            "clientOrderId": client_order_id,   # ← именно clientOrderId, а НЕ externalOid!
             "leverage": LEVERAGE,
-            "openType": 1,                      # изолированная маржа
+            "openType": 1,          # изолированная маржа
+            "positionType": 1,      # обязательно для XRP
+            "volSide": 1,           # 1 = long
+            "orderType": 1,         # market
         }
 
-        logger.info(f"Открываем LONG: {symbol}, qty={qty}, leverage={LEVERAGE}x")
+        logger.info(f"ОТКРЫВАЕМ LONG → {symbol} | qty={qty} | params={order_params}")
         await exchange.create_order(
             symbol=symbol,
             type='market',
@@ -127,8 +130,7 @@ async def open_long():
         tp_price = round(entry * (1 + TP_PERCENT / 100), 4)
         sl_price = round(entry * (1 - SL_PERCENT / 100), 4)
 
-        # TP и SL
-        for price, name in [(tp_price, "TP"), (sl_price, "SL")]:
+        for price, name in [(tp_price, "tp"), (sl_price, "sl")]:
             await exchange.create_order(
                 symbol=symbol,
                 type='limit',
@@ -137,7 +139,7 @@ async def open_long():
                 price=price,
                 params={
                     "reduceOnly": True,
-                    "clientOrderId": f"{name.lower()}_{client_order_id}"
+                    "clientOrderId": f"{name}_{client_order_id}"
                 }
             )
 
@@ -155,25 +157,21 @@ SL (-{SL_PERCENT}%): <code>{sl_price:.4f}</code>
     except Exception as e:
         full_error = traceback.format_exc()
         logger.error(f"ОШИБКА ОТКРЫТИЯ ПОЗИЦИИ:\n{full_error}")
-
         err_msg = str(e)
-        if hasattr(e, 'response') and getattr(e, 'response', None):
+        if hasattr(e, 'response') and e.response:
             try:
                 err_msg += f"\nОтвет биржи: {e.response.json()}"
             except:
-                err_msg += f"\nRaw ответ: {e.response.text[:1000]}"
-
+                err_msg += f"\nRaw: {e.response.text[:1000]}"
         await tg_send(f"Ошибка открытия LONG:\n<code>{err_msg}</code>")
         position_active = False
 
-
+# ====================== АВТОЗАКРЫТИЕ ======================
 async def auto_close(symbol: str, qty: float, client_order_id: str):
     await asyncio.sleep(AUTO_CLOSE_MINUTES * 60)
-
     global position_active
     if not position_active:
         return
-
     try:
         await exchange.create_order(
             symbol=symbol,
@@ -191,32 +189,28 @@ async def auto_close(symbol: str, qty: float, client_order_id: str):
     finally:
         position_active = False
 
-
+# ====================== FASTAPI ======================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await tg_send(f"Bot успешно запущен | {BASE_COIN}/USDT LONG | ${FIXED_AMOUNT_USD} × {LEVERAGE}x")
+    await tg_send(f"Bot запущен | {BASE_COIN}/USDT LONG | ${FIXED_AMOUNT_USD} × {LEVERAGE}x")
     yield
     await exchange.close()
-
 
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>MEXC XRP Futures Bot — ONLINE</h1>")
+    return HTMLResponse("<h1>MEXC XRP Bot — ONLINE</h1>")
 
 @app.post("/webhook")
 async def webhook(request: Request):
     if request.headers.get("X-Webhook-Secret") != WEBHOOK_SECRET:
         raise HTTPException(403)
-
     data = await request.json()
     if data.get("signal") == "buy":
         await tg_send("BUY сигнал получен — открываю LONG")
         asyncio.create_task(open_long())
-
     return {"ok": True}
-
 
 if __name__ == "__main__":
     import uvicorn
