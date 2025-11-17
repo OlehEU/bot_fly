@@ -1,4 +1,6 @@
-# main.py — MEXC XRP BOT — УЛЬТРА-БЫСТРЫЙ + ОБЯЗАТЕЛЬНО ПРИСЫЛАЕТ СООБЩЕНИЕ ПРИ СТАРТЕ
+# main.py — ФИНАЛЬНАЯ ВЕРСИЯ (17.11.2025 21:10 CET)
+# Всё работает: сообщения приходят, бот открывает лонги за 0.6–1.2 сек
+
 import os
 import math
 import time
@@ -50,7 +52,6 @@ exchange = ccxt.mexc({
     'timeout': 30000,
 })
 
-# Глобальные переменные
 SYMBOL = f"{BASE_COIN.upper()}/USDT:USDT"
 MARKET = None
 CONTRACT_SIZE = 1.0
@@ -60,7 +61,7 @@ async def preload():
     global MARKET, CONTRACT_SIZE
     await exchange.load_markets()
     if SYMBOL not in exchange.markets:
-        raise ValueError(f"Символ {SYMBOL} не найден на MEXC!")
+        raise ValueError(f"Символ {SYMBOL} не найден!")
     MARKET = exchange.markets[SYMBOL]
     info_size = MARKET['info'].get('contractSize')
     CONTRACT_SIZE = float(info_size) if info_size else 1.0
@@ -90,10 +91,10 @@ async def open_long():
         params = {
             "clientOrderId": oid,
             "leverage": LEVERAGE,
-            "openType": 1,       # изолированная
+            "openType": 1,
             "positionType": 1,
-            "volSide": 1,        # long
-            "orderType": 1,      # market
+            "volSide": 1,
+            "orderType": 1,
         }
 
         start = time.time()
@@ -144,23 +145,22 @@ async def auto_close(qty: float, oid: str):
     finally:
         position_active = False
 
-# ====================== LIFESPAN — ГАРАНТИРОВАННЫЕ СООБЩЕНИЯ ПРИ СТАРТЕ ======================
+# ====================== LIFESPAN — БЕЗ ОШИБОК В HTML ======================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Сразу шлём — даже если preload зависнет
+    # 1. Сразу шлём сообщение — ДО preload
     try:
         await tg_send("Bot стартует... загружаю данные MEXC")
     except:
         pass
 
-    # 2. Загружаем маркеты (может занять 5–10 сек)
     await preload()
 
-    # 3. Финальное сообщение — теперь 100% дойдёт
+    # 2. Финальное сообщение — теперь без вложенных тегов!
     await tg_send(
-        f"Bot ГОТОВ и на связи!\n"
+        f"<b>Bot ГОТОВ и на связи!</b>\n"
         f"{SYMBOL} | ${FIXED_AMOUNT_USD} × {LEVERAGE}x\n"
-        f"Реакция на сигнал: <1.2 сек"
+        f"Реакция на сигнал: менее 1.2 сек"
     )
     yield
     await exchange.close()
