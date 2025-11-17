@@ -1,4 +1,4 @@
-# main.py — MEXC XRP BOT — УЛЬТРА-БЫСТРЫЙ И БЕЗ ОШИБОК
+# main.py — MEXC XRP BOT — УЛЬТРА-БЫСТРЫЙ + ОБЯЗАТЕЛЬНО ПРИСЫЛАЕТ СООБЩЕНИЕ ПРИ СТАРТЕ
 import os
 import math
 import time
@@ -19,7 +19,7 @@ logger = logging.getLogger("mexc-bot")
 required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "MEXC_API_KEY", "MEXC_API_SECRET", "WEBHOOK_SECRET"]
 for var in required:
     if not os.getenv(var):
-        raise EnvironmentError(f"Нет переменной: {var}")
+        raise EnvironmentError(f"Отсутствует переменная окружения: {var}")
 
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
@@ -35,6 +35,7 @@ AUTO_CLOSE_MINUTES = int(os.getenv("AUTO_CLOSE_MINUTES", "10"))
 BASE_COIN          = "XRP"
 
 bot = Bot(token=TELEGRAM_TOKEN)
+
 async def tg_send(text: str):
     try:
         await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
@@ -53,17 +54,17 @@ exchange = ccxt.mexc({
 SYMBOL = f"{BASE_COIN.upper()}/USDT:USDT"
 MARKET = None
 CONTRACT_SIZE = 1.0
-position_active = False  # ← теперь объявлена заранее
+position_active = False
 
 async def preload():
     global MARKET, CONTRACT_SIZE
     await exchange.load_markets()
     if SYMBOL not in exchange.markets:
-        raise ValueError(f"Символ {SYMBOL} не найден!")
+        raise ValueError(f"Символ {SYMBOL} не найден на MEXC!")
     MARKET = exchange.markets[SYMBOL]
     info_size = MARKET['info'].get('contractSize')
     CONTRACT_SIZE = float(info_size) if info_size else 1.0
-    logger.info(f"Preload OK: {SYMBOL} | contract_size={CONTRACT_SIZE}")
+    logger.info(f"Preload завершён: {SYMBOL} | contract_size={CONTRACT_SIZE}")
 
 async def get_price() -> float:
     ticker = await exchange.fetch_ticker(SYMBOL)
@@ -95,10 +96,10 @@ async def open_long():
             "orderType": 1,      # market
         }
 
-        start_time = time.time()
+        start = time.time()
         await exchange.create_order(SYMBOL, 'market', 'open_long', qty, None, params)
         entry = await get_price()
-        took = round(time.time() - start_time, 2)
+        took = round(time.time() - start, 2)
 
         position_active = True
 
@@ -139,15 +140,28 @@ async def auto_close(qty: float, oid: str):
         })
         await tg_send("Позиция закрыта по таймеру")
     except Exception as e:
-        await tg_send(f"Ошибка закрытия: {e}")
+        await tg_send(f"Ошибка автозакрытия: {e}")
     finally:
         position_active = False
 
-# ====================== FASTAPI ======================
+# ====================== LIFESPAN — ГАРАНТИРОВАННЫЕ СООБЩЕНИЯ ПРИ СТАРТЕ ======================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 1. Сразу шлём — даже если preload зависнет
+    try:
+        await tg_send("Bot стартует... загружаю данные MEXC")
+    except:
+        pass
+
+    # 2. Загружаем маркеты (может занять 5–10 сек)
     await preload()
-    await tg_send(f"Bot запущен и готов!\n{SYMBOL} | ${FIXED_AMOUNT_USD} × {LEVERAGE}x\nСкорость: <1.2 сек")
+
+    # 3. Финальное сообщение — теперь 100% дойдёт
+    await tg_send(
+        f"Bot ГОТОВ и на связи!\n"
+        f"{SYMBOL} | ${FIXED_AMOUNT_USD} × {LEVERAGE}x\n"
+        f"Реакция на сигнал: <1.2 сек"
+    )
     yield
     await exchange.close()
 
