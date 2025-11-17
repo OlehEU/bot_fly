@@ -1,4 +1,4 @@
-# main.py — УЛЬТРА-БЫСТРЫЙ XRP BOT НА MEXC (17.11.2025)
+# main.py — MEXC XRP BOT — УЛЬТРА-БЫСТРЫЙ И БЕЗ ОШИБОК
 import os
 import math
 import time
@@ -19,7 +19,7 @@ logger = logging.getLogger("mexc-bot")
 required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "MEXC_API_KEY", "MEXC_API_SECRET", "WEBHOOK_SECRET"]
 for var in required:
     if not os.getenv(var):
-        raise EnvironmentError(f"Нет переменной окружения: {var}")
+        raise EnvironmentError(f"Нет переменной: {var}")
 
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
@@ -39,7 +39,7 @@ async def tg_send(text: str):
     try:
         await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
-        logger.error(f"TG error: {e}")
+        logger.error(f"Telegram error: {e}")
 
 exchange = ccxt.mexc({
     'apiKey': MEXC_API_KEY,
@@ -49,20 +49,21 @@ exchange = ccxt.mexc({
     'timeout': 30000,
 })
 
-# Глобальные переменные — кэшируем при старте
+# Глобальные переменные
 SYMBOL = f"{BASE_COIN.upper()}/USDT:USDT"
 MARKET = None
 CONTRACT_SIZE = 1.0
+position_active = False  # ← теперь объявлена заранее
 
 async def preload():
     global MARKET, CONTRACT_SIZE
     await exchange.load_markets()
     if SYMBOL not in exchange.markets:
-        raise ValueError(f"Символ {SYMBOL} не найден на MEXC!")
+        raise ValueError(f"Символ {SYMBOL} не найден!")
     MARKET = exchange.markets[SYMBOL]
     info_size = MARKET['info'].get('contractSize')
     CONTRACT_SIZE = float(info_size) if info_size else 1.0
-    logger.info(f"Preload готов: {SYMBOL} | contract_size={CONTRACT_SIZE}")
+    logger.info(f"Preload OK: {SYMBOL} | contract_size={CONTRACT_SIZE}")
 
 async def get_price() -> float:
     ticker = await exchange.fetch_ticker(SYMBOL)
@@ -74,8 +75,6 @@ async def get_qty() -> float:
     qty = math.ceil(raw_qty / CONTRACT_SIZE) * CONTRACT_SIZE
     min_qty = MARKET['limits']['amount']['min'] or 0
     return max(qty, min_qty)
-
-position_active = False
 
 async def open_long():
     global position_active
@@ -118,36 +117,37 @@ ${FIXED_AMOUNT_USD} × {LEVERAGE}x | {SYMBOL}
 Entry: <code>{entry:.4f}</code>
 TP: <code>{tp:.4f}</code> (+{TP_PERCENT}%)
 SL: <code>{sl:.4f}</code> (-{SL_PERCENT}%)
+Автозакрытие через {AUTO_CLOSE_MINUTES} мин
         """.strip())
 
         asyncio.create_task(auto_close(qty, oid))
 
     except Exception as e:
-        err = traceback.format_exc()
-        logger.error(f"Ошибка открытия: {err}")
+        logger.error(f"Ошибка открытия: {traceback.format_exc()}")
         await tg_send(f"Ошибка LONG:\n<code>{str(e)}</code>")
         position_active = False
 
 async def auto_close(qty: float, oid: str):
     await asyncio.sleep(AUTO_CLOSE_MINUTES * 60)
-    if not position_active: return
+    global position_active
+    if not position_active:
+        return
     try:
         await exchange.create_order(SYMBOL, 'market', 'close_long', qty, None, {
             "reduceOnly": True,
             "clientOrderId": f"close_{oid}"
         })
-        await tg_send("Автозакрытие — позиция закрыта")
+        await tg_send("Позиция закрыта по таймеру")
     except Exception as e:
         await tg_send(f"Ошибка закрытия: {e}")
     finally:
-        global position_active
         position_active = False
 
 # ====================== FASTAPI ======================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await preload()
-    await tg_send(f"Bot ULTRAFAST запущен!\n{SYMBOL} | ${FIXED_AMOUNT_USD} × {LEVERAGE}x\nРеакция: <1.2 сек")
+    await tg_send(f"Bot запущен и готов!\n{SYMBOL} | ${FIXED_AMOUNT_USD} × {LEVERAGE}x\nСкорость: <1.2 сек")
     yield
     await exchange.close()
 
@@ -160,7 +160,7 @@ async def root():
 @app.post("/webhook")
 async def webhook(request: Request):
     if request.headers.get("X-Webhook-Secret") != WEBHOOK_SECRET:
-        raise HTTPException(403)
+        raise HTTPException(status_code=403)
     data = await request.json()
     if data.get("signal") == "buy":
         await tg_send("Сигнал BUY — открываю LONG")
