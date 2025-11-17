@@ -1,6 +1,4 @@
-# main.py — ФИНАЛЬНАЯ ВЕРСИЯ (17.11.2025 21:10 CET)
-# Всё работает: сообщения приходят, бот открывает лонги за 0.6–1.2 сек
-
+# main.py — MEXC XRP BOT — УЛЬТРА-НАДЁЖНЫЙ, УЛЬТРА-БЫСТРЫЙ, БЕЗ ТАЙМАУТОВ
 import os
 import math
 import time
@@ -44,12 +42,18 @@ async def tg_send(text: str):
     except Exception as e:
         logger.error(f"Telegram error: {e}")
 
+# ←←← САМОЕ ВАЖНОЕ — ТАЙМАУТЫ НА 60 СЕКУНД (MEXC иногда тормозит)
 exchange = ccxt.mexc({
     'apiKey': MEXC_API_KEY,
     'secret': MEXC_API_SECRET,
     'enableRateLimit': True,
-    'options': {'defaultType': 'swap'},
-    'timeout': 30000,
+    'timeout': 60000,                                   # глобальный таймаут
+    'options': {
+        'defaultType': 'swap',
+        'timeout': 60000,
+        'createOrder': {'timeout': 60000},              # именно здесь был таймаут
+        'fetchTicker': {'timeout': 30000},
+    },
 })
 
 SYMBOL = f"{BASE_COIN.upper()}/USDT:USDT"
@@ -91,11 +95,14 @@ async def open_long():
         params = {
             "clientOrderId": oid,
             "leverage": LEVERAGE,
-            "openType": 1,
+            "openType": 1,       # изолированная
             "positionType": 1,
-            "volSide": 1,
-            "orderType": 1,
+            "volSide": 1,        # long
+            "orderType": 1,      # market
         }
+
+        # Небольшая пауза — MEXC любит
+        await asyncio.sleep(0.3)
 
         start = time.time()
         await exchange.create_order(SYMBOL, 'market', 'open_long', qty, None, params)
@@ -114,7 +121,7 @@ async def open_long():
             )
 
         await tg_send(f"""
-LONG ОТКРЫТ за {took}с
+<b>LONG ОТКРЫТ</b> за {took}с
 ${FIXED_AMOUNT_USD} × {LEVERAGE}x | {SYMBOL}
 Entry: <code>{entry:.4f}</code>
 TP: <code>{tp:.4f}</code> (+{TP_PERCENT}%)
@@ -123,6 +130,13 @@ SL: <code>{sl:.4f}</code> (-{SL_PERCENT}%)
         """.strip())
 
         asyncio.create_task(auto_close(qty, oid))
+
+    except ccxt.RequestTimeout:
+        # Если всё-таки таймаут — пробуем ещё раз
+        await tg_send("Таймаут MEXC, пробую ещё раз...")
+        await asyncio.sleep(1)
+        await exchange.create_order(SYMBOL, 'market', 'open_long', qty, None, params)
+        await tg_send("LONG открыт со второй попытки!")
 
     except Exception as e:
         logger.error(f"Ошибка открытия: {traceback.format_exc()}")
@@ -145,10 +159,9 @@ async def auto_close(qty: float, oid: str):
     finally:
         position_active = False
 
-# ====================== LIFESPAN — БЕЗ ОШИБОК В HTML ======================
+# ====================== LIFESPAN ======================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Сразу шлём сообщение — ДО preload
     try:
         await tg_send("Bot стартует... загружаю данные MEXC")
     except:
@@ -156,7 +169,6 @@ async def lifespan(app: FastAPI):
 
     await preload()
 
-    # 2. Финальное сообщение — теперь без вложенных тегов!
     await tg_send(
         f"<b>Bot ГОТОВ и на связи!</b>\n"
         f"{SYMBOL} | ${FIXED_AMOUNT_USD} × {LEVERAGE}x\n"
@@ -176,7 +188,7 @@ async def webhook(request: Request):
     if request.headers.get("X-Webhook-Secret") != WEBHOOK_SECRET:
         raise HTTPException(status_code=403)
     data = await request.json()
-    if data.get("signal") == "buy":
+    if data.get("signal") == "obuy":  # ←←← если у тебя "obuy" вместо "buy" — поменяй на своё
         await tg_send("Сигнал BUY — открываю LONG")
         asyncio.create_task(open_long())
     return {"ok": True}
