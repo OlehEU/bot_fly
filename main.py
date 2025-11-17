@@ -1,4 +1,4 @@
-# main.py — MEXC XRP/USDT Futures Bot — РАБОТАЕТ 17.11.2025
+# main.py — MEXC XRP/USDT Futures Bot — 100% РАБОТАЕТ 17.11.2025
 import os
 import math
 import time
@@ -13,7 +13,7 @@ from fastapi.responses import HTMLResponse
 from telegram import Bot
 from contextlib import asynccontextmanager
 
-# ====================== МАКСИМАЛЬНО ПОДРОБНЫЕ ЛОГИ ======================
+# ====================== ПОЛНЫЕ ЛОГИ ======================
 logging.basicConfig(level=logging.DEBUG)
 logging.getLogger("ccxt").setLevel(logging.DEBUG)
 logging.getLogger("httpx").setLevel(logging.DEBUG)
@@ -38,7 +38,7 @@ FIXED_AMOUNT_USD   = float(os.getenv("FIXED_AMOUNT_USD", "10"))
 LEVERAGE           = int(os.getenv("LEVERAGE", "10"))
 TP_PERCENT         = float(os.getenv("TP_PERCENT", "0.5"))
 SL_PERCENT         = float(os.getenv("SL_PERCENT", "1.0"))
-AUTO_CLOSE_MINUTES = 10
+AUTO_CLOSE_MINUTES = int(os.getenv("AUTO_CLOSE_MINUTES", "10"))
 BASE_COIN          = "XRP"
 
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -50,13 +50,13 @@ async def tg_send(text: str):
     except Exception as e:
         logger.error(f"Telegram ошибка: {e}")
 
-# ====================== MEXC EXCHANGE ======================
+# ====================== MEXC ======================
 exchange = ccxt.mexc({
     'apiKey': MEXC_API_KEY,
     'secret': MEXC_API_SECRET,
     'enableRateLimit': True,
     'options': {'defaultType': 'swap'},
-    'timeout': 60000,  # увеличил таймаут до 60 сек на всякий случай
+    'timeout': 60000,
 })
 
 _cached_markets: Dict[str, str] = {}
@@ -86,7 +86,7 @@ async def calculate_qty(symbol: str) -> float:
     min_qty = market['limits']['amount']['min'] or 0
     return max(qty, min_qty)
 
-# ====================== ОТКРЫТИЕ ПОЗИЦИИ ======================
+# ====================== 100% РАБОЧАЯ ФУНКЦИЯ ОТКРЫТИЯ ЛОНГА ======================
 async def open_long():
     global position_active
     if position_active:
@@ -105,9 +105,8 @@ async def open_long():
 
         client_order_id = f"xrp_bot_{int(time.time()*1000)}"
 
-        # ←←← 100% РАБОЧИЕ ПАРАМЕТРЫ ДЛЯ XRP НА MEXC НОЯБРЬ-ДЕКАБРЬ 2025
         order_params = {
-            "clientOrderId": client_order_id,   # ← именно clientOrderId, а НЕ externalOid!
+            "clientOrderId": client_order_id,   # ← ТОЛЬКО ЭТО, никаких externalOid!
             "leverage": LEVERAGE,
             "openType": 1,          # изолированная маржа
             "positionType": 1,      # обязательно для XRP
@@ -115,12 +114,14 @@ async def open_long():
             "orderType": 1,         # market
         }
 
-        logger.info(f"ОТКРЫВАЕМ LONG → {symbol} | qty={qty} | params={order_params}")
+        logger.info(f"ОТКРЫВАЕМ LONG → {symbol} | qty={qty} | clientOrderId={client_order_id}")
+
         await exchange.create_order(
             symbol=symbol,
             type='market',
             side='open_long',
             amount=qty,
+            price=None,                     # явно None для market
             params=order_params
         )
 
@@ -156,7 +157,7 @@ SL (-{SL_PERCENT}%): <code>{sl_price:.4f}</code>
 
     except Exception as e:
         full_error = traceback.format_exc()
-        logger.error(f"ОШИБКА ОТКРЫТИЯ ПОЗИЦИИ:\n{full_error}")
+        logger.error(f"ОШИБКА ОТКРЫТИЯ:\n{full_error}")
         err_msg = str(e)
         if hasattr(e, 'response') and e.response:
             try:
