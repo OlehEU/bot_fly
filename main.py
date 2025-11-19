@@ -48,6 +48,7 @@ async def tg_send(text: str):
 
 MEXC_BASE_URL = "https://contract.mexc.com/api"
 SYMBOL_MEXC = f"{BASE_COIN.upper()}_USDT"
+SYMBOL_MEXC_TICKER = f"{BASE_COIN.upper()}USDT"
 SYMBOL = f"{BASE_COIN.upper()}/USDT:USDT"
 MARKET = None
 CONTRACT_SIZE = 1.0
@@ -143,14 +144,24 @@ async def preload():
         raise
 
 async def get_price() -> float:
-    url = f"{MEXC_BASE_URL}/v1/contract/ticker/{SYMBOL_MEXC}"
     try:
+        url = f"{MEXC_BASE_URL}/v1/contract/ticker/{SYMBOL_MEXC_TICKER}"
         response = await mexc_client.get(url, timeout=30.0)
         response.raise_for_status()
         data = response.json()
         if data.get("code") != 0:
             raise Exception(f"Ошибка получения цены: {data.get('msg')}")
         return float(data.get("data", {}).get("lastPrice", 0))
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            url = f"{MEXC_BASE_URL}/v1/contract/ticker"
+            response = await mexc_client.get(url, params={"symbol": SYMBOL_MEXC}, timeout=30.0)
+            response.raise_for_status()
+            data = response.json()
+            if data.get("code") != 0:
+                raise Exception(f"Ошибка получения цены: {data.get('msg')}")
+            return float(data.get("data", {}).get("lastPrice", 0))
+        raise
     except Exception as e:
         logger.error(f"Ошибка получения цены: {e}")
         raise
