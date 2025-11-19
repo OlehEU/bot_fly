@@ -109,16 +109,13 @@ async def open_long():
         tp = round(entry * (1 + TP_PERCENT / 100), 4)
         sl = round(entry * (1 - SL_PERCENT / 100), 4)
 
+        # Параметры для открытия позиции (без TP/SL)
         params = {
             "clientOrderId": oid,
             "leverage": LEVERAGE,
             "openType": 1,
             "positionType": 1,
             "volSide": 1,
-            "takeProfitPrice": tp,
-            "stopLossPrice": sl,
-            "reduceOnly": False,
-            "force": "ioc"
         }
 
         start = time.time()
@@ -151,6 +148,26 @@ async def open_long():
         logger.info(f"LONG открыт: {order.get('id')} | {took}s")
 
         position_active = True
+
+        # Устанавливаем TP и SL отдельными запросами
+        await asyncio.sleep(0.2)  # небольшая пауза перед установкой TP/SL
+        
+        for price, name in [(tp, "tp"), (sl, "sl")]:
+            try:
+                tp_sl_order = await exchange.create_order(
+                    SYMBOL,
+                    "limit",
+                    "sell",
+                    qty,
+                    price,
+                    {"reduceOnly": True, "clientOrderId": f"{name}_{oid}"}
+                )
+                if not tp_sl_order or not tp_sl_order.get("id"):
+                    logger.warning(f"Ордер {name} не создан: {tp_sl_order}")
+                else:
+                    logger.info(f"Ордер {name} создан: {tp_sl_order.get('id')}")
+            except Exception as e:
+                logger.warning(f"Ошибка при создании {name}: {e}")
 
         await tg_send(f"""
 <b>LONG ОТКРЫТ</b> за {took}с
