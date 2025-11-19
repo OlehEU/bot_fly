@@ -63,13 +63,24 @@ position_active = False
 
 async def preload():
     global MARKET, CONTRACT_SIZE
-    await exchange.load_markets()
-    if SYMBOL not in exchange.markets:
-        raise ValueError(f"Символ {SYMBOL} не найден!")
-    MARKET = exchange.markets[SYMBOL]
-    info_size = MARKET['info'].get('contractSize')
-    CONTRACT_SIZE = float(info_size) if info_size else 1.0
-    logger.info(f"Preload завершён: {SYMBOL} | contract_size={CONTRACT_SIZE}")
+    try:
+        await exchange.load_markets()
+        if SYMBOL not in exchange.markets:
+            raise ValueError(f"Символ {SYMBOL} не найден!")
+        MARKET = exchange.markets[SYMBOL]
+        info_size = MARKET['info'].get('contractSize')
+        CONTRACT_SIZE = float(info_size) if info_size else 1.0
+        logger.info(f"Preload завершён: {SYMBOL} | contract_size={CONTRACT_SIZE}")
+        
+        # Проверка прав API ключа - пробуем получить баланс
+        try:
+            balance = await exchange.fetch_balance({'type': 'swap'})
+            logger.info(f"API ключ работает, баланс получен: {bool(balance)}")
+        except Exception as e:
+            logger.warning(f"Не удалось получить баланс - проверьте права API ключа: {e}")
+    except Exception as e:
+        logger.error(f"Ошибка при preload: {e}")
+        raise
 
 async def get_price() -> float:
     ticker = await exchange.fetch_ticker(SYMBOL)
@@ -105,7 +116,18 @@ async def open_long():
 
         start = time.time()
         logger.info(f"Создание ордера: symbol={SYMBOL}, type=market, side=buy, qty={qty}, params={params}")
-        order = await exchange.create_order(SYMBOL, 'market', 'buy', qty, None, params)
+        logger.info(f"API Key (первые 8 символов): {MEXC_API_KEY[:8]}...")
+        
+        try:
+            order = await exchange.create_order(SYMBOL, 'market', 'buy', qty, None, params)
+        except ccxt.AuthenticationError as auth_error:
+            logger.error(f"Ошибка аутентификации: {auth_error}")
+            await tg_send(f"Ошибка LONG:\n<code>Ошибка аутентификации API ключа</code>")
+            raise
+        except ccxt.PermissionDenied as perm_error:
+            logger.error(f"Нет прав: {perm_error}")
+            await tg_send(f"Ошибка LONG:\n<code>Нет прав для создания ордеров</code>")
+            raise
         
         if not order or not order.get('id'):
             raise Exception(f"Ордер не создан: {order}")
@@ -141,15 +163,24 @@ SL: <code>{sl:.4f}</code> (-{SL_PERCENT}%)
 
         asyncio.create_task(auto_close(qty, oid))
 
-    except ccxt.RequestTimeout:
+    except (ccxt.RequestTimeout, asyncio.TimeoutError) as timeout_error:
         # Если всё-таки таймаут — пробуем ещё раз
+        logger.error(f"Таймаут при создании ордера: {timeout_error}")
+        logger.error(f"Параметры запроса: symbol={SYMBOL}, qty={qty}, params={params}")
         await tg_send("Таймаут MEXC, пробую ещё раз...")
-        await asyncio.sleep(1)
-        order = await exchange.create_order(SYMBOL, 'market', 'buy', qty, None, params)
-        if not order or not order.get('id'):
-            raise Exception(f"Ордер не создан при повторе: {order}")
-        logger.info(f"Ордер создан при повторе: {order.get('id')}")
-        await tg_send("LONG открыт со второй попытки!")
+        await asyncio.sleep(2)
+        try:
+            order = await exchange.create_order(SYMBOL, 'market', 'buy', qty, None, params)
+            if not order or not order.get('id'):
+                raise Exception(f"Ордер не создан при повторе: {order}")
+            logger.info(f"Ордер создан при повторе: {order.get('id')}")
+            await tg_send("LONG открыт со второй попытки!")
+        except Exception as retry_error:
+            logger.error(f"Ошибка при повторной попытке: {retry_error}")
+            logger.error(f"Детали ошибки: {traceback.format_exc()}")
+            await tg_send(f"Ошибка LONG:\n<code>{str(retry_error)}</code>")
+            position_active = False
+            raise
 
     except Exception as e:
         logger.error(f"Ошибка открытия: {traceback.format_exc()}")
