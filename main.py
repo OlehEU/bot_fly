@@ -108,12 +108,10 @@ async def open_long():
         tp = round(entry * (1 + TP_PERCENT / 100), 4)
         sl = round(entry * (1 - SL_PERCENT / 100), 4)
 
-        # Параметры для открытия позиции (без TP/SL)
+        # Параметры для открытия позиции (минимальный набор)
         params = {
-            "clientOrderId": oid,
             "leverage": LEVERAGE,
             "openType": 1,
-            "positionType": 1,
             "volSide": 1,
         }
 
