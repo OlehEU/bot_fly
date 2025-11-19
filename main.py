@@ -44,15 +44,15 @@ async def tg_send(text: str):
 
 # ←←← САМОЕ ВАЖНОЕ — ТАЙМАУТЫ НА 60 СЕКУНД (MEXC иногда тормозит)
 exchange = ccxt.mexc({
-    'apiKey': MEXC_API_KEY,
-    'secret': MEXC_API_SECRET,
-    'enableRateLimit': True,
-    'timeout': 60000,                                   # глобальный таймаут
-    'options': {
-        'defaultType': 'swap',
-        'timeout': 60000,
-        'createOrder': {'timeout': 60000},              # именно здесь был таймаут
-        'fetchTicker': {'timeout': 30000},
+    "apiKey": MEXC_API_KEY,
+    "secret": MEXC_API_SECRET,
+    "enableRateLimit": False,
+    "timeout": 60000,
+    "options": {
+        "defaultType": "swap",
+        "timeout": 60000,
+        "createOrder": {"timeout": 60000},
+        "force": "ioc"
     },
 })
 
@@ -84,7 +84,7 @@ async def preload():
 
 async def get_price() -> float:
     ticker = await exchange.fetch_ticker(SYMBOL)
-    return float(ticker['last'])
+    return float(ticker["last"])
 
 async def get_qty() -> float:
     price = await get_price()
@@ -103,54 +103,54 @@ async def open_long():
         qty = await get_qty()
         oid = f"xrp_{int(time.time()*1000)}"
 
-        params = {
-            "clientOrderId": oid,
-            "leverage": LEVERAGE,
-            "openType": 1,       # изолированная
-            "positionType": 1,
-            "volSide": 1,        # long
-        }
+        await asyncio.sleep(0.25)  # required pause for MEXC
 
-        # Небольшая пауза — MEXC любит
-        await asyncio.sleep(0.3)
-
-        start = time.time()
-        logger.info(f"Создание ордера: symbol={SYMBOL}, type=market, side=buy, qty={qty}, params={params}")
-        logger.info(f"API Key (первые 8 символов): {MEXC_API_KEY[:8]}...")
-        
-        try:
-            order = await exchange.create_order(SYMBOL, 'market', 'buy', qty, None, params)
-        except ccxt.AuthenticationError as auth_error:
-            logger.error(f"Ошибка аутентификации: {auth_error}")
-            await tg_send(f"Ошибка LONG:\n<code>Ошибка аутентификации API ключа</code>")
-            raise
-        except ccxt.PermissionDenied as perm_error:
-            logger.error(f"Нет прав: {perm_error}")
-            await tg_send(f"Ошибка LONG:\n<code>Нет прав для создания ордеров</code>")
-            raise
-        
-        if not order or not order.get('id'):
-            raise Exception(f"Ордер не создан: {order}")
-        
-        logger.info(f"Ордер создан: {order.get('id')}, статус: {order.get('status')}")
-        
         entry = await get_price()
-        took = round(time.time() - start, 2)
-
-        position_active = True
-
         tp = round(entry * (1 + TP_PERCENT / 100), 4)
         sl = round(entry * (1 - SL_PERCENT / 100), 4)
 
-        for price, name in [(tp, "tp"), (sl, "sl")]:
-            tp_sl_order = await exchange.create_order(
-                SYMBOL, 'limit', 'sell', qty, price,
-                {"reduceOnly": True, "clientOrderId": f"{name}_{oid}"}
+        params = {
+            "clientOrderId": oid,
+            "leverage": LEVERAGE,
+            "openType": 1,
+            "positionType": 1,
+            "volSide": 1,
+            "takeProfitPrice": tp,
+            "stopLossPrice": sl,
+            "reduceOnly": False,
+            "force": "ioc"
+        }
+
+        start = time.time()
+
+        try:
+            order = await exchange.create_order(
+                SYMBOL,
+                "market",
+                "buy",
+                qty,
+                None,
+                params
             )
-            if not tp_sl_order or not tp_sl_order.get('id'):
-                logger.warning(f"Ордер {name} не создан: {tp_sl_order}")
-            else:
-                logger.info(f"Ордер {name} создан: {tp_sl_order.get('id')}")
+        except (ccxt.RequestTimeout, asyncio.TimeoutError):
+            await tg_send("Таймаут MEXC, пробую ещё раз...")
+            await asyncio.sleep(1)
+            order = await exchange.create_order(
+                SYMBOL,
+                "market",
+                "buy",
+                qty,
+                None,
+                params
+            )
+
+        if not order or not order.get("id"):
+            raise Exception(f"MEXC не вернул ID ордера: {order}")
+
+        took = round(time.time() - start, 2)
+        logger.info(f"LONG открыт: {order.get('id')} | {took}s")
+
+        position_active = True
 
         await tg_send(f"""
 <b>LONG ОТКРЫТ</b> за {took}с
@@ -163,27 +163,8 @@ SL: <code>{sl:.4f}</code> (-{SL_PERCENT}%)
 
         asyncio.create_task(auto_close(qty, oid))
 
-    except (ccxt.RequestTimeout, asyncio.TimeoutError) as timeout_error:
-        # Если всё-таки таймаут — пробуем ещё раз
-        logger.error(f"Таймаут при создании ордера: {timeout_error}")
-        logger.error(f"Параметры запроса: symbol={SYMBOL}, qty={qty}, params={params}")
-        await tg_send("Таймаут MEXC, пробую ещё раз...")
-        await asyncio.sleep(2)
-        try:
-            order = await exchange.create_order(SYMBOL, 'market', 'buy', qty, None, params)
-            if not order or not order.get('id'):
-                raise Exception(f"Ордер не создан при повторе: {order}")
-            logger.info(f"Ордер создан при повторе: {order.get('id')}")
-            await tg_send("LONG открыт со второй попытки!")
-        except Exception as retry_error:
-            logger.error(f"Ошибка при повторной попытке: {retry_error}")
-            logger.error(f"Детали ошибки: {traceback.format_exc()}")
-            await tg_send(f"Ошибка LONG:\n<code>{str(retry_error)}</code>")
-            position_active = False
-            raise
-
     except Exception as e:
-        logger.error(f"Ошибка открытия: {traceback.format_exc()}")
+        logger.error(traceback.format_exc())
         await tg_send(f"Ошибка LONG:\n<code>{str(e)}</code>")
         position_active = False
 
@@ -193,13 +174,17 @@ async def auto_close(qty: float, oid: str):
     if not position_active:
         return
     try:
-        close_order = await exchange.create_order(SYMBOL, 'market', 'sell', qty, None, {
-            "reduceOnly": True,
-            "clientOrderId": f"close_{oid}"
-        })
-        if not close_order or not close_order.get('id'):
+        await asyncio.sleep(0.2)
+        close_order = await exchange.create_order(
+            SYMBOL,
+            "market",
+            "sell",
+            qty,
+            None,
+            {"reduceOnly": True, "clientOrderId": f"close_{oid}", "force": "ioc"}
+        )
+        if not close_order or not close_order.get("id"):
             raise Exception(f"Ордер закрытия не создан: {close_order}")
-        logger.info(f"Ордер закрытия создан: {close_order.get('id')}")
         await tg_send("Позиция закрыта по таймеру")
     except Exception as e:
         await tg_send(f"Ошибка автозакрытия: {e}")
