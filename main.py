@@ -105,7 +105,13 @@ async def open_long():
         await asyncio.sleep(0.3)
 
         start = time.time()
-        await exchange.create_order(SYMBOL, 'market', 'buy', qty, None, params)
+        order = await exchange.create_order(SYMBOL, 'market', 'buy', qty, None, params)
+        
+        if not order or not order.get('id'):
+            raise Exception(f"Ордер не создан: {order}")
+        
+        logger.info(f"Ордер создан: {order.get('id')}, статус: {order.get('status')}")
+        
         entry = await get_price()
         took = round(time.time() - start, 2)
 
@@ -115,10 +121,14 @@ async def open_long():
         sl = round(entry * (1 - SL_PERCENT / 100), 4)
 
         for price, name in [(tp, "tp"), (sl, "sl")]:
-            await exchange.create_order(
+            tp_sl_order = await exchange.create_order(
                 SYMBOL, 'limit', 'sell', qty, price,
                 {"reduceOnly": True, "clientOrderId": f"{name}_{oid}"}
             )
+            if not tp_sl_order or not tp_sl_order.get('id'):
+                logger.warning(f"Ордер {name} не создан: {tp_sl_order}")
+            else:
+                logger.info(f"Ордер {name} создан: {tp_sl_order.get('id')}")
 
         await tg_send(f"""
 <b>LONG ОТКРЫТ</b> за {took}с
@@ -135,7 +145,10 @@ SL: <code>{sl:.4f}</code> (-{SL_PERCENT}%)
         # Если всё-таки таймаут — пробуем ещё раз
         await tg_send("Таймаут MEXC, пробую ещё раз...")
         await asyncio.sleep(1)
-        await exchange.create_order(SYMBOL, 'market', 'buy', qty, None, params)
+        order = await exchange.create_order(SYMBOL, 'market', 'buy', qty, None, params)
+        if not order or not order.get('id'):
+            raise Exception(f"Ордер не создан при повторе: {order}")
+        logger.info(f"Ордер создан при повторе: {order.get('id')}")
         await tg_send("LONG открыт со второй попытки!")
 
     except Exception as e:
@@ -149,10 +162,13 @@ async def auto_close(qty: float, oid: str):
     if not position_active:
         return
     try:
-        await exchange.create_order(SYMBOL, 'market', 'sell', qty, None, {
+        close_order = await exchange.create_order(SYMBOL, 'market', 'sell', qty, None, {
             "reduceOnly": True,
             "clientOrderId": f"close_{oid}"
         })
+        if not close_order or not close_order.get('id'):
+            raise Exception(f"Ордер закрытия не создан: {close_order}")
+        logger.info(f"Ордер закрытия создан: {close_order.get('id')}")
         await tg_send("Позиция закрыта по таймеру")
     except Exception as e:
         await tg_send(f"Ошибка автозакрытия: {e}")
