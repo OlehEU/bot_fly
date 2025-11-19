@@ -5,8 +5,12 @@ import time
 import logging
 import asyncio
 import traceback
+import hmac
+import hashlib
+import urllib.parse
+from typing import Dict, Any, Optional
 
-import ccxt.async_support as ccxt
+import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from telegram import Bot
@@ -42,38 +46,95 @@ async def tg_send(text: str):
     except Exception as e:
         logger.error(f"Telegram error: {e}")
 
-# ←←← САМОЕ ВАЖНОЕ — ТАЙМАУТЫ НА 60 СЕКУНД (MEXC иногда тормозит)
-exchange = ccxt.mexc({
-    "apiKey": MEXC_API_KEY,
-    "secret": MEXC_API_SECRET,
-    "enableRateLimit": False,
-    "timeout": 60000,
-    "options": {
-        "defaultType": "swap",
-        "timeout": 60000,
-        "createOrder": {"timeout": 60000},
-    },
-})
-
+MEXC_BASE_URL = "https://contract.mexc.com/api"
+SYMBOL_MEXC = f"{BASE_COIN.upper()}_USDT"
 SYMBOL = f"{BASE_COIN.upper()}/USDT:USDT"
 MARKET = None
 CONTRACT_SIZE = 1.0
 position_active = False
 
+mexc_client = httpx.AsyncClient(timeout=60.0)
+
+def _create_signature(params: Dict[str, Any], secret: str) -> str:
+    sorted_params = sorted(params.items())
+    query_string = "&".join([f"{k}={v}" for k, v in sorted_params])
+    signature = hmac.new(
+        secret.encode('utf-8'),
+        query_string.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+    return signature
+
+async def mexc_request(method: str, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    url = f"{MEXC_BASE_URL}{endpoint}"
+    params = params or {}
+    
+    timestamp = str(int(time.time() * 1000))
+    
+    sign_params = params.copy()
+    sign_params["timestamp"] = timestamp
+    
+    signature = _create_signature(sign_params, MEXC_API_SECRET)
+    
+    params["timestamp"] = timestamp
+    params["signature"] = signature
+    
+    headers = {
+        "ApiKey": MEXC_API_KEY,
+        "Request-Time": timestamp,
+        "Content-Type": "application/json",
+    }
+    
+    try:
+        if method == "GET":
+            response = await mexc_client.get(url, params=params, headers=headers, timeout=60.0)
+        else:
+            response = await mexc_client.post(url, json=params, headers=headers, timeout=60.0)
+        
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as e:
+        error_text = e.response.text if hasattr(e.response, 'text') else str(e.response.content)
+        logger.error(f"MEXC API error: {e.response.status_code} - {error_text}")
+        raise Exception(f"MEXC API error: {e.response.status_code} - {error_text}")
+    except httpx.TimeoutException as e:
+        logger.error(f"MEXC API timeout: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"MEXC request error: {e}")
+        raise
+
 async def preload():
     global MARKET, CONTRACT_SIZE
     try:
-        await exchange.load_markets()
-        if SYMBOL not in exchange.markets:
-            raise ValueError(f"Символ {SYMBOL} не найден!")
-        MARKET = exchange.markets[SYMBOL]
-        info_size = MARKET['info'].get('contractSize')
-        CONTRACT_SIZE = float(info_size) if info_size else 1.0
+        try:
+            url = f"{MEXC_BASE_URL}/v1/contract/detail/{SYMBOL_MEXC}"
+            response = await mexc_client.get(url, timeout=30.0)
+            response.raise_for_status()
+            contract_info = response.json()
+            if contract_info and contract_info.get("code") == 0:
+                data = contract_info.get("data", {})
+                CONTRACT_SIZE = float(data.get("contractSize", 1.0))
+                min_vol = float(data.get("minVol", 1.0))
+            else:
+                CONTRACT_SIZE = 1.0
+                min_vol = 1.0
+        except:
+            CONTRACT_SIZE = 1.0
+            min_vol = 1.0
+        
+        MARKET = {
+            "limits": {
+                "amount": {
+                    "min": min_vol
+                }
+            }
+        }
+        
         logger.info(f"Preload завершён: {SYMBOL} | contract_size={CONTRACT_SIZE}")
         
-        # Проверка прав API ключа - пробуем получить баланс
         try:
-            balance = await exchange.fetch_balance({'type': 'swap'})
+            balance = await mexc_request("GET", "/v1/private/account/assets")
             logger.info(f"API ключ работает, баланс получен: {bool(balance)}")
         except Exception as e:
             logger.warning(f"Не удалось получить баланс - проверьте права API ключа: {e}")
@@ -82,8 +143,17 @@ async def preload():
         raise
 
 async def get_price() -> float:
-    ticker = await exchange.fetch_ticker(SYMBOL)
-    return float(ticker["last"])
+    url = f"{MEXC_BASE_URL}/v1/contract/ticker/{SYMBOL_MEXC}"
+    try:
+        response = await mexc_client.get(url, timeout=30.0)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("code") != 0:
+            raise Exception(f"Ошибка получения цены: {data.get('msg')}")
+        return float(data.get("data", {}).get("lastPrice", 0))
+    except Exception as e:
+        logger.error(f"Ошибка получения цены: {e}")
+        raise
 
 async def get_qty() -> float:
     price = await get_price()
@@ -102,67 +172,69 @@ async def open_long():
         qty = await get_qty()
         oid = f"xrp_{int(time.time()*1000)}"
 
-        await asyncio.sleep(0.25)  # required pause for MEXC
+        await asyncio.sleep(0.25)
 
         entry = await get_price()
         tp = round(entry * (1 + TP_PERCENT / 100), 4)
         sl = round(entry * (1 - SL_PERCENT / 100), 4)
 
-        # Параметры для открытия позиции (минимальный набор)
         params = {
-            "leverage": LEVERAGE,
-            "openType": 1,
-            "volSide": 1,
+            "symbol": SYMBOL_MEXC,
+            "price": "",
+            "vol": str(qty),
+            "leverage": str(LEVERAGE),
+            "side": "1",
+            "type": "1",
+            "openType": "1",
+            "positionType": "1",
+            "volSide": "1",
         }
 
         start = time.time()
 
         try:
-            order = await exchange.create_order(
-                SYMBOL,
-                "market",
-                "buy",
-                qty,
-                None,
-                params
-            )
-        except (ccxt.RequestTimeout, asyncio.TimeoutError):
+            response = await mexc_request("POST", "/v1/private/order/submit", params)
+            if response.get("code") != 0:
+                raise Exception(f"MEXC API error: {response.get('msg', 'Unknown error')}")
+            order = {"id": response.get("data", {}).get("orderId")}
+        except (httpx.TimeoutException, asyncio.TimeoutError):
             await tg_send("Таймаут MEXC, пробую ещё раз...")
             await asyncio.sleep(1)
-            order = await exchange.create_order(
-                SYMBOL,
-                "market",
-                "buy",
-                qty,
-                None,
-                params
-            )
+            response = await mexc_request("POST", "/v1/private/order/submit", params)
+            if response.get("code") != 0:
+                raise Exception(f"MEXC API error: {response.get('msg', 'Unknown error')}")
+            order = {"id": response.get("data", {}).get("orderId")}
 
         if not order or not order.get("id"):
-            raise Exception(f"MEXC не вернул ID ордера: {order}")
+            raise Exception(f"MEXC не вернул ID ордера: {response}")
 
         took = round(time.time() - start, 2)
         logger.info(f"LONG открыт: {order.get('id')} | {took}s")
 
         position_active = True
 
-        # Устанавливаем TP и SL отдельными запросами
-        await asyncio.sleep(0.2)  # небольшая пауза перед установкой TP/SL
+        await asyncio.sleep(0.2)
         
         for price, name in [(tp, "tp"), (sl, "sl")]:
             try:
-                tp_sl_order = await exchange.create_order(
-                    SYMBOL,
-                    "limit",
-                    "sell",
-                    qty,
-                    price,
-                    {"reduceOnly": True, "clientOrderId": f"{name}_{oid}"}
-                )
-                if not tp_sl_order or not tp_sl_order.get("id"):
-                    logger.warning(f"Ордер {name} не создан: {tp_sl_order}")
+                tp_sl_params = {
+                    "symbol": SYMBOL_MEXC,
+                    "price": str(price),
+                    "vol": str(qty),
+                    "leverage": str(LEVERAGE),
+                    "side": "2",
+                    "type": "2",
+                    "openType": "1",
+                    "positionType": "2",
+                    "volSide": "1",
+                    "reduceOnly": "true",
+                }
+                tp_sl_response = await mexc_request("POST", "/v1/private/order/submit", tp_sl_params)
+                if tp_sl_response.get("code") != 0:
+                    logger.warning(f"Ордер {name} не создан: {tp_sl_response.get('msg')}")
                 else:
-                    logger.info(f"Ордер {name} создан: {tp_sl_order.get('id')}")
+                    order_id = tp_sl_response.get("data", {}).get("orderId")
+                    logger.info(f"Ордер {name} создан: {order_id}")
             except Exception as e:
                 logger.warning(f"Ошибка при создании {name}: {e}")
 
@@ -189,16 +261,24 @@ async def auto_close(qty: float, oid: str):
         return
     try:
         await asyncio.sleep(0.2)
-        close_order = await exchange.create_order(
-            SYMBOL,
-            "market",
-            "sell",
-            qty,
-            None,
-            {"reduceOnly": True, "clientOrderId": f"close_{oid}", "force": "ioc"}
-        )
-        if not close_order or not close_order.get("id"):
-            raise Exception(f"Ордер закрытия не создан: {close_order}")
+        close_params = {
+            "symbol": SYMBOL_MEXC,
+            "price": "",
+            "vol": str(qty),
+            "leverage": str(LEVERAGE),
+            "side": "2",
+            "type": "1",
+            "openType": "1",
+            "positionType": "2",
+            "volSide": "1",
+            "reduceOnly": "true",
+        }
+        close_response = await mexc_request("POST", "/v1/private/order/submit", close_params)
+        if close_response.get("code") != 0:
+            raise Exception(f"Ордер закрытия не создан: {close_response.get('msg')}")
+        order_id = close_response.get("data", {}).get("orderId")
+        if not order_id:
+            raise Exception(f"Ордер закрытия не создан: {close_response}")
         await tg_send("Позиция закрыта по таймеру")
     except Exception as e:
         await tg_send(f"Ошибка автозакрытия: {e}")
@@ -221,7 +301,7 @@ async def lifespan(app: FastAPI):
         f"Реакция на сигнал: менее 1.2 сек"
     )
     yield
-    await exchange.close()
+    await mexc_client.aclose()
 
 app = FastAPI(lifespan=lifespan)
 
