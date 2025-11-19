@@ -52,7 +52,6 @@ exchange = ccxt.mexc({
         "defaultType": "swap",
         "timeout": 60000,
         "createOrder": {"timeout": 60000},
-        "force": "ioc"
     },
 })
 
