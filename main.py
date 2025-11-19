@@ -105,7 +105,7 @@ async def open_long():
         await asyncio.sleep(0.3)
 
         start = time.time()
-        await exchange.create_order(SYMBOL, 'market', 'open_long', qty, None, params)
+        await exchange.create_order(SYMBOL, 'market', 'buy', qty, None, params)
         entry = await get_price()
         took = round(time.time() - start, 2)
 
@@ -135,7 +135,7 @@ SL: <code>{sl:.4f}</code> (-{SL_PERCENT}%)
         # Если всё-таки таймаут — пробуем ещё раз
         await tg_send("Таймаут MEXC, пробую ещё раз...")
         await asyncio.sleep(1)
-        await exchange.create_order(SYMBOL, 'market', 'open_long', qty, None, params)
+        await exchange.create_order(SYMBOL, 'market', 'buy', qty, None, params)
         await tg_send("LONG открыт со второй попытки!")
 
     except Exception as e:
@@ -149,7 +149,7 @@ async def auto_close(qty: float, oid: str):
     if not position_active:
         return
     try:
-        await exchange.create_order(SYMBOL, 'market', 'close_long', qty, None, {
+        await exchange.create_order(SYMBOL, 'market', 'sell', qty, None, {
             "reduceOnly": True,
             "clientOrderId": f"close_{oid}"
         })
