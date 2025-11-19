@@ -98,13 +98,13 @@ async def open_long():
             "openType": 1,       # изолированная
             "positionType": 1,
             "volSide": 1,        # long
-            "orderType": 1,      # market
         }
 
         # Небольшая пауза — MEXC любит
         await asyncio.sleep(0.3)
 
         start = time.time()
+        logger.info(f"Создание ордера: symbol={SYMBOL}, type=market, side=buy, qty={qty}, params={params}")
         order = await exchange.create_order(SYMBOL, 'market', 'buy', qty, None, params)
         
         if not order or not order.get('id'):
