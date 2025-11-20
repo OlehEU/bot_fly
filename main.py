@@ -1,4 +1,4 @@
-# main.py — XRP Long Bot 2025 — ФИНАЛЬНАЯ РАБОЧАЯ ВЕРСИЯ
+# main.py — XRP Long Bot 2025 — ФИНАЛЬНАЯ РАБОЧАЯ ВЕРСИЯ (без ошибок)
 import os
 import time
 import hmac
@@ -21,11 +21,11 @@ for var in required:
     if not os.getenv(var):
         raise EnvironmentError(f"Отсутствует переменная: {var}")
 
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
-API_KEY          = os.getenv("BINANCE_API_KEY")
-API_SECRET       = os.getenv("BINANCE_API_SECRET")
-WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET")
+TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID  = int(os.getenv("TELEGRAM_CHAT_ID"))
+API_KEY           = os.getenv("BINANCE_API_KEY")
+API_SECRET        = os.getenv("BINANCE_API_SECRET")
+WEBHOOK_SECRET    = os.getenv("WEBHOOK_SECRET")
 
 FIXED_USD   = float(os.getenv("FIXED_AMOUNT_USD", "10"))
 LEVERAGE    = int(os.getenv("LEVERAGE", "10"))
@@ -62,7 +62,7 @@ async def binance_request(method: str, endpoint: str, params: dict | None = None
         if method == "POST":
             r = await client.post(url, data=params, headers=headers)
         else:
-            r = await client.get(url, params=params, headers=headers)  # ← params, а не data!
+            r = await client.get(url, params=params, headers=headers)  # params, а НЕ data!
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -145,7 +145,7 @@ NEW LONG XRP
         current_status = "Ошибка"
         await tg_send(f"ОШИБКА ОТКРЫТИЯ:\n<code>{e}</code>")
 
-# ====================== HTML СТРАНИЦА ======================
+# ====================== HTML СТРАНИЦА (БЕЗ ОШИБОК!) ======================
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>XRP Bot — LIVE</title>
