@@ -138,23 +138,32 @@ NEW LONG XRP
 
 # ====================== HTML ======================
 HTML_PAGE = """<!DOCTYPE html>
-<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>XRP BOT LIVE</title>
-<style>
-  body{margin:0;font-family:Segoe UI;background:linear-gradient(135deg,#0f0f23,#1a1a2e);color:#fff;height:100vh;display:flex;align-items:center;justify-content:center;}
-  .card{background:rgba(255,255,255,0.05);padding:40px;border-radius:20px;border:2px solid #00ffcc;box-shadow:0 0 30px rgba(0,255,204,0.3);text-align:center;max-width:500px;}
-  h1{font-size:3.5rem;margin:0;text-shadow:0 0 20px #00ffcc;animation:pulse 3s infinite;}
-  .price{font-size:2.8rem;margin:25px 0;}
-  .status{font-size:1.5rem;background:rgba(0,255,204,0.1);padding:15px;border-radius:15px;margin:20px 0;}
-  @keyframes pulse{0%,100%{opacity:0.7}50%{opacity:1}}
-</style></head><body>
-<div class="card">
-  <h1>XRP BOT</h1>
-  <div class="price">{price} USDT</div>
-  <div class="status">{status}</div>
-  <p>${amount} × {leverage}x | TP +{tp}%</p>
-</div>
-</body></html>"""
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>XRP BOT LIVE</title>
+    <style>
+        body {margin:0;font-family:Segoe UI;background:linear-gradient(135deg,#0f0f23,#1a1a2e);color:#fff;height:100vh;display:flex;align-items:center;justify-content:center;}
+        .card {background:rgba(255,255,255,0.05);padding:40px;border-radius:20px;border:2px solid #00ffcc;box-shadow:0 0 30px rgba(0,255,204,0.3);text-align:center;max-width:500px;}
+        h1 {font-size:3.5rem;margin:0;text-shadow:0 0 20px #00ffcc;animation:pulse 3s infinite;}
+        .price {font-size:2.8rem;margin:25px 0;color:#00ffcc;}
+        .status {font-size:1.5rem;background:rgba(0,255,204,0.1);padding:15px;border-radius:15px;margin:20px 0;}
+        .info {font-size:1.1rem;color:#aaa;}
+        @keyframes pulse {0%,100%{opacity:0.7}50%{opacity:1}}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>XRP BOT</h1>
+        <div class="price">{price} USDT</div>
+        <div class="status">{status}</div>
+        <div class="info">
+            ${amount} × {leverage}x | TP +{tp}%
+        </div>
+    </div>
+</body>
+</html>"""
 
 # ====================== FastAPI ======================
 app = FastAPI()
