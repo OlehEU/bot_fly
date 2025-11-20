@@ -253,40 +253,13 @@ ${FIXED_AMOUNT_USD} × {LEVERAGE}x | {SYMBOL}
 Entry: <code>{entry:.4f}</code>
 TP: <code>{tp:.4f}</code> (+{TP_PERCENT}%)
 SL: <code>{sl:.4f}</code> (-{SL_PERCENT}%)
-Автозакрытие через {AUTO_CLOSE_MINUTES} мин
         """.strip())
-
-        asyncio.create_task(auto_close(qty, oid))
 
     except Exception as e:
         logger.error(traceback.format_exc())
         await tg_send(f"Ошибка LONG:\n<code>{str(e)}</code>")
         position_active = False
 
-async def auto_close(qty: float, oid: str):
-    await asyncio.sleep(AUTO_CLOSE_MINUTES * 60)
-    global position_active
-    if not position_active:
-        return
-    try:
-        await asyncio.sleep(0.2)
-        close_params = {
-            "symbol": SYMBOL_BINANCE,
-            "side": "SELL",
-            "type": "MARKET",
-            "quantity": str(qty),
-            "reduceOnly": "true",
-            "newClientOrderId": f"close_{oid}",
-        }
-        close_response = await binance_request("POST", "/fapi/v1/order", close_params)
-        order_id = close_response.get("orderId")
-        if not order_id:
-            raise Exception(f"Ордер закрытия не создан: {close_response}")
-        await tg_send("Позиция закрыта по таймеру")
-    except Exception as e:
-        await tg_send(f"Ошибка автозакрытия: {e}")
-    finally:
-        position_active = False
 
 # ====================== LIFESPAN ======================
 @asynccontextmanager
