@@ -202,7 +202,6 @@ async def open_long():
             "side": "BUY",
             "type": "MARKET",
             "quantity": str(qty),
-            "positionSide": "LONG",
             "newClientOrderId": oid,
         }
 
@@ -235,7 +234,6 @@ async def open_long():
                     "side": "SELL",
                     "type": "TAKE_PROFIT_MARKET" if name == "tp" else "STOP_MARKET",
                     "quantity": str(qty),
-                    "positionSide": "LONG",
                     "stopPrice": str(price),
                     "reduceOnly": "true",
                     "newClientOrderId": f"{name}_{oid}",
@@ -277,7 +275,6 @@ async def auto_close(qty: float, oid: str):
             "side": "SELL",
             "type": "MARKET",
             "quantity": str(qty),
-            "positionSide": "LONG",
             "reduceOnly": "true",
             "newClientOrderId": f"close_{oid}",
         }
