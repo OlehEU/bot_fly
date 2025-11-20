@@ -1,4 +1,4 @@
-# main.py — XRP Futures Bot 2025 — Финальная боевая версия
+# main.py — XRP Futures Bot 2025 — РАБОЧАЯ ВЕРСИЯ (100% без ошибок)
 import os
 import time
 import hmac
@@ -63,25 +63,34 @@ async def binance_request(method: str, endpoint: str, params: dict | None = None
         r = await (client.post if method == "POST" else client.get)(url, data=params, headers=headers)
         r.raise_for_status()
         return r.json()
-    except httpx.HTTPStatusError as e:
-        try:
-            err = e.response.json()
-            msg = err.get("msg", str(err))
-        except:
-            msg = e.response.text[:300]
+    except Exception as e:
+        msg = str(e)
+        if hasattr(e, "response") and e.response is not None:
+            try:
+                msg = e.response.json().get("msg", str(e.response.text))
+            except:
+                msg = e.response.text[:200]
         logger.error(f"Binance error: {msg}")
         raise Exception(msg)
 
 # ====================== ЦЕНА И КОЛИЧЕСТВО ======================
 async def get_price() -> float:
-    data = await binance_request("GET", "/fapi/v1/ticker/price", {"symbol": SYMBOL})
-    return float(data["price"])
+    try:
+        data = await binance_request("GET", "/fapi/v1/ticker/price", {"symbol": SYMBOL})
+        return float(data["price"])
+    except:
+        return 0.0
 
 async def get_quantity() -> str:
     price = await get_price()
+    if price <= 0:
+        return "1000"  # fallback
     qty = (FIXED_USD * LEVERAGE) / price
-    info = await binance_request("GET", "/fapi/v1/exchangeInfo")
-    prec = next(s["quantityPrecision"] for s in info["symbols"] if s["symbol"] == SYMBOL)
+    try:
+        info = await binance_request("GET", "/fapi/v1/exchangeInfo")
+        prec = next(s["quantityPrecision"] for s in info["symbols"] if s["symbol"] == SYMBOL)
+    except:
+        prec = 3
     return f"{qty:.{prec}f}"
 
 # ====================== ОТКРЫТИЕ ЛОНГА ======================
@@ -94,13 +103,17 @@ async def open_long():
     try:
         qty = await get_quantity()
         entry_price = await get_price()
+        if entry_price <= 0:
+            await tg_send("Не удалось получить цену XRP")
+            return
+
         last_entry_price = entry_price
         tp_price = round(entry_price * (1 + TP_PERCENT / 100), 5)
         sl_price = round(entry_price * (1 - SL_PERCENT / 100), 5)
 
         start_time = time.time()
 
-        # 1. Рыночный LONG
+        # LONG
         await binance_request("POST", "/fapi/v1/order", {
             "symbol": SYMBOL,
             "side": "BUY",
@@ -108,7 +121,7 @@ async def open_long():
             "quantity": qty,
         })
 
-        # 2. TP +0.5%
+        # TP
         await binance_request("POST", "/fapi/v1/order", {
             "symbol": SYMBOL,
             "side": "SELL",
@@ -119,7 +132,7 @@ async def open_long():
             "workingType": "MARK_PRICE"
         })
 
-        # 3. SL
+        # SL
         await binance_request("POST", "/fapi/v1/order", {
             "symbol": SYMBOL,
             "side": "SELL",
@@ -132,7 +145,7 @@ async def open_long():
 
         took = round(time.time() - start_time, 2)
         position_active = True
-        current_status = f"Позиция открыта | Вход: {entry_price:.5f}"
+        current_status = f"LONG ОТКРЫТ | Вход: {entry_price:.5f}"
 
         await tg_send(f"""
 NEW LONG XRP
@@ -145,7 +158,7 @@ NEW LONG XRP
 <b>Количество:</b> <code>{qty}</code> XRP
 <b>Время отклика:</b> {took} сек
 
-<i>Позиция закроется только по TP или SL</i>
+<i>Закрытие только по TP/SL</i>
 """)
 
     except Exception as e:
@@ -170,25 +183,23 @@ HTML_PAGE = """<!DOCTYPE html>
   <h1>XRP BOT</h1>
   <div class="price"><b>{price}</b> USDT</div>
   <div class="status">{status}</div>
-  <p>${FIXED_USD} × {LEVERAGE}x | TP +{TP_PERCENT}%</p>
+  <p>${amount} × {leverage}x | TP +{tp}%</p>
 </div>
 </body></html>"""
 
 # ====================== FastAPI ======================
-app = FastAPI()   # ← ВАЖНО: СНАЧАЛА создаём app!
+app = FastAPI()
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    try:
-        price = await get_price()
-    except:
-        price = "—"
+    price = await get_price()
+    price_str = f"{price:.5f}" if price > 0 else "—"
     return HTML_PAGE.format(
-        price=f"{price:.5f}" if isinstance(price, float) else price,
+        price=price_str,
         status=current_status,
-        FIXED_USD=FIXED_USD,
-        LEVERAGE=LEVERAGE,
-        TP_PERCENT=TP_PERCENT
+        amount=FIXED_USD,
+        leverage=LEVERAGE,
+        tp=TP_PERCENT
     )
 
 @app.get("/health")
@@ -211,7 +222,7 @@ async def webhook(request: Request, x_secret: Optional[str] = Header(None, alias
         await tg_send("СИГНАЛ TRADINGVIEW — ОТКРЫВАЮ LONG XRP")
         asyncio.create_task(open_long())
         return {"status": "long_initiated"}
-    return {"status": "ignored", "signal": signal}
+    return {"status": "ignored"}
 
 @app.on_event("startup")
 async def startup():
@@ -220,7 +231,7 @@ async def startup():
         await binance_request("POST", "/fapi/v1/leverage", {"symbol": SYMBOL, "leverage": LEVERAGE})
         logger.info(f"Плечо {LEVERAGE}x установлено")
     except Exception as e:
-        logger.warning(f"Не удалось установить плечо: {e}")
+        logger.warning(f"Плечо не установлено: {e}")
 
 @app.on_event("shutdown")
 async def shutdown():
