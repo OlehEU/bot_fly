@@ -1,4 +1,4 @@
-# main.py — XRP Long Bot 2025 — ФИНАЛЬНАЯ РАБОЧАЯ ВЕРСИЯ (без ошибок)
+# main.py — XRP Long Bot 2025 — ГОТОВ К DEPLOY НА FLY.IO
 import os
 import time
 import hmac
@@ -21,11 +21,11 @@ for var in required:
     if not os.getenv(var):
         raise EnvironmentError(f"Отсутствует переменная: {var}")
 
-TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID  = int(os.getenv("TELEGRAM_CHAT_ID"))
-API_KEY           = os.getenv("BINANCE_API_KEY")
-API_SECRET        = os.getenv("BINANCE_API_SECRET")
-WEBHOOK_SECRET    = os.getenv("WEBHOOK_SECRET")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
+API_KEY          = os.getenv("BINANCE_API_KEY")
+API_SECRET       = os.getenv("BINANCE_API_SECRET")
+WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET")
 
 FIXED_USD   = float(os.getenv("FIXED_AMOUNT_USD", "10"))
 LEVERAGE    = int(os.getenv("LEVERAGE", "10"))
@@ -62,7 +62,7 @@ async def binance_request(method: str, endpoint: str, params: dict | None = None
         if method == "POST":
             r = await client.post(url, data=params, headers=headers)
         else:
-            r = await client.get(url, params=params, headers=headers)  # params, а НЕ data!
+            r = await client.get(url, params=params, headers=headers)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -75,7 +75,7 @@ async def binance_request(method: str, endpoint: str, params: dict | None = None
         logger.error(f"Binance error: {msg}")
         raise Exception(msg)
 
-# ====================== ЦЕНА ======================
+# ====================== ЦЕНА И КОЛ-ВО ======================
 async def get_price() -> float:
     try:
         data = await binance_request("GET", "/fapi/v1/ticker/price", {"symbol": SYMBOL})
@@ -99,42 +99,33 @@ async def get_quantity() -> str:
 async def open_long():
     global position_active, current_status
     if position_active:
-        await tg_send("Позиция уже открыта! Дубли отклонены.")
+        await tg_send("Позиция уже открыта!")
         return
 
     try:
         qty = await get_quantity()
-        entry_price = await get_price()
-        if entry_price <= 0:
+        entry = await get_price()
+        if entry <= 0:
             await tg_send("Не удалось получить цену XRP")
             return
 
-        tp_price = round(entry_price * (1 + TP_PERCENT / 100), 5)
-        sl_price = round(entry_price * (1 - SL_PERCENT / 100), 5)
+        tp_price = round(entry * (1 + TP_PERCENT / 100), 5)
+        sl_price = round(entry * (1 - SL_PERCENT / 100), 5)
+        start = time.time()
 
-        start_time = time.time()
+        await binance_request("POST", "/fapi/v1/order", {"symbol": SYMBOL, "side": "BUY", "type": "MARKET", "quantity": qty})
+        await binance_request("POST", "/fapi/v1/order", {"symbol": SYMBOL, "side": "SELL", "type": "TAKE_PROFIT_MARKET", "quantity": qty, "stopPrice": f"{tp_price:.5f}", "reduceOnly": "true", "workingType": "MARK_PRICE"})
+        await binance_request("POST", "/fapi/v1/order", {"symbol": SYMBOL, "side": "SELL", "type": "STOP_MARKET", "quantity": qty, "stopPrice": f"{sl_price:.5f}", "reduceOnly": "true", "workingType": "MARK_PRICE"})
 
-        await binance_request("POST", "/fapi/v1/order", {
-            "symbol": SYMBOL, "side": "BUY", "type": "MARKET", "quantity": qty
-        })
-        await binance_request("POST", "/fapi/v1/order", {
-            "symbol": SYMBOL, "side": "SELL", "type": "TAKE_PROFIT_MARKET",
-            "quantity": qty, "stopPrice": f"{tp_price:.5f}", "reduceOnly": "true", "workingType": "MARK_PRICE"
-        })
-        await binance_request("POST", "/fapi/v1/order", {
-            "symbol": SYMBOL, "side": "SELL", "type": "STOP_MARKET",
-            "quantity": qty, "stopPrice": f"{sl_price:.5f}", "reduceOnly": "true", "workingType": "MARK_PRICE"
-        })
-
-        took = round(time.time() - start_time, 2)
+        took = round(time.time() - start, 2)
         position_active = True
-        current_status = f"LONG | Вход {entry_price:.5f}"
+        current_status = f"LONG | Вход {entry:.5f}"
 
         await tg_send(f"""
 NEW LONG XRP
 
 <b>Сумма:</b> ${FIXED_USD} × {LEVERAGE}x
-<b>Вход:</b> <code>{entry_price:.5f}</code>
+<b>Вход:</b> <code>{entry:.5f}</code>
 <b>TP +{TP_PERCENT}%:</b> <code>{tp_price:.5f}</code>
 <b>SL -{SL_PERCENT}%:</b> <code>{sl_price:.5f}</code>
 <b>Кол-во:</b> <code>{qty}</code> XRP
@@ -145,16 +136,16 @@ NEW LONG XRP
         current_status = "Ошибка"
         await tg_send(f"ОШИБКА ОТКРЫТИЯ:\n<code>{e}</code>")
 
-# ====================== HTML СТРАНИЦА (БЕЗ ОШИБОК!) ======================
+# ====================== HTML ======================
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>XRP Bot — LIVE</title>
+<title>XRP BOT LIVE</title>
 <style>
-  body {margin:0;font-family:Segoe UI;background:linear-gradient(135deg,#0f0f23,#1a1a2e);color:#fff;height:100vh;display:flex;align-items:center;justify-content:center;}
-  .card {background:rgba(255,255,255,0.05);padding:40px;border-radius:20px;border:2px solid #00ffcc;box-shadow:0 0 30px rgba(0,255,204,0.3);text-align:center;max-width:500px;}
-  h1 {font-size:3.5rem;margin:0;text-shadow:0 0 20px #00ffcc;animation:pulse 3s infinite;}
-  .price {font-size:2.8rem;margin:25px 0;}
-  .status {font-size:1.5rem;background:rgba(0,255,204,0.1);padding:15px;border-radius:15px;margin:20px 0;}
+  body{margin:0;font-family:Segoe UI;background:linear-gradient(135deg,#0f0f23,#1a1a2e);color:#fff;height:100vh;display:flex;align-items:center;justify-content:center;}
+  .card{background:rgba(255,255,255,0.05);padding:40px;border-radius:20px;border:2px solid #00ffcc;box-shadow:0 0 30px rgba(0,255,204,0.3);text-align:center;max-width:500px;}
+  h1{font-size:3.5rem;margin:0;text-shadow:0 0 20px #00ffcc;animation:pulse 3s infinite;}
+  .price{font-size:2.8rem;margin:25px 0;}
+  .status{font-size:1.5rem;background:rgba(0,255,204,0.1);padding:15px;border-radius:15px;margin:20px 0;}
   @keyframes pulse{0%,100%{opacity:0.7}50%{opacity:1}}
 </style></head><body>
 <div class="card">
@@ -182,33 +173,31 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "bot": "XRP alive", "time": int(time.time())}
+    return {"status": "ok", "bot": "alive"}
 
 @app.post("/webhook")
 async def webhook(request: Request, x_secret: Optional[str] = Header(None, alias="X-Webhook-Secret")):
     if x_secret != WEBHOOK_SECRET:
         raise HTTPException(403, "Forbidden")
-
     try:
         payload = await request.json()
         signal = payload.get("signal", "").lower()
     except:
-        signal = (await request.body()).decode().strip().lower()
-
-    if signal in ["obuy", "buy", "long", "go", "лонг", "вход"]:
-        await tg_send("СИГНАЛ TRADINGVIEW — ОТКРЫВАЮ LONG XRP")
+        signal = (await request.body()).decode().lower()
+    if signal in ["buy", "long", "obuy", "go", "лонг", "вход"]:
+        await tg_send("СИГНАЛ — ОТКРЫВАЮ LONG XRP")
         asyncio.create_task(open_long())
         return {"status": "long_initiated"}
     return {"status": "ignored"}
 
 @app.on_event("startup")
 async def startup():
-    await tg_send("XRP BOT ЗАПУЩЕН И ГОТОВ К ТОРГОВЛЕ")
+    await tg_send("XRP BOT ЗАПУЩЕН И РАБОТАЕТ")
     try:
         await binance_request("POST", "/fapi/v1/leverage", {"symbol": SYMBOL, "leverage": LEVERAGE})
         logger.info(f"Плечо {LEVERAGE}x установлено")
     except Exception as e:
-        logger.warning(f"Не удалось установить плечо: {e}")
+        logger.warning(f"Плечо не установлено: {e}")
 
 @app.on_event("shutdown")
 async def shutdown():
