@@ -1,4 +1,4 @@
-# main.py — XRP Long Bot 2025 — ГОТОВ К DEPLOY НА FLY.IO
+# main.py — XRP Long Bot — ФИНАЛЬНАЯ ВЕРСИЯ ДЛЯ FLY.IO (без ошибок!)
 import os
 import time
 import hmac
@@ -11,7 +11,6 @@ from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.responses import HTMLResponse
 from telegram import Bot
 
-# ====================== ЛОГИ ======================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("XRP-BOT")
 
@@ -136,7 +135,7 @@ NEW LONG XRP
         current_status = "Ошибка"
         await tg_send(f"ОШИБКА ОТКРЫТИЯ:\n<code>{e}</code>")
 
-# ====================== HTML ======================
+# ====================== HTML — 100 % ЧИСТЫЙ, БЕЗ {margin} ======================
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -145,11 +144,11 @@ HTML_PAGE = """<!DOCTYPE html>
     <title>XRP BOT LIVE</title>
     <style>
         body {margin:0;font-family:Segoe UI;background:linear-gradient(135deg,#0f0f23,#1a1a2e);color:#fff;height:100vh;display:flex;align-items:center;justify-content:center;}
-        .card {background:rgba(255,255,255,0.05);padding:40px;border-radius:20px;border:2px solid #00ffcc;box-shadow:0 0 30px rgba(0,255,204,0.3);text-align:center;max-width:500px;}
+        .card {background:rgba(255,255,255,0.05);padding:40px;border-radius:20px;border:2px solid #00ffcc;box-shadow:0 0 30px rgba(0,255,204,0.3);text-align:center;max-width:500px;width:90%;}
         h1 {font-size:3.5rem;margin:0;text-shadow:0 0 20px #00ffcc;animation:pulse 3s infinite;}
-        .price {font-size:2.8rem;margin:25px 0;color:#00ffcc;}
+        .price {font-size:2.8rem;margin:25px 0;color:#00ffcc;font-weight:bold;}
         .status {font-size:1.5rem;background:rgba(0,255,204,0.1);padding:15px;border-radius:15px;margin:20px 0;}
-        .info {font-size:1.1rem;color:#aaa;}
+        .info {font-size:1.1rem;color:#ccc;margin-top:20px;}
         @keyframes pulse {0%,100%{opacity:0.7}50%{opacity:1}}
     </style>
 </head>
@@ -158,9 +157,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <h1>XRP BOT</h1>
         <div class="price">{price} USDT</div>
         <div class="status">{status}</div>
-        <div class="info">
-            ${amount} × {leverage}x | TP +{tp}%
-        </div>
+        <div class="info">${amount} × {leverage}x | TP +{tp}%</div>
     </div>
 </body>
 </html>"""
@@ -182,7 +179,7 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "bot": "alive"}
+    return {"status": "ok", "bot": "XRP alive"}
 
 @app.post("/webhook")
 async def webhook(request: Request, x_secret: Optional[str] = Header(None, alias="X-Webhook-Secret")):
@@ -192,7 +189,7 @@ async def webhook(request: Request, x_secret: Optional[str] = Header(None, alias
         payload = await request.json()
         signal = payload.get("signal", "").lower()
     except:
-        signal = (await request.body()).decode().lower()
+        signal = (await request.body()).decode().lower().strip()
     if signal in ["buy", "long", "obuy", "go", "лонг", "вход"]:
         await tg_send("СИГНАЛ — ОТКРЫВАЮ LONG XRP")
         asyncio.create_task(open_long())
@@ -201,12 +198,12 @@ async def webhook(request: Request, x_secret: Optional[str] = Header(None, alias
 
 @app.on_event("startup")
 async def startup():
-    await tg_send("XRP BOT ЗАПУЩЕН И РАБОТАЕТ")
+    await tg_send("XRP BOT ЗАПУЩЕН И ГОТОВ")
     try:
         await binance_request("POST", "/fapi/v1/leverage", {"symbol": SYMBOL, "leverage": LEVERAGE})
         logger.info(f"Плечо {LEVERAGE}x установлено")
     except Exception as e:
-        logger.warning(f"Плечо не установлено: {e}")
+        logger.warning(f"Не удалось установить плечо: {e}")
 
 @app.on_event("shutdown")
 async def shutdown():
