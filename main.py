@@ -57,18 +57,18 @@ position_active = False
 binance_client = httpx.AsyncClient(timeout=60.0)
 
 def _create_signature(params: Dict[str, Any], secret: str) -> str:
-    query_parts = []
-    for k, v in sorted(params.items()):
+    normalized = {}
+    for k, v in params.items():
         if v is None:
             continue
         if isinstance(v, bool):
-            v = str(v).lower()
-        elif isinstance(v, float):
-            v = str(v)
-        elif not isinstance(v, str):
-            v = str(v)
-        query_parts.append(f"{k}={v}")
-    query_string = "&".join(query_parts)
+            normalized[k] = str(v).lower()
+        elif isinstance(v, (int, float)):
+            normalized[k] = str(v)
+        else:
+            normalized[k] = str(v)
+    
+    query_string = urllib.parse.urlencode(sorted(normalized.items()))
     signature = hmac.new(
         secret.encode('utf-8'),
         query_string.encode('utf-8'),
