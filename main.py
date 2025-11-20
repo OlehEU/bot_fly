@@ -1,16 +1,11 @@
 # main.py — BINANCE XRP BOT — УЛЬТРА-НАДЁЖНЫЙ, УЛЬТРА-БЫСТРЫЙ, БЕЗ ТАЙМАУТОВ
 import os
-import math
 import time
 import logging
 import asyncio
 import traceback
-import hmac
-import hashlib
-import urllib.parse
-from typing import Dict, Any, Optional
 
-import httpx
+import ccxt
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from telegram import Bot
@@ -46,119 +41,38 @@ async def tg_send(text: str):
     except Exception as e:
         logger.error(f"Telegram error: {e}")
 
-BINANCE_BASE_URL = "https://fapi.binance.com"
-SYMBOL_BINANCE = f"{BASE_COIN.upper()}USDT"
 SYMBOL = f"{BASE_COIN.upper()}/USDT:USDT"
 MARKET = None
-MIN_QTY = 0.0
-QTY_PRECISION = 3
 position_active = False
 
-binance_client = httpx.AsyncClient(timeout=60.0)
-
-def _create_signature(params: Dict[str, Any], secret: str) -> str:
-    normalized = {}
-    for k, v in params.items():
-        if v is None:
-            continue
-        if isinstance(v, bool):
-            normalized[k] = str(v).lower()
-        elif isinstance(v, (int, float)):
-            normalized[k] = str(v)
-        else:
-            normalized[k] = str(v)
-    
-    query_string = urllib.parse.urlencode(sorted(normalized.items()))
-    signature = hmac.new(
-        secret.encode('utf-8'),
-        query_string.encode('utf-8'),
-        hashlib.sha256
-    ).hexdigest()
-    return signature
-
-async def binance_request(method: str, endpoint: str, params: Optional[Dict[str, Any]] = None, signed: bool = True) -> Dict[str, Any]:
-    url = f"{BINANCE_BASE_URL}{endpoint}"
-    params = params or {}
-    
-    if signed:
-        params["timestamp"] = int(time.time() * 1000)
-        signature = _create_signature(params, BINANCE_API_SECRET)
-        params["signature"] = signature
-    
-    headers = {
-        "X-MBX-APIKEY": BINANCE_API_KEY,
-    }
-    
-    try:
-        logger.info(f"Binance {method} {url} с параметрами: {params}")
-        if method == "GET":
-            response = await binance_client.get(url, params=params, headers=headers, timeout=60.0)
-        else:
-            response = await binance_client.post(url, params=params, headers=headers, timeout=60.0)
-        
-        response.raise_for_status()
-        return response.json()
-    except httpx.HTTPStatusError as e:
-        try:
-            error_data = e.response.json()
-            error_msg = error_data.get("msg", str(error_data))
-            logger.error(f"Binance API error: {e.response.status_code} - {error_msg}")
-            raise Exception(f"Binance API error: {error_msg}")
-        except:
-            error_text = e.response.text if hasattr(e.response, 'text') else str(e.response.content)
-            logger.error(f"Binance API error: {e.response.status_code} - {error_text}")
-            raise Exception(f"Binance API error: {e.response.status_code} - {error_text}")
-    except httpx.TimeoutException as e:
-        logger.error(f"Binance API timeout: {e}")
-        raise
-    except Exception as e:
-        logger.error(f"Binance request error: {e}")
-        raise
+exchange = ccxt.binance({
+    "apiKey": BINANCE_API_KEY,
+    "secret": BINANCE_API_SECRET,
+    "enableRateLimit": False,
+    "timeout": 60000,
+    "options": {
+        "defaultType": "future",
+        "leverage": LEVERAGE,
+    },
+})
 
 async def preload():
-    global MARKET, MIN_QTY, QTY_PRECISION
+    global MARKET
     try:
-        try:
-            exchange_info = await binance_request("GET", "/fapi/v1/exchangeInfo", signed=False)
-            symbol_info = None
-            for s in exchange_info.get("symbols", []):
-                if s.get("symbol") == SYMBOL_BINANCE:
-                    symbol_info = s
-                    break
-            
-            if symbol_info:
-                for f in symbol_info.get("filters", []):
-                    if f.get("filterType") == "LOT_SIZE":
-                        MIN_QTY = float(f.get("minQty", 0))
-                    elif f.get("filterType") == "PRICE_FILTER":
-                        price_precision = len(str(f.get("tickSize", "0.01")).split(".")[-1].rstrip("0"))
-                QTY_PRECISION = symbol_info.get("quantityPrecision", 3)
-            else:
-                MIN_QTY = 0.0
-                QTY_PRECISION = 3
-        except:
-            MIN_QTY = 0.0
-            QTY_PRECISION = 3
-        
-        MARKET = {
-            "limits": {
-                "amount": {
-                    "min": MIN_QTY
-                }
-            }
-        }
+        await exchange.load_markets()
+        MARKET = exchange.market(SYMBOL)
         
         try:
-            await binance_request("POST", "/fapi/v1/leverage", {"symbol": SYMBOL_BINANCE, "leverage": str(LEVERAGE)})
+            await exchange.set_leverage(LEVERAGE, SYMBOL)
             logger.info(f"Плечо установлено: {LEVERAGE}x")
         except Exception as e:
             logger.warning(f"Не удалось установить плечо: {e}")
         
-        logger.info(f"Preload завершён: {SYMBOL} | min_qty={MIN_QTY} | qty_precision={QTY_PRECISION}")
+        logger.info(f"Preload завершён: {SYMBOL} | min_qty={MARKET['limits']['amount']['min']}")
         
         try:
-            account = await binance_request("GET", "/fapi/v2/account")
-            logger.info(f"API ключ работает, баланс получен: {bool(account)}")
+            balance = await exchange.fetch_balance()
+            logger.info(f"API ключ работает, баланс получен: {bool(balance)}")
         except Exception as e:
             logger.warning(f"Не удалось получить баланс - проверьте права API ключа: {e}")
     except Exception as e:
@@ -167,8 +81,8 @@ async def preload():
 
 async def get_price() -> float:
     try:
-        data = await binance_request("GET", "/fapi/v1/ticker/price", {"symbol": SYMBOL_BINANCE}, signed=False)
-        return float(data.get("price", 0))
+        ticker = await exchange.fetch_ticker(SYMBOL)
+        return float(ticker['last'])
     except Exception as e:
         logger.error(f"Ошибка получения цены: {e}")
         raise
@@ -176,9 +90,9 @@ async def get_price() -> float:
 async def get_qty() -> float:
     price = await get_price()
     raw_qty = (FIXED_AMOUNT_USD * LEVERAGE) / price
-    qty = round(raw_qty, QTY_PRECISION)
+    qty = exchange.amount_to_precision(SYMBOL, raw_qty)
     min_qty = MARKET['limits']['amount']['min'] or 0
-    return max(qty, min_qty)
+    return max(float(qty), min_qty)
 
 async def open_long():
     global position_active
@@ -197,10 +111,6 @@ async def open_long():
         sl = round(entry * (1 - SL_PERCENT / 100), 4)
 
         params = {
-            "symbol": SYMBOL_BINANCE,
-            "side": "BUY",
-            "type": "MARKET",
-            "quantity": str(qty),
             "positionSide": "LONG",
             "newClientOrderId": oid,
         }
@@ -208,17 +118,15 @@ async def open_long():
         start = time.time()
 
         try:
-            logger.info(f"Создаю ордер: {params}")
-            response = await binance_request("POST", "/fapi/v1/order", params)
-            order = {"id": response.get("orderId")}
-        except (httpx.TimeoutException, asyncio.TimeoutError):
+            logger.info(f"Создаю ордер: {SYMBOL}, market, buy, {qty}")
+            order = await exchange.create_order(SYMBOL, 'market', 'buy', qty, None, params)
+        except (ccxt.RequestTimeout, asyncio.TimeoutError):
             await tg_send("Таймаут Binance, пробую ещё раз...")
             await asyncio.sleep(1)
-            response = await binance_request("POST", "/fapi/v1/order", params)
-            order = {"id": response.get("orderId")}
+            order = await exchange.create_order(SYMBOL, 'market', 'buy', qty, None, params)
 
-        if not order or not order.get("id"):
-            raise Exception(f"Binance не вернул ID ордера: {response}")
+        if not order or not order.get('id'):
+            raise Exception(f"Binance не вернул ID ордера: {order}")
 
         took = round(time.time() - start, 2)
         logger.info(f"LONG открыт: {order.get('id')} | {took}s")
@@ -230,21 +138,19 @@ async def open_long():
         for price, name in [(tp, "tp"), (sl, "sl")]:
             try:
                 tp_sl_params = {
-                    "symbol": SYMBOL_BINANCE,
-                    "side": "SELL",
-                    "type": "TAKE_PROFIT_MARKET" if name == "tp" else "STOP_MARKET",
-                    "quantity": str(qty),
                     "positionSide": "LONG",
-                    "stopPrice": str(price),
-                    "reduceOnly": "true",
+                    "stopPrice": price,
+                    "reduceOnly": True,
                     "newClientOrderId": f"{name}_{oid}",
                 }
-                tp_sl_response = await binance_request("POST", "/fapi/v1/order", tp_sl_params)
-                if "orderId" in tp_sl_response:
-                    order_id = tp_sl_response.get("orderId")
-                    logger.info(f"Ордер {name} создан: {order_id}")
+                if name == "tp":
+                    tp_sl_order = await exchange.create_order(SYMBOL, 'TAKE_PROFIT_MARKET', 'sell', qty, None, tp_sl_params)
                 else:
-                    logger.warning(f"Ордер {name} не создан: {tp_sl_response}")
+                    tp_sl_order = await exchange.create_order(SYMBOL, 'STOP_MARKET', 'sell', qty, None, tp_sl_params)
+                if tp_sl_order and tp_sl_order.get('id'):
+                    logger.info(f"Ордер {name} создан: {tp_sl_order.get('id')}")
+                else:
+                    logger.warning(f"Ордер {name} не создан: {tp_sl_order}")
             except Exception as e:
                 logger.warning(f"Ошибка при создании {name}: {e}")
 
@@ -272,18 +178,13 @@ async def auto_close(qty: float, oid: str):
     try:
         await asyncio.sleep(0.2)
         close_params = {
-            "symbol": SYMBOL_BINANCE,
-            "side": "SELL",
-            "type": "MARKET",
-            "quantity": str(qty),
             "positionSide": "LONG",
-            "reduceOnly": "true",
+            "reduceOnly": True,
             "newClientOrderId": f"close_{oid}",
         }
-        close_response = await binance_request("POST", "/fapi/v1/order", close_params)
-        order_id = close_response.get("orderId")
-        if not order_id:
-            raise Exception(f"Ордер закрытия не создан: {close_response}")
+        close_order = await exchange.create_order(SYMBOL, 'market', 'sell', qty, None, close_params)
+        if not close_order or not close_order.get('id'):
+            raise Exception(f"Ордер закрытия не создан: {close_order}")
         await tg_send("Позиция закрыта по таймеру")
     except Exception as e:
         await tg_send(f"Ошибка автозакрытия: {e}")
@@ -306,7 +207,6 @@ async def lifespan(app: FastAPI):
         f"Реакция на сигнал: менее 1.2 сек"
     )
     yield
-    await binance_client.aclose()
 
 app = FastAPI(lifespan=lifespan)
 
