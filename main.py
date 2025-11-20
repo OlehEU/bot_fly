@@ -67,14 +67,15 @@ def _create_signature(params: Dict[str, Any], secret: str) -> str:
             normalized[k] = str(v)
         else:
             normalized[k] = str(v)
-    
-    query_string = urllib.parse.urlencode(sorted(normalized.items()))
-    signature = hmac.new(
+
+    query_string = urllib.parse.urlencode(normalized)
+
+    return hmac.new(
         secret.encode('utf-8'),
         query_string.encode('utf-8'),
         hashlib.sha256
     ).hexdigest()
-    return signature
+
 
 async def binance_request(method: str, endpoint: str, params: Optional[Dict[str, Any]] = None, signed: bool = True) -> Dict[str, Any]:
     url = f"{BINANCE_BASE_URL}{endpoint}"
