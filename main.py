@@ -57,7 +57,18 @@ position_active = False
 binance_client = httpx.AsyncClient(timeout=60.0)
 
 def _create_signature(params: Dict[str, Any], secret: str) -> str:
-    query_string = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
+    query_parts = []
+    for k, v in sorted(params.items()):
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            v = str(v).lower()
+        elif isinstance(v, float):
+            v = str(v)
+        elif not isinstance(v, str):
+            v = str(v)
+        query_parts.append(f"{k}={v}")
+    query_string = "&".join(query_parts)
     signature = hmac.new(
         secret.encode('utf-8'),
         query_string.encode('utf-8'),
@@ -71,7 +82,6 @@ async def binance_request(method: str, endpoint: str, params: Optional[Dict[str,
     
     if signed:
         params["timestamp"] = int(time.time() * 1000)
-        query_string = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
         signature = _create_signature(params, BINANCE_API_SECRET)
         params["signature"] = signature
     
@@ -139,7 +149,7 @@ async def preload():
         }
         
         try:
-            await binance_request("POST", "/fapi/v1/leverage", {"symbol": SYMBOL_BINANCE, "leverage": LEVERAGE})
+            await binance_request("POST", "/fapi/v1/leverage", {"symbol": SYMBOL_BINANCE, "leverage": str(LEVERAGE)})
             logger.info(f"Плечо установлено: {LEVERAGE}x")
         except Exception as e:
             logger.warning(f"Не удалось установить плечо: {e}")
@@ -190,7 +200,7 @@ async def open_long():
             "symbol": SYMBOL_BINANCE,
             "side": "BUY",
             "type": "MARKET",
-            "quantity": qty,
+            "quantity": str(qty),
             "positionSide": "LONG",
             "newClientOrderId": oid,
         }
@@ -223,9 +233,9 @@ async def open_long():
                     "symbol": SYMBOL_BINANCE,
                     "side": "SELL",
                     "type": "TAKE_PROFIT_MARKET" if name == "tp" else "STOP_MARKET",
-                    "quantity": qty,
+                    "quantity": str(qty),
                     "positionSide": "LONG",
-                    "stopPrice": price,
+                    "stopPrice": str(price),
                     "reduceOnly": "true",
                     "newClientOrderId": f"{name}_{oid}",
                 }
@@ -265,7 +275,7 @@ async def auto_close(qty: float, oid: str):
             "symbol": SYMBOL_BINANCE,
             "side": "SELL",
             "type": "MARKET",
-            "quantity": qty,
+            "quantity": str(qty),
             "positionSide": "LONG",
             "reduceOnly": "true",
             "newClientOrderId": f"close_{oid}",
