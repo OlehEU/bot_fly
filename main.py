@@ -1,4 +1,4 @@
-# main.py — XRP Futures Bot 2025 — УЛЬТРА-БЫСТРЫЙ, КРАСИВЫЙ, НАДЁЖНЫЙ
+# main.py — XRP Futures Bot 2025 — Финальная боевая версия
 import os
 import time
 import hmac
@@ -68,7 +68,7 @@ async def binance_request(method: str, endpoint: str, params: dict | None = None
             err = e.response.json()
             msg = err.get("msg", str(err))
         except:
-            msg = e.response.text[:200]
+            msg = e.response.text[:300]
         logger.error(f"Binance error: {msg}")
         raise Exception(msg)
 
@@ -145,7 +145,7 @@ NEW LONG XRP
 <b>Количество:</b> <code>{qty}</code> XRP
 <b>Время отклика:</b> {took} сек
 
-<i>Позиция будет закрыта только по TP/SL</i>
+<i>Позиция закроется только по TP или SL</i>
 """)
 
     except Exception as e:
@@ -174,6 +174,9 @@ HTML_PAGE = """<!DOCTYPE html>
 </div>
 </body></html>"""
 
+# ====================== FastAPI ======================
+app = FastAPI()   # ← ВАЖНО: СНАЧАЛА создаём app!
+
 @app.get("/", response_class=HTMLResponse)
 async def root():
     try:
@@ -190,9 +193,8 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "bot": "XRP alive"}
+    return {"status": "ok", "bot": "XRP alive", "time": int(time.time())}
 
-# ====================== ВЕБХУК ======================
 @app.post("/webhook")
 async def webhook(request: Request, x_secret: Optional[str] = Header(None, alias="X-Webhook-Secret")):
     if x_secret != WEBHOOK_SECRET:
@@ -211,18 +213,15 @@ async def webhook(request: Request, x_secret: Optional[str] = Header(None, alias
         return {"status": "long_initiated"}
     return {"status": "ignored", "signal": signal}
 
-# ====================== СТАРТ ======================
 @app.on_event("startup")
 async def startup():
     await tg_send("XRP BOT ЗАПУЩЕН И ГОТОВ К ТОРГОВЛЕ")
     try:
         await binance_request("POST", "/fapi/v1/leverage", {"symbol": SYMBOL, "leverage": LEVERAGE})
         logger.info(f"Плечо {LEVERAGE}x установлено")
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Не удалось установить плечо: {e}")
 
 @app.on_event("shutdown")
 async def shutdown():
     await client.aclose()
-
-app = FastAPI()
