@@ -40,7 +40,7 @@ BASE_COIN = "XRP"
 # Добавь в свой .env строку:
 # DISABLE_TPSL=true   → бот НЕ будет ставить TP и SL
 # DISABLE_TPSL=false  → будет ставить как обычно (по умолчанию false)
-DISABLE_TPSL = os.getenv("DISABLE_TPSL", "false").lower() == "true"
+DISABLE_TPSL = os.getenv("DISABLE_TPSL", "true").lower() == "true"
 # →→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→
 
 bot = Bot(token=TELEGRAM_TOKEN)
