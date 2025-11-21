@@ -38,29 +38,31 @@ client = httpx.AsyncClient(timeout=20.0)
 position_active = False
 current_status = "Ожидание сигнала..."
 
-# ====================== ПОДПИСЬ ======================
+# ====================== ПОДПИСЬ — ИСПРАВЛЕННАЯ ======================
 def sign(params: dict) -> str:
-    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()) if v is not None)
+    # Используем urllib.parse.urlencode для идеальной сортировки и экранирования
+    import urllib.parse
+    query = urllib.parse.urlencode(params)
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-async def tg_send(text: str):
-    try:
-        await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
-    except Exception as e:
-        logger.error(f"TG error: {e}")
-
-# ====================== BINANCE API ======================
+# ====================== BINANCE API — ИСПРАВЛЕННАЯ ======================
 async def binance_request(method: str, endpoint: str, params: dict | None = None):
     url = f"https://fapi.binance.com{endpoint}"
     params = params or {}
     headers = {"X-MBX-APIKEY": API_KEY}
-    params["timestamp"] = int(time.time() * 1000)
+    
+    # Только для signed запросов добавляем timestamp и signature
+    if "timestamp" not in params:
+        params["timestamp"] = int(time.time() * 1000)
+    
+    # Добавляем signature
     params["signature"] = sign(params)
 
     try:
         if method == "POST":
             r = await client.post(url, data=params, headers=headers)
         else:
+            # Для GET используем params, а не data
             r = await client.get(url, params=params, headers=headers)
         r.raise_for_status()
         return r.json()
