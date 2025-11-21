@@ -1,11 +1,11 @@
-# main.py — ФИНАЛЬНАЯ РАБОЧАЯ ВЕРСИЯ (100% без ошибок подписи и запуска)
+# main.py — ФИНИШНАЯ РАБОЧАЯ ВЕРСИЯ
 import os
 import time
 import hmac
 import hashlib
 import asyncio
 import logging
-import urllib.parse  # ← ЭТОТ ИМПОРТ ОБЯЗАТЕЛЕН!
+import urllib.parse
 from typing import Optional
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Header
@@ -42,21 +42,28 @@ current_status = "Ожидание сигнала..."
 # ====================== ТЕЛЕГА ======================
 async def tg_send(text: str):
     try:
+        # python-telegram-bot v20+ предоставляет async Bot.send_message
         await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"TG error: {e}")
 
 # ====================== ПОДПИСЬ ======================
 def sign(params: dict) -> str:
-    query = urllib.parse.urlencode(params)
+    """
+    Формируем query string с упорядоченными параметрами — Binance требует стабильного порядка при подписи.
+    """
+    # сортируем по ключу, исключая None
+    items = [(k, v) for k, v in sorted(params.items()) if v is not None]
+    query = urllib.parse.urlencode(items)
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
 # ====================== BINANCE API ======================
 async def binance_request(method: str, endpoint: str, params: dict | None = None):
     url = f"https://fapi.binance.com{endpoint}"
-    params = params or {}
+    params = params.copy() if params else {}
     headers = {"X-MBX-APIKEY": API_KEY}
     params["timestamp"] = int(time.time() * 1000)
+    # подпись должна быть рассчитана по параметрам без signature
     params["signature"] = sign(params)
 
     try:
@@ -71,7 +78,7 @@ async def binance_request(method: str, endpoint: str, params: dict | None = None
         if hasattr(e, "response") and e.response is not None:
             try:
                 msg = e.response.json().get("msg", e.response.text[:200])
-            except:
+            except Exception:
                 msg = str(e)
         logger.error(f"Binance error: {msg}")
         raise Exception(msg)
@@ -81,7 +88,7 @@ async def get_price() -> float:
     try:
         data = await binance_request("GET", "/fapi/v1/ticker/price", {"symbol": SYMBOL})
         return float(data["price"])
-    except:
+    except Exception:
         return 0.0
 
 async def get_quantity() -> str:
@@ -92,7 +99,7 @@ async def get_quantity() -> str:
     try:
         info = await binance_request("GET", "/fapi/v1/exchangeInfo")
         prec = next(s["quantityPrecision"] for s in info["symbols"] if s["symbol"] == SYMBOL)
-    except:
+    except Exception:
         prec = 1
     return f"{qty:.{prec}f}"
 
@@ -114,6 +121,7 @@ async def open_long():
         sl_price = round(entry * (1 - SL_PERCENT / 100), 5)
         start = time.time()
 
+        # Открываем рынок, ставим TP и SL как рыночные тейк-профит и стоп-маркет ордера
         await binance_request("POST", "/fapi/v1/order", {"symbol": SYMBOL, "side": "BUY", "type": "MARKET", "quantity": qty})
         await binance_request("POST", "/fapi/v1/order", {"symbol": SYMBOL, "side": "SELL", "type": "TAKE_PROFIT_MARKET", "quantity": qty, "stopPrice": f"{tp_price:.5f}", "reduceOnly": "true", "workingType": "MARK_PRICE"})
         await binance_request("POST", "/fapi/v1/order", {"symbol": SYMBOL, "side": "SELL", "type": "STOP_MARKET", "quantity": qty, "stopPrice": f"{sl_price:.5f}", "reduceOnly": "true", "workingType": "MARK_PRICE"})
@@ -137,7 +145,7 @@ NEW LONG XRP
         current_status = "Ошибка"
         await tg_send(f"ОШИБКА ОТКРЫТИЯ:\n<code>{e}</code>")
 
-# ====================== HTML ======================
+# ====================== HTML (экранированные фигурные скобки) ======================
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -145,13 +153,16 @@ HTML_PAGE = """<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>XRP BOT LIVE</title>
     <style>
-        body {margin:0;font-family:Segoe UI;background:linear-gradient(135deg,#0f0f23,#1a1a2e);color:#fff;height:100vh;display:flex;align-items:center;justify-content:center;}
-        .card {background:rgba(255,255,255,0.05);padding:40px;border-radius:20px;border:2px solid #00ffcc;box-shadow:0 0 30px rgba(0,255,204,0.3);text-align:center;max-width:500px;width:90%;}
-        h1 {font-size:3.5rem;margin:0;text-shadow:0 0 20px #00ffcc;animation:pulse 3s infinite;}
-        .price {font-size:2.8rem;margin:25px 0;color:#00ffcc;font-weight:bold;}
-        .status {font-size:1.5rem;background:rgba(0,255,204,0.1);padding:15px;border-radius:15px;margin:20px 0;}
-        .info {font-size:1.1rem;color:#ccc;margin-top:20px;}
-        @keyframes pulse {0%,100%{opacity:0.7}50%{opacity:1}}
+        body {{margin:0;font-family:Segoe UI;background:linear-gradient(135deg,#0f0f23,#1a1a2e);color:#fff;height:100vh;display:flex;align-items:center;justify-content:center;}}
+        .card {{background:rgba(255,255,255,0.05);padding:40px;border-radius:20px;border:2px solid #00ffcc;box-shadow:0 0 30px rgba(0,255,204,0.3);text-align:center;max-width:500px;width:90%;}}
+        h1 {{font-size:3.5rem;margin:0;text-shadow:0 0 20px #00ffcc;animation:pulse 3s infinite;}}
+        .price {{font-size:2.8rem;margin:25px 0;color:#00ffcc;font-weight:bold;}}
+        .status {{font-size:1.5rem;background:rgba(0,255,204,0.1);padding:15px;border-radius:15px;margin:20px 0;}}
+        .info {{font-size:1.1rem;color:#ccc;margin-top:20px;}}
+        @keyframes pulse {{
+            0%,100% {{opacity:0.7;}}
+            50% {{opacity:1;}}
+        }}
     </style>
 </head>
 <body>
@@ -190,17 +201,23 @@ async def webhook(request: Request, x_secret: Optional[str] = Header(None, alias
     try:
         payload = await request.json()
         signal = payload.get("signal", "").lower()
-    except:
+    except Exception:
         signal = (await request.body()).decode().lower().strip()
     if signal in ["buy", "long", "obuy", "go", "лонг", "вход"]:
         await tg_send("СИГНАЛ — ОТКРЫВАЮ LONG XRP")
+        # создаём таск, чтобы webhook ответил быстро
         asyncio.create_task(open_long())
         return {"status": "long_initiated"}
     return {"status": "ignored"}
 
 @app.on_event("startup")
 async def startup():
-    await tg_send("XRP BOT ЗАПУЩЕН И ГОТОВ")
+    # уведомление о старте
+    try:
+        await tg_send("XRP BOT ЗАПУЩЕН И ГОТОВ")
+    except Exception as e:
+        logger.warning(f"Не удалось отправить TG сообщение при старте: {e}")
+
     try:
         await binance_request("POST", "/fapi/v1/leverage", {"symbol": SYMBOL, "leverage": LEVERAGE})
         logger.info(f"Плечо {LEVERAGE}x установлено")
