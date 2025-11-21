@@ -1,4 +1,4 @@
-# main.py — BINANCE XRP BOT — УЛЬТРА-НАДЁЖНЫЙ, УЛЬТРА-БЫСТРЫЙ
+# main.py — BINANCE XRP BOT — FIXED QUANTITY
 import os
 import time
 import hmac
@@ -33,7 +33,7 @@ TP_PERCENT  = float(os.getenv("TP_PERCENT", "0.5"))
 SL_PERCENT  = float(os.getenv("SL_PERCENT", "1.0"))
 
 SYMBOL = "XRPUSDT"
-QUANTITY = "3"  # Жёстко задаём количество XRP
+QUANTITY = "3"  # фиксированное количество XRP
 bot = Bot(token=TELEGRAM_TOKEN)
 client = httpx.AsyncClient(timeout=20.0)
 
@@ -76,7 +76,6 @@ async def tg_send(text: str):
 
 # ====================== BINANCE SIGN ======================
 def sign(params: Dict[str, Any]) -> str:
-    """Создаёт корректную подпись HMAC для Binance"""
     query = urllib.parse.urlencode(params)
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
@@ -123,7 +122,6 @@ async def open_long():
         return
 
     try:
-        quantity = QUANTITY  # Используем жёстко заданное количество XRP
         entry = await get_price()
         if entry <= 0:
             await tg_send("Не удалось получить цену XRP")
@@ -133,29 +131,17 @@ async def open_long():
         sl_price = round(entry * (1 - SL_PERCENT / 100), 5)
         start = time.time()
 
+        # открытие позиции с фиксированным количеством
         await binance_request("POST", "/fapi/v1/order", {
-            "symbol": SYMBOL,
-            "side": "BUY",
-            "type": "MARKET",
-            "quantity": quantity
+            "symbol": SYMBOL, "side": "BUY", "type": "MARKET", "quantity": QUANTITY
         })
         await binance_request("POST", "/fapi/v1/order", {
-            "symbol": SYMBOL,
-            "side": "SELL",
-            "type": "TAKE_PROFIT_MARKET",
-            "quantity": quantity,
-            "stopPrice": f"{tp_price:.5f}",
-            "reduceOnly": "true",
-            "workingType": "MARK_PRICE"
+            "symbol": SYMBOL, "side": "SELL", "type": "TAKE_PROFIT_MARKET", 
+            "quantity": QUANTITY, "stopPrice": f"{tp_price:.5f}", "reduceOnly": "true", "workingType": "MARK_PRICE"
         })
         await binance_request("POST", "/fapi/v1/order", {
-            "symbol": SYMBOL,
-            "side": "SELL",
-            "type": "STOP_MARKET",
-            "quantity": quantity,
-            "stopPrice": f"{sl_price:.5f}",
-            "reduceOnly": "true",
-            "workingType": "MARK_PRICE"
+            "symbol": SYMBOL, "side": "SELL", "type": "STOP_MARKET", 
+            "quantity": QUANTITY, "stopPrice": f"{sl_price:.5f}", "reduceOnly": "true", "workingType": "MARK_PRICE"
         })
 
         took = round(time.time() - start, 2)
@@ -169,7 +155,7 @@ NEW LONG XRP
 <b>Вход:</b> <code>{entry:.5f}</code>
 <b>TP +{TP_PERCENT}%:</b> <code>{tp_price:.5f}</code>
 <b>SL -{SL_PERCENT}%:</b> <code>{sl_price:.5f}</code>
-<b>Кол-во:</b> <code>{quantity}</code> XRP
+<b>Кол-во:</b> <code>{QUANTITY}</code> XRP
 <b>Время:</b> {took}s
 """)
     except Exception as e:
