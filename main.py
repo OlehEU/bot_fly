@@ -227,13 +227,25 @@ async def root():
 # ====================== WEBHOOK ДЛЯ ПРИЁМА СИГНАЛОВ ======================
 @app.post("/webhook")
 async def webhook(request: Request):
-    if request.headers.get("X-Webhook-Secret") != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403)
+    try:
+        data = await request.json()  # Получаем JSON из тела запроса
+    except:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    data = await request.json()
-    
-    if data.get("signal") == "buy":      # сигнал на покупку
+    # Проверка секрета прямо из тела JSON
+    if data.get("secret") != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    signal = data.get("signal", "").lower()
+
+    # Сигнал на открытие LONG
+    if signal in ["buy", "long", "obuy", "open"]:
         await tg_send("Сигнал BUY — открываю LONG")
         asyncio.create_task(open_long())
+
+    # Можно добавить сигнал на закрытие позиции
+    elif signal in ["close", "sell", "olong"]:
+        await tg_send("Сигнал CLOSE — закрываю LONG")
+        # Здесь можно вызвать функцию закрытия позиции, если есть
 
     return {"ok": True}
