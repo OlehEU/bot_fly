@@ -7,7 +7,6 @@ import urllib.parse
 import asyncio
 import logging
 from typing import Optional, Dict, Any
-import math
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.responses import HTMLResponse
@@ -34,6 +33,7 @@ TP_PERCENT  = float(os.getenv("TP_PERCENT", "0.5"))
 SL_PERCENT  = float(os.getenv("SL_PERCENT", "1.0"))
 
 SYMBOL = "XRPUSDT"
+QUANTITY = "3"  # Жёстко задаём количество XRP
 bot = Bot(token=TELEGRAM_TOKEN)
 client = httpx.AsyncClient(timeout=20.0)
 
@@ -87,7 +87,6 @@ async def binance_request(method: str, endpoint: str, params: Optional[Dict[str,
     headers = {"X-MBX-APIKEY": API_KEY}
 
     if method in ["POST", "DELETE", "PUT"] or endpoint.endswith("/order"):
-        # Для всех ордеров нужна подпись
         params["timestamp"] = int(time.time() * 1000)
         params["signature"] = sign(params)
 
@@ -108,29 +107,13 @@ async def binance_request(method: str, endpoint: str, params: Optional[Dict[str,
         logger.error(f"Binance error: {msg}")
         raise Exception(msg)
 
-# ====================== PRICE & QTY ======================
+# ====================== PRICE ======================
 async def get_price() -> float:
     try:
         data = await binance_request("GET", "/fapi/v1/ticker/price", {"symbol": SYMBOL})
         return float(data.get("price", 0))
     except:
         return 0.0
-
-async def get_quantity() -> str:
-    price = await get_price()
-    if price <= 0:
-        return "1000"
-    qty = (FIXED_USD * LEVERAGE) / price
-    try:
-        info = await binance_request("GET", "/fapi/v1/exchangeInfo")
-        prec = next(s["quantityPrecision"] for s in info["symbols"] if s["symbol"] == SYMBOL)
-    except:
-        prec = 1
-
-    # округление вниз до допустимой точности
-    factor = 10 ** prec
-    qty = math.floor(qty * factor) / factor
-    return f"{qty:.{prec}f}"
 
 # ====================== OPEN LONG ======================
 async def open_long():
@@ -140,7 +123,7 @@ async def open_long():
         return
 
     try:
-        qty = await get_quantity()
+        quantity = QUANTITY  # Используем жёстко заданное количество XRP
         entry = await get_price()
         if entry <= 0:
             await tg_send("Не удалось получить цену XRP")
@@ -150,9 +133,30 @@ async def open_long():
         sl_price = round(entry * (1 - SL_PERCENT / 100), 5)
         start = time.time()
 
-        await binance_request("POST", "/fapi/v1/order", {"symbol": SYMBOL, "side": "BUY", "type": "MARKET", "quantity": qty})
-        await binance_request("POST", "/fapi/v1/order", {"symbol": SYMBOL, "side": "SELL", "type": "TAKE_PROFIT_MARKET", "quantity": qty, "stopPrice": f"{tp_price:.5f}", "reduceOnly": "true", "workingType": "MARK_PRICE"})
-        await binance_request("POST", "/fapi/v1/order", {"symbol": SYMBOL, "side": "SELL", "type": "STOP_MARKET", "quantity": qty, "stopPrice": f"{sl_price:.5f}", "reduceOnly": "true", "workingType": "MARK_PRICE"})
+        await binance_request("POST", "/fapi/v1/order", {
+            "symbol": SYMBOL,
+            "side": "BUY",
+            "type": "MARKET",
+            "quantity": quantity
+        })
+        await binance_request("POST", "/fapi/v1/order", {
+            "symbol": SYMBOL,
+            "side": "SELL",
+            "type": "TAKE_PROFIT_MARKET",
+            "quantity": quantity,
+            "stopPrice": f"{tp_price:.5f}",
+            "reduceOnly": "true",
+            "workingType": "MARK_PRICE"
+        })
+        await binance_request("POST", "/fapi/v1/order", {
+            "symbol": SYMBOL,
+            "side": "SELL",
+            "type": "STOP_MARKET",
+            "quantity": quantity,
+            "stopPrice": f"{sl_price:.5f}",
+            "reduceOnly": "true",
+            "workingType": "MARK_PRICE"
+        })
 
         took = round(time.time() - start, 2)
         position_active = True
@@ -165,7 +169,7 @@ NEW LONG XRP
 <b>Вход:</b> <code>{entry:.5f}</code>
 <b>TP +{TP_PERCENT}%:</b> <code>{tp_price:.5f}</code>
 <b>SL -{SL_PERCENT}%:</b> <code>{sl_price:.5f}</code>
-<b>Кол-во:</b> <code>{qty}</code> XRP
+<b>Кол-во:</b> <code>{quantity}</code> XRP
 <b>Время:</b> {took}s
 """)
     except Exception as e:
