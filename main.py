@@ -47,7 +47,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>XRP BOT LIVE</title>
 <style>
-body {
+body {{
     margin: 0;
     font-family: 'Segoe UI', sans-serif;
     background: linear-gradient(135deg,#0f0f23,#1a1a2e);
@@ -56,8 +56,8 @@ body {
     display: flex;
     align-items: center;
     justify-content: center;
-}
-.card {
+}}
+.card {{
     background: rgba(255,255,255,0.05);
     padding: 40px;
     border-radius: 20px;
@@ -66,35 +66,35 @@ body {
     text-align: center;
     max-width: 500px;
     width: 90%;
-}
-h1 {
+}}
+h1 {{
     font-size: 3.5rem;
     margin: 0;
     text-shadow: 0 0 20px #00ffcc;
     animation: pulse 3s infinite;
-}
-.price {
+}}
+.price {{
     font-size: 2.8rem;
     margin: 25px 0;
     color: #00ffcc;
     font-weight: bold;
-}
-.status {
+}}
+.status {{
     font-size: 1.5rem;
     background: rgba(0,255,204,0.1);
     padding: 15px;
     border-radius: 15px;
     margin: 20px 0;
-}
-.info {
+}}
+.info {{
     font-size: 1.1rem;
     color: #ccc;
     margin-top: 20px;
-}
-@keyframes pulse {
-    0%,100% { opacity: 0.7; }
-    50% { opacity: 1; }
-}
+}}
+@keyframes pulse {{
+    0%,100% {{ opacity: 0.7; }}
+    50% {{ opacity: 1; }}
+}}
 </style>
 </head>
 <body>
@@ -127,7 +127,6 @@ async def binance_request(method: str, endpoint: str, params: Optional[Dict[str,
     headers = {"X-MBX-APIKEY": API_KEY}
 
     if method in ["POST", "DELETE", "PUT"] or endpoint.endswith("/order"):
-        # Для всех ордеров нужна подпись
         params["timestamp"] = int(time.time() * 1000)
         params["signature"] = sign(params)
 
