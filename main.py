@@ -122,6 +122,8 @@ async def open_long():
         return
 
     try:
+        # Жёстко фиксированное количество XRP
+        qty = "3"  # <--- количество XRP, всегда целое число
         entry = await get_price()
         if entry <= 0:
             await tg_send("Не удалось получить цену XRP")
@@ -131,17 +133,31 @@ async def open_long():
         sl_price = round(entry * (1 - SL_PERCENT / 100), 5)
         start = time.time()
 
-        # открытие позиции с фиксированным количеством
+        # Открываем LONG
         await binance_request("POST", "/fapi/v1/order", {
-            "symbol": SYMBOL, "side": "BUY", "type": "MARKET", "quantity": QUANTITY
+            "symbol": SYMBOL,
+            "side": "BUY",
+            "type": "MARKET",
+            "quantity": qty
+        })
+        # TP и SL
+        await binance_request("POST", "/fapi/v1/order", {
+            "symbol": SYMBOL,
+            "side": "SELL",
+            "type": "TAKE_PROFIT_MARKET",
+            "quantity": qty,
+            "stopPrice": f"{tp_price:.5f}",
+            "reduceOnly": "true",
+            "workingType": "MARK_PRICE"
         })
         await binance_request("POST", "/fapi/v1/order", {
-            "symbol": SYMBOL, "side": "SELL", "type": "TAKE_PROFIT_MARKET", 
-            "quantity": QUANTITY, "stopPrice": f"{tp_price:.5f}", "reduceOnly": "true", "workingType": "MARK_PRICE"
-        })
-        await binance_request("POST", "/fapi/v1/order", {
-            "symbol": SYMBOL, "side": "SELL", "type": "STOP_MARKET", 
-            "quantity": QUANTITY, "stopPrice": f"{sl_price:.5f}", "reduceOnly": "true", "workingType": "MARK_PRICE"
+            "symbol": SYMBOL,
+            "side": "SELL",
+            "type": "STOP_MARKET",
+            "quantity": qty,
+            "stopPrice": f"{sl_price:.5f}",
+            "reduceOnly": "true",
+            "workingType": "MARK_PRICE"
         })
 
         took = round(time.time() - start, 2)
@@ -155,13 +171,14 @@ NEW LONG XRP
 <b>Вход:</b> <code>{entry:.5f}</code>
 <b>TP +{TP_PERCENT}%:</b> <code>{tp_price:.5f}</code>
 <b>SL -{SL_PERCENT}%:</b> <code>{sl_price:.5f}</code>
-<b>Кол-во:</b> <code>{QUANTITY}</code> XRP
+<b>Кол-во:</b> <code>{qty}</code> XRP
 <b>Время:</b> {took}s
 """)
     except Exception as e:
         position_active = False
         current_status = "Ошибка"
         await tg_send(f"ОШИБКА ОТКРЫТИЯ:\n<code>{e}</code>")
+
 
 # ====================== FASTAPI ======================
 app = FastAPI()
