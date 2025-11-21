@@ -158,22 +158,33 @@ async def get_qty() -> float:
     return max(qty, MIN_QTY)
 
 
-# ====================== ОТКРЫТИЕ LONG ПО РЫНКУ ======================
+# ====================== ОТКРЫТИЕ LONG С ПРОВЕРКОЙ НА BINANCE ======================
 async def open_long():
     global position_active
-    if position_active:
-        await tg_send("Позиция уже открыта!")
-        return
-
     try:
-        qty = await get_qty()                     # расчёт количества
-        oid = f"xrp_{int(time.time()*1000)}"      # свой ID ордера
+        # Получаем актуальные позиции на фьючерсах
+        account_info = await binance_request("GET", "/fapi/v2/positionRisk")
+        current_position = None
+        for pos in account_info:
+            if pos.get("symbol") == SYMBOL_BINANCE and float(pos.get("positionAmt", 0)) != 0:
+                current_position = pos
+                break
 
-        entry = await get_price()                 # цена входа
+        if current_position:
+            await tg_send(f"Позиция уже открыта на бирже! Кол-во: {current_position['positionAmt']}")
+            position_active = True
+            return
+        else:
+            position_active = False
+
+        # Расчёт количества и цены
+        qty = await get_qty()
+        oid = f"xrp_{int(time.time()*1000)}"
+        entry = await get_price()
         tp = round(entry * (1 + TP_PERCENT / 100), 4)
         sl = round(entry * (1 - SL_PERCENT / 100), 4)
 
-        # параметры для MARKET-ордера
+        # MARKET ордер на открытие LONG
         params = {
             "symbol": SYMBOL_BINANCE,
             "side": "BUY",
@@ -181,14 +192,11 @@ async def open_long():
             "quantity": str(qty),
             "newClientOrderId": oid,
         }
-
-        # отправка ордера
         response = await binance_request("POST", "/fapi/v1/order", params)
         order = {"id": response.get("orderId")}
-
         position_active = True
 
-        # создание TP и SL
+        # TP и SL ордера
         for price, name in [(tp, "tp"), (sl, "sl")]:
             tp_sl_params = {
                 "symbol": SYMBOL_BINANCE,
@@ -201,7 +209,13 @@ async def open_long():
             }
             await binance_request("POST", "/fapi/v1/order", tp_sl_params)
 
-        await tg_send(f"LONG открыт | Entry {entry}")
+        await tg_send(f"""
+<b>LONG ОТКРЫТ</b>
+${FIXED_AMOUNT_USD} × {LEVERAGE}x | {SYMBOL}
+Entry: <code>{entry:.4f}</code>
+TP: <code>{tp:.4f}</code> (+{TP_PERCENT}%)
+SL: <code>{sl:.4f}</code> (-{SL_PERCENT}%)
+        """.strip())
 
     except Exception as e:
         await tg_send(f"Ошибка LONG:\n<code>{str(e)}</code>")
