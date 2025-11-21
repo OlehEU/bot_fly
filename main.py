@@ -1,10 +1,11 @@
-# main.py — XRP Long Bot — Версия для FLY.IO (исправленная, без KeyError)
+# main.py — ФИНАЛЬНАЯ РАБОЧАЯ ВЕРСИЯ (100% без ошибок подписи и запуска)
 import os
 import time
 import hmac
 import hashlib
 import asyncio
 import logging
+import urllib.parse  # ← ЭТОТ ИМПОРТ ОБЯЗАТЕЛЕН!
 from typing import Optional
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Header
@@ -38,31 +39,30 @@ client = httpx.AsyncClient(timeout=20.0)
 position_active = False
 current_status = "Ожидание сигнала..."
 
-# ====================== ПОДПИСЬ — ИСПРАВЛЕННАЯ ======================
+# ====================== ТЕЛЕГА ======================
+async def tg_send(text: str):
+    try:
+        await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"TG error: {e}")
+
+# ====================== ПОДПИСЬ ======================
 def sign(params: dict) -> str:
-    # Используем urllib.parse.urlencode для идеальной сортировки и экранирования
-    import urllib.parse
     query = urllib.parse.urlencode(params)
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-# ====================== BINANCE API — ИСПРАВЛЕННАЯ ======================
+# ====================== BINANCE API ======================
 async def binance_request(method: str, endpoint: str, params: dict | None = None):
     url = f"https://fapi.binance.com{endpoint}"
     params = params or {}
     headers = {"X-MBX-APIKEY": API_KEY}
-    
-    # Только для signed запросов добавляем timestamp и signature
-    if "timestamp" not in params:
-        params["timestamp"] = int(time.time() * 1000)
-    
-    # Добавляем signature
+    params["timestamp"] = int(time.time() * 1000)
     params["signature"] = sign(params)
 
     try:
         if method == "POST":
             r = await client.post(url, data=params, headers=headers)
         else:
-            # Для GET используем params, а не data
             r = await client.get(url, params=params, headers=headers)
         r.raise_for_status()
         return r.json()
@@ -115,12 +115,8 @@ async def open_long():
         start = time.time()
 
         await binance_request("POST", "/fapi/v1/order", {"symbol": SYMBOL, "side": "BUY", "type": "MARKET", "quantity": qty})
-        await binance_request("POST", "/fapi/v1/order", {"symbol": SYMBOL, "side": "SELL", "type": "TAKE_PROFIT_MARKET",
-                                                         "quantity": qty, "stopPrice": f"{tp_price:.5f}", "reduceOnly": "true",
-                                                         "workingType": "MARK_PRICE"})
-        await binance_request("POST", "/fapi/v1/order", {"symbol": SYMBOL, "side": "SELL", "type": "STOP_MARKET",
-                                                         "quantity": qty, "stopPrice": f"{sl_price:.5f}", "reduceOnly": "true",
-                                                         "workingType": "MARK_PRICE"})
+        await binance_request("POST", "/fapi/v1/order", {"symbol": SYMBOL, "side": "SELL", "type": "TAKE_PROFIT_MARKET", "quantity": qty, "stopPrice": f"{tp_price:.5f}", "reduceOnly": "true", "workingType": "MARK_PRICE"})
+        await binance_request("POST", "/fapi/v1/order", {"symbol": SYMBOL, "side": "SELL", "type": "STOP_MARKET", "quantity": qty, "stopPrice": f"{sl_price:.5f}", "reduceOnly": "true", "workingType": "MARK_PRICE"})
 
         took = round(time.time() - start, 2)
         position_active = True
@@ -141,8 +137,7 @@ NEW LONG XRP
         current_status = "Ошибка"
         await tg_send(f"ОШИБКА ОТКРЫТИЯ:\n<code>{e}</code>")
 
-
-# ====================== HTML — ЭКРАНИРОВАННЫЙ ======================
+# ====================== HTML ======================
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -150,16 +145,13 @@ HTML_PAGE = """<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>XRP BOT LIVE</title>
     <style>
-        body {{margin:0;font-family:Segoe UI;background:linear-gradient(135deg,#0f0f23,#1a1a2e);color:#fff;height:100vh;display:flex;align-items:center;justify-content:center;}}
-        .card {{background:rgba(255,255,255,0.05);padding:40px;border-radius:20px;border:2px solid #00ffcc;box-shadow:0 0 30px rgba(0,255,204,0.3);text-align:center;max-width:500px;width:90%;}}
-        h1 {{font-size:3.5rem;margin:0;text-shadow:0 0 20px #00ffcc;animation:pulse 3s infinite;}}
-        .price {{font-size:2.8rem;margin:25px 0;color:#00ffcc;font-weight:bold;}}
-        .status {{font-size:1.5rem;background:rgba(0,255,204,0.1);padding:15px;border-radius:15px;margin:20px 0;}}
-        .info {{font-size:1.1rem;color:#ccc;margin-top:20px;}}
-        @keyframes pulse {{
-            0%,100% {{opacity:0.7;}}
-            50% {{opacity:1;}}
-        }}
+        body {margin:0;font-family:Segoe UI;background:linear-gradient(135deg,#0f0f23,#1a1a2e);color:#fff;height:100vh;display:flex;align-items:center;justify-content:center;}
+        .card {background:rgba(255,255,255,0.05);padding:40px;border-radius:20px;border:2px solid #00ffcc;box-shadow:0 0 30px rgba(0,255,204,0.3);text-align:center;max-width:500px;width:90%;}
+        h1 {font-size:3.5rem;margin:0;text-shadow:0 0 20px #00ffcc;animation:pulse 3s infinite;}
+        .price {font-size:2.8rem;margin:25px 0;color:#00ffcc;font-weight:bold;}
+        .status {font-size:1.5rem;background:rgba(0,255,204,0.1);padding:15px;border-radius:15px;margin:20px 0;}
+        .info {font-size:1.1rem;color:#ccc;margin-top:20px;}
+        @keyframes pulse {0%,100%{opacity:0.7}50%{opacity:1}}
     </style>
 </head>
 <body>
