@@ -28,20 +28,14 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
 # ====================== НАСТРОЙКИ ТОРГОВЛИ ======================
-FIXED_AMOUNT_USD = float(os.getenv("FIXED_AMOUNT_USD", "10"))      # сколько $ на сделку
-LEVERAGE = int(os.getenv("LEVERAGE", "10"))                        # плечо
-TP_PERCENT = float(os.getenv("TP_PERCENT", "0.5"))                 # тейк-профит в %
-SL_PERCENT = float(os.getenv("SL_PERCENT", "1.0"))                 # стоп-лосс в %
-AUTO_CLOSE_MINUTES = int(os.getenv("AUTO_CLOSE_MINUTES", "10"))   # не используется пока
+FIXED_AMOUNT_USD = float(os.getenv("FIXED_AMOUNT_USD", "10"))
+LEVERAGE = int(os.getenv("LEVERAGE", "10"))
+TP_PERCENT = float(os.getenv("TP_PERCENT", "0.5"))
+SL_PERCENT = float(os.getenv("SL_PERCENT", "1.0"))
 BASE_COIN = "XRP"
 
-# ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
-# НОВАЯ ПЕРЕМЕННАЯ — ОТКЛЮЧЕНИЕ TP/SL
-# Добавь в свой .env строку:
-# DISABLE_TPSL=true   → бот НЕ будет ставить TP и SL
-# DISABLE_TPSL=false  → будет ставить как обычно (по умолчанию false)
+# Отключение TP/SL
 DISABLE_TPSL = os.getenv("DISABLE_TPSL", "true").lower() == "true"
-# →→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
@@ -52,22 +46,39 @@ SYMBOL = f"{BASE_COIN.upper()}/USDT:USDT"
 MIN_QTY = 0.0
 QTY_PRECISION = 3
 position_active = False
+last_balance_before_trade = 0.0        # ← НОВАЯ: баланс перед открытием сделки
 binance_client = httpx.AsyncClient(timeout=60.0)
 
-# ====================== ОТПРАВКА В ТЕЛЕГУ ======================
+# ====================== УТИЛИТЫ ======================
 async def tg_send(text: str):
     try:
         await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Telegram error: {e}")
 
-# ====================== ПОДПИСЬ ДЛЯ BINANCE ======================
+# Получение баланса Futures (USDT)
+async def get_futures_balance() -> float:
+    try:
+        account = await binance_request("GET", "/fapi/v2/balance")
+        for asset in account:
+            if asset["asset"] == "USDT":
+                return float(asset["balance"])
+        return 0.0
+    except Exception as e:
+        logger.error(f"Ошибка получения баланса: {e}")
+        return 0.0
+
+# Отправка баланса в телегу
+async def tg_balance():
+    balance = await get_futures_balance()
+    await tg_send(f"<b>Баланс Futures:</b> <code>{balance:,.2f}</code> USDT")
+
+# ====================== ПОДПИСЬ И ЗАПРОСЫ ======================
 def _create_signature(params: Dict[str, Any], secret: str) -> str:
     normalized = {k: str(v).lower() if isinstance(v, bool) else str(v) for k, v in params.items() if v is not None}
     query_string = urllib.parse.urlencode(normalized)
     return hmac.new(secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
 
-# ====================== УНИВЕРСАЛЬНЫЙ ЗАПРОС К BINANCE ======================
 async def binance_request(method: str, endpoint: str, params: Optional[Dict[str, Any]] = None, signed: bool = True):
     url = f"{BINANCE_BASE_URL}{endpoint}"
     params = params or {}
@@ -90,7 +101,7 @@ async def binance_request(method: str, endpoint: str, params: Optional[Dict[str,
     except Exception as e:
         raise e
 
-# ====================== ЗАГРУЗКА ИНФЫ О СИМВОЛЕ И ПЛЕЧЕ ======================
+# ====================== PRELOAD ======================
 async def preload():
     global MIN_QTY, QTY_PRECISION
     try:
@@ -103,7 +114,8 @@ async def preload():
                 QTY_PRECISION = s.get("quantityPrecision", 3)
                 break
         await binance_request("POST", "/fapi/v1/leverage", {"symbol": SYMBOL_BINANCE, "leverage": LEVERAGE})
-        await tg_send("XRP Bot запущен и готов!\nTP/SL: " + ("ВЫКЛЮЧЕНЫ" if DISABLE_TPSL else "включены"))
+        status = "ВЫКЛЮЧЕНЫ" if DISABLE_TPSL else "включены"
+        await tg_send(f"XRP Bot запущен и готов!\nTP/SL: {status}")
     except Exception as e:
         await tg_send(f"Ошибка запуска: {e}")
 
@@ -118,11 +130,10 @@ async def get_qty() -> float:
     qty = round(raw, QTY_PRECISION)
     return max(qty, MIN_QTY)
 
-# ====================== ОТКРЫТИЕ LONG (С ОПЦИЕЙ ОТКЛЮЧЕНИЯ TP/SL) ======================
+# ====================== ОТКРЫТИЕ LONG ======================
 async def open_long():
-    global position_active
+    global position_active, last_balance_before_trade
     try:
-        # Проверка: нет ли уже открытой позиции
         pos_info = await binance_request("GET", "/fapi/v2/positionRisk")
         for p in pos_info:
             if p["symbol"] == SYMBOL_BINANCE and float(p.get("positionAmt", 0)) != 0:
@@ -136,53 +147,46 @@ async def open_long():
         tp = round(entry * (1 + TP_PERCENT / 100), 4)
         sl = round(entry * (1 - SL_PERCENT / 100), 4)
 
-        # MARKET ордер на вход
         await binance_request("POST", "/fapi/v1/order", {
             "symbol": SYMBOL_BINANCE, "side": "BUY", "type": "MARKET",
             "quantity": str(qty), "newClientOrderId": oid
         })
 
         position_active = True
+        last_balance_before_trade = await get_futures_balance()  # ← запоминаем баланс
 
-        # ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
-        # ОТКЛЮЧЕНИЕ TP/SL — главная фича
         if DISABLE_TPSL:
             await tg_send(f"""
 <b>LONG ОТКРЫТ БЕЗ TP/SL</b>
 ${FIXED_AMOUNT_USD} × {LEVERAGE}x | {SYMBOL}
 Entry: <code>{entry:.4f}</code>
-<i>TP и SL отключены (DISABLE_TPSL=true)</i>
+<i>TP и SL отключены</i>
             """.strip())
-            return
-            
-        # DISABLE_TPSL=true   # → бот НЕ ставит TP и SL
-        # DISABLE_TPSL=false  # → ставит как обычно (можно вообще не писать)    
-        # →→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→
-
-        # Обычная установка TP и SL
-        for price, name in [(tp, "tp"), (sl, "sl")]:
-            await binance_request("POST", "/fapi/v1/order", {
-                "symbol": SYMBOL_BINANCE, "side": "SELL",
-                "type": "TAKE_PROFIT_MARKET" if name == "tp" else "STOP_MARKET",
-                "quantity": str(qty), "stopPrice": str(price),
-                "reduceOnly": "true", "newClientOrderId": f"{name}_{oid}"
-            })
-
-        await tg_send(f"""
+        else:
+            for price, name in [(tp, "tp"), (sl, "sl")]:
+                await binance_request("POST", "/fapi/v1/order", {
+                    "symbol": SYMBOL_BINANCE, "side": "SELL",
+                    "type": "TAKE_PROFIT_MARKET" if name == "tp" else "STOP_MARKET",
+                    "quantity": str(qty), "stopPrice": str(price),
+                    "reduceOnly": "true", "newClientOrderId": f"{name}_{oid}"
+                })
+            await tg_send(f"""
 <b>LONG ОТКРЫТ</b>
 ${FIXED_AMOUNT_USD} × {LEVERAGE}x | {SYMBOL}
 Entry: <code>{entry:.4f}</code>
 TP: <code>{tp:.4f}</code> (+{TP_PERCENT}%)
 SL: <code>{sl:.4f}</code> (-{SL_PERCENT}%)
-        """.strip())
+            """.strip())
+
+        await tg_balance()  # ← баланс после открытия
 
     except Exception as e:
         await tg_send(f"Ошибка открытия LONG:\n<code>{str(e)}</code>")
         position_active = False
 
-# ====================== ЗАКРЫТИЕ ВСЕГО ПО XRP ======================
+# ====================== ЗАКРЫТИЕ ВСЕГО + ПРИБЫЛЬ ======================
 async def close_all_xrp():
-    global position_active
+    global position_active, last_balance_before_trade
     try:
         positions = await binance_request("GET", "/fapi/v2/positionRisk")
         current = None
@@ -199,18 +203,26 @@ async def close_all_xrp():
                 "quantity": str(qty), "reduceOnly": "true"
             })
 
-        # Отмена всех открытых ордеров (даже если TP/SL отключены — на всякий случай)
         open_orders = await binance_request("GET", "/fapi/v1/openOrders", {"symbol": SYMBOL_BINANCE})
         cancelled = 0
         if open_orders:
             for order in open_orders:
-                await binance_request("DELETE", "/fapi/v1/order", {
-                    "symbol": SYMBOL_BINANCE, "orderId": order["orderId"]
-                })
+                await binance_request("DELETE", "/fapi/v1/order", {"symbol": SYMBOL_BINANCE, "orderId": order["orderId"]})
                 cancelled += 1
 
+        current_balance = await get_futures_balance()
+        pnl = current_balance - last_balance_before_trade
+        pnl_text = f"<b>Прибыль по сделке:</b> <code>{pnl:+.2f}</code> USDT"
+        if pnl > 0:
+            pnl_text = "Прибыль по сделке: <code>+{:.2f}</code> USDT".format(pnl)
+        elif pnl < 0:
+            pnl_text = "Убыток по сделке: <code>{:.2f}</code> USDT".format(pnl)
+        else:
+            pnl_text = "Прибыль по сделке: <code>0.00</code> USDT"
+
         position_active = False
-        await tg_send(f"Позиция закрыта по рынку\nОтменено ордеров: {cancelled}")
+        await tg_send(f"Позиция закрыта по рынку\nОтменено ордеров: {cancelled}\n\n{pnl_text}")
+        await tg_balance()
 
     except Exception as e:
         await tg_send(f"Ошибка close_all: {str(e)}")
@@ -228,7 +240,6 @@ app = FastAPI(lifespan=lifespan)
 async def root():
     return HTMLResponse("<h1>XRP Binance Bot — ONLINE</h1>")
 
-# ====================== WEBHOOK ======================
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
@@ -244,11 +255,9 @@ async def webhook(request: Request):
     if signal in ["buy", "long", "obuy", "open"]:
         await tg_send("Сигнал BUY — открываю LONG")
         asyncio.create_task(open_long())
-
     elif signal == "close_all":
         await tg_send("Сигнал CLOSE_ALL — закрываю позицию и все ордера")
         asyncio.create_task(close_all_xrp())
-
     else:
         await tg_send(f"Неизвестный сигнал: {signal}")
 
