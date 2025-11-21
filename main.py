@@ -232,7 +232,7 @@ async def webhook(request: Request):
 
     data = await request.json()
     
-    if data.get("signal") == "obuy":      # сигнал на покупку
+    if data.get("signal") == "buy":      # сигнал на покупку
         await tg_send("Сигнал BUY — открываю LONG")
         asyncio.create_task(open_long())
 
