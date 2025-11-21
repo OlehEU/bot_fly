@@ -1,16 +1,13 @@
 # main.py — BINANCE XRP BOT — УЛЬТРА-БЫСТРЫЙ БОТ ДЛЯ ТОРГОВЛИ FUTURES
 import os
-import math
 import time
 import logging
 import asyncio
-import traceback
+import httpx
 import hmac
 import hashlib
 import urllib.parse
 from typing import Dict, Any, Optional
-
-import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from telegram import Bot
@@ -19,195 +16,157 @@ from contextlib import asynccontextmanager
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("binance-bot")
 
-# ====================== КОНФИГ: загрузка переменных окружения ======================
-required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "BINANCE_API_KEY", "BINANCE_API_SECRET", "WEBHOOK_SECRET"]
+# ====================== КОНФИГ ======================
+required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "BINANCE_API_KEY", "BINANCE_API_SECRET"]
 for var in required:
     if not os.getenv(var):
         raise EnvironmentError(f"Отсутствует переменная окружения: {var}")
 
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
-BINANCE_API_KEY     = os.getenv("BINANCE_API_KEY")
-BINANCE_API_SECRET  = os.getenv("BINANCE_API_SECRET")
-WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET")
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
-# ====================== НАСТРОЙКИ БОТА ======================
-FIXED_AMOUNT_USD   = float(os.getenv("FIXED_AMOUNT_USD", "10"))  # фиксированная сумма для входа
-LEVERAGE           = int(os.getenv("LEVERAGE", "10"))            # плечо
-TP_PERCENT         = float(os.getenv("TP_PERCENT", "0.5"))        # тейк-профит %
-SL_PERCENT         = float(os.getenv("SL_PERCENT", "1.0"))        # стоп-лосс %
-AUTO_CLOSE_MINUTES = int(os.getenv("AUTO_CLOSE_MINUTES", "10"))  # авто-закрытие
-BASE_COIN          = "XRP"                                       # торгуемая монета
+# ====================== НАСТРОЙКИ ТОРГОВЛИ ======================
+FIXED_AMOUNT_USD = float(os.getenv("FIXED_AMOUNT_USD", "10"))      # сколько $ на сделку
+LEVERAGE = int(os.getenv("LEVERAGE", "10"))                        # плечо
+TP_PERCENT = float(os.getenv("TP_PERCENT", "0.5"))                 # тейк-профит в %
+SL_PERCENT = float(os.getenv("SL_PERCENT", "1.0"))                 # стоп-лосс в %
+AUTO_CLOSE_MINUTES = int(os.getenv("AUTO_CLOSE_MINUTES", "10"))   # не используется пока
+BASE_COIN = "XRP"
+
+# ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
+# НОВАЯ ПЕРЕМЕННАЯ — ОТКЛЮЧЕНИЕ TP/SL
+# Добавь в свой .env строку:
+# DISABLE_TPSL=true   → бот НЕ будет ставить TP и SL
+# DISABLE_TPSL=false  → будет ставить как обычно (по умолчанию false)
+DISABLE_TPSL = os.getenv("DISABLE_TPSL", "false").lower() == "true"
+# →→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# ====================== ОТПРАВКА СООБЩЕНИЙ В TELEGRAM ======================
+# ====================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ======================
+BINANCE_BASE_URL = "https://fapi.binance.com"
+SYMBOL_BINANCE = f"{BASE_COIN.upper()}USDT"
+SYMBOL = f"{BASE_COIN.upper()}/USDT:USDT"
+MIN_QTY = 0.0
+QTY_PRECISION = 3
+position_active = False
+binance_client = httpx.AsyncClient(timeout=60.0)
+
+# ====================== ОТПРАВКА В ТЕЛЕГУ ======================
 async def tg_send(text: str):
     try:
         await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Telegram error: {e}")
 
-# ====================== НАСТРОЙКИ BINANCE API ======================
-BINANCE_BASE_URL = "https://fapi.binance.com"
-SYMBOL_BINANCE = f"{BASE_COIN.upper()}USDT"       # формат Binance
-SYMBOL = f"{BASE_COIN.upper()}/USDT:USDT"         # формат отображения
-MARKET = None
-MIN_QTY = 0.0
-QTY_PRECISION = 3
-position_active = False
-
-binance_client = httpx.AsyncClient(timeout=60.0)
-
-# ====================== СОЗДАНИЕ SIG НАПР. ДЛЯ ПОДПИСАННЫХ ЗАПРОСОВ ======================
+# ====================== ПОДПИСЬ ДЛЯ BINANCE ======================
 def _create_signature(params: Dict[str, Any], secret: str) -> str:
-    normalized = {}
-    for k, v in params.items():
-        if v is None:
-            continue
-        if isinstance(v, bool):
-            normalized[k] = str(v).lower()
-        elif isinstance(v, (int, float)):
-            normalized[k] = str(v)
-        else:
-            normalized[k] = str(v)
-
+    normalized = {k: str(v).lower() if isinstance(v, bool) else str(v) for k, v in params.items() if v is not None}
     query_string = urllib.parse.urlencode(normalized)
-
-    return hmac.new(
-        secret.encode('utf-8'),
-        query_string.encode('utf-8'),
-        hashlib.sha256
-    ).hexdigest()
-
+    return hmac.new(secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
 
 # ====================== УНИВЕРСАЛЬНЫЙ ЗАПРОС К BINANCE ======================
-async def binance_request(method: str, endpoint: str, params: Optional[Dict[str, Any]] = None, signed: bool = True) -> Dict[str, Any]:
+async def binance_request(method: str, endpoint: str, params: Optional[Dict[str, Any]] = None, signed: bool = True):
     url = f"{BINANCE_BASE_URL}{endpoint}"
     params = params or {}
-    
-    # добавление подписи если запрос приватный
     if signed:
         params["timestamp"] = int(time.time() * 1000)
-        signature = _create_signature(params, BINANCE_API_SECRET)
-        params["signature"] = signature
-    
+        params["signature"] = _create_signature(params, BINANCE_API_SECRET)
     headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
-    
     try:
-        logger.info(f"Binance {method} {url} с параметрами: {params}")
-        if method == "GET":
-            response = await binance_client.get(url, params=params, headers=headers, timeout=60.0)
-        else:
-            response = await binance_client.post(url, params=params, headers=headers, timeout=60.0)
-        
+        response = await (binance_client.get if method == "GET" else binance_client.post)(
+            url, params=params, headers=headers
+        )
         response.raise_for_status()
         return response.json()
-
     except httpx.HTTPStatusError as e:
         try:
-            error_data = e.response.json()
-            error_msg = error_data.get("msg", str(error_data))
-            raise Exception(f"Binance API error: {error_msg}")
+            msg = e.response.json().get("msg", str(e.response.json()))
         except:
-            raise Exception(f"Binance API error: {e.response.status_code}")
-
+            msg = e.response.text
+        raise Exception(f"Binance API error: {msg}")
     except Exception as e:
-        raise
+        raise e
 
-
-# ====================== PRELOAD: загрузка инфы о рынке, плеча и т.д. ======================
+# ====================== ЗАГРУЗКА ИНФЫ О СИМВОЛЕ И ПЛЕЧЕ ======================
 async def preload():
-    global MARKET, MIN_QTY, QTY_PRECISION
+    global MIN_QTY, QTY_PRECISION
     try:
-        # загрузка информации о символе (лот, минимальное количество)
-        exchange_info = await binance_request("GET", "/fapi/v1/exchangeInfo", signed=False)
-        symbol_info = None
-        for s in exchange_info.get("symbols", []):
-            if s.get("symbol") == SYMBOL_BINANCE:
-                symbol_info = s
+        info = await binance_request("GET", "/fapi/v1/exchangeInfo", signed=False)
+        for s in info.get("symbols", []):
+            if s["symbol"] == SYMBOL_BINANCE:
+                for f in s.get("filters", []):
+                    if f["filterType"] == "LOT_SIZE":
+                        MIN_QTY = float(f["minQty"])
+                QTY_PRECISION = s.get("quantityPrecision", 3)
                 break
-        
-        if symbol_info:
-            for f in symbol_info.get("filters", []):
-                if f.get("filterType") == "LOT_SIZE":
-                    MIN_QTY = float(f.get("minQty", 0))
-            QTY_PRECISION = symbol_info.get("quantityPrecision", 3)
-
-        MARKET = {"limits": {"amount": {"min": MIN_QTY}}}
-
-        # установка плеча
-        await binance_request("POST", "/fapi/v1/leverage", {"symbol": SYMBOL_BINANCE, "leverage": str(LEVERAGE)})
-
+        await binance_request("POST", "/fapi/v1/leverage", {"symbol": SYMBOL_BINANCE, "leverage": LEVERAGE})
+        await tg_send("XRP Bot запущен и готов!\nTP/SL: " + ("ВЫКЛЮЧЕНЫ" if DISABLE_TPSL else "включены"))
     except Exception as e:
-        logger.error(f"Ошибка при preload: {e}")
-        raise
+        await tg_send(f"Ошибка запуска: {e}")
 
-
-# ====================== ПОЛУЧЕНИЕ ТЕКУЩЕЙ ЦЕНЫ ======================
+# ====================== ЦЕНА И КОЛИЧЕСТВО ======================
 async def get_price() -> float:
     data = await binance_request("GET", "/fapi/v1/ticker/price", {"symbol": SYMBOL_BINANCE}, signed=False)
-    return float(data.get("price", 0))
+    return float(data["price"])
 
-
-# ====================== РАСЧЁТ КОЛИЧЕСТВА XRP ======================
 async def get_qty() -> float:
     price = await get_price()
-    raw_qty = (FIXED_AMOUNT_USD * LEVERAGE) / price
-    qty = round(raw_qty, QTY_PRECISION)
+    raw = (FIXED_AMOUNT_USD * LEVERAGE) / price
+    qty = round(raw, QTY_PRECISION)
     return max(qty, MIN_QTY)
 
-
-# ====================== ОТКРЫТИЕ LONG С ПРОВЕРКОЙ НА BINANCE ======================
+# ====================== ОТКРЫТИЕ LONG (С ОПЦИЕЙ ОТКЛЮЧЕНИЯ TP/SL) ======================
 async def open_long():
     global position_active
     try:
-        # Получаем актуальные позиции на фьючерсах
-        account_info = await binance_request("GET", "/fapi/v2/positionRisk")
-        current_position = None
-        for pos in account_info:
-            if pos.get("symbol") == SYMBOL_BINANCE and float(pos.get("positionAmt", 0)) != 0:
-                current_position = pos
-                break
+        # Проверка: нет ли уже открытой позиции
+        pos_info = await binance_request("GET", "/fapi/v2/positionRisk")
+        for p in pos_info:
+            if p["symbol"] == SYMBOL_BINANCE and float(p.get("positionAmt", 0)) != 0:
+                await tg_send(f"Позиция уже открыта: {p['positionAmt']} XRP")
+                position_active = True
+                return
 
-        if current_position:
-            await tg_send(f"Позиция уже открыта на бирже! Кол-во: {current_position['positionAmt']}")
-            position_active = True
-            return
-        else:
-            position_active = False
-
-        # Расчёт количества и цены
         qty = await get_qty()
         oid = f"xrp_{int(time.time()*1000)}"
         entry = await get_price()
         tp = round(entry * (1 + TP_PERCENT / 100), 4)
         sl = round(entry * (1 - SL_PERCENT / 100), 4)
 
-        # MARKET ордер на открытие LONG
-        params = {
-            "symbol": SYMBOL_BINANCE,
-            "side": "BUY",
-            "type": "MARKET",
-            "quantity": str(qty),
-            "newClientOrderId": oid,
-        }
-        response = await binance_request("POST", "/fapi/v1/order", params)
-        order = {"id": response.get("orderId")}
+        # MARKET ордер на вход
+        await binance_request("POST", "/fapi/v1/order", {
+            "symbol": SYMBOL_BINANCE, "side": "BUY", "type": "MARKET",
+            "quantity": str(qty), "newClientOrderId": oid
+        })
+
         position_active = True
 
-        # TP и SL ордера
+        # ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
+        # ОТКЛЮЧЕНИЕ TP/SL — главная фича
+        if DISABLE_TPSL:
+            await tg_send(f"""
+<b>LONG ОТКРЫТ БЕЗ TP/SL</b>
+${FIXED_AMOUNT_USD} × {LEVERAGE}x | {SYMBOL}
+Entry: <code>{entry:.4f}</code>
+<i>TP и SL отключены (DISABLE_TPSL=true)</i>
+            """.strip())
+            return
+            
+        # DISABLE_TPSL=true   # → бот НЕ ставит TP и SL
+        # DISABLE_TPSL=false  # → ставит как обычно (можно вообще не писать)    
+        # →→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→
+
+        # Обычная установка TP и SL
         for price, name in [(tp, "tp"), (sl, "sl")]:
-            tp_sl_params = {
-                "symbol": SYMBOL_BINANCE,
-                "side": "SELL",
+            await binance_request("POST", "/fapi/v1/order", {
+                "symbol": SYMBOL_BINANCE, "side": "SELL",
                 "type": "TAKE_PROFIT_MARKET" if name == "tp" else "STOP_MARKET",
-                "quantity": str(qty),
-                "stopPrice": str(price),
-                "reduceOnly": "true",
-                "newClientOrderId": f"{name}_{oid}",
-            }
-            await binance_request("POST", "/fapi/v1/order", tp_sl_params)
+                "quantity": str(qty), "stopPrice": str(price),
+                "reduceOnly": "true", "newClientOrderId": f"{name}_{oid}"
+            })
 
         await tg_send(f"""
 <b>LONG ОТКРЫТ</b>
@@ -218,48 +177,79 @@ SL: <code>{sl:.4f}</code> (-{SL_PERCENT}%)
         """.strip())
 
     except Exception as e:
-        await tg_send(f"Ошибка LONG:\n<code>{str(e)}</code>")
+        await tg_send(f"Ошибка открытия LONG:\n<code>{str(e)}</code>")
         position_active = False
 
+# ====================== ЗАКРЫТИЕ ВСЕГО ПО XRP ======================
+async def close_all_xrp():
+    global position_active
+    try:
+        positions = await binance_request("GET", "/fapi/v2/positionRisk")
+        current = None
+        for p in positions:
+            if p["symbol"] == SYMBOL_BINANCE and float(p.get("positionAmt", 0)) != 0:
+                current = p
+                break
 
-# ====================== LIFESPAN: запуск и остановка приложения ======================
+        if current:
+            qty = abs(float(current["positionAmt"]))
+            side = "SELL" if float(current["positionAmt"]) > 0 else "BUY"
+            await binance_request("POST", "/fapi/v1/order", {
+                "symbol": SYMBOL_BINANCE, "side": side, "type": "MARKET",
+                "quantity": str(qty), "reduceOnly": "true"
+            })
+
+        # Отмена всех открытых ордеров (даже если TP/SL отключены — на всякий случай)
+        open_orders = await binance_request("GET", "/fapi/v1/openOrders", {"symbol": SYMBOL_BINANCE})
+        cancelled = 0
+        if open_orders:
+            for order in open_orders:
+                await binance_request("DELETE", "/fapi/v1/order", {
+                    "symbol": SYMBOL_BINANCE, "orderId": order["orderId"]
+                })
+                cancelled += 1
+
+        position_active = False
+        await tg_send(f"Позиция закрыта по рынку\nОтменено ордеров: {cancelled}")
+
+    except Exception as e:
+        await tg_send(f"Ошибка close_all: {str(e)}")
+
+# ====================== FASTAPI ======================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await preload()
-    await tg_send("Bot запущен и готов!")
     yield
     await binance_client.aclose()
 
 app = FastAPI(lifespan=lifespan)
 
-# ====================== ГЛАВНАЯ СТРАНИЦА ======================
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>XRP Bot — BINANCE — ONLINE</h1>")
+    return HTMLResponse("<h1>XRP Binance Bot — ONLINE</h1>")
 
-
-# ====================== WEBHOOK ДЛЯ ПРИЁМА СИГНАЛОВ ======================
+# ====================== WEBHOOK ======================
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
-        data = await request.json()  # Получаем JSON из тела запроса
+        data = await request.json()
     except:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # Проверка секрета прямо из тела JSON
-    if data.get("secret") != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="Forbidden")
+    if data.get("secret") != "supersecret123":
+        raise HTTPException(status_code=403, detail="Wrong secret")
 
     signal = data.get("signal", "").lower()
 
-    # Сигнал на открытие LONG
     if signal in ["buy", "long", "obuy", "open"]:
         await tg_send("Сигнал BUY — открываю LONG")
         asyncio.create_task(open_long())
 
-    # Можно добавить сигнал на закрытие позиции
-    elif signal in ["close", "sell", "olong"]:
-        await tg_send("Сигнал CLOSE — закрываю LONG")
-        # Здесь можно вызвать функцию закрытия позиции, если есть
+    elif signal == "close_all":
+        await tg_send("Сигнал CLOSE_ALL — закрываю позицию и все ордера")
+        asyncio.create_task(close_all_xrp())
 
-    return {"ok": True}
+    else:
+        await tg_send(f"Неизвестный сигнал: {signal}")
+
+    return {"ok": True, "signal": signal}
