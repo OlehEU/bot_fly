@@ -246,53 +246,54 @@ async def root():
 # ====================== SCANNER ======================
 @app.get("/scanner")
 async def scanner_dashboard():
-    return HTMLResponse("""
+    # Получаем свежие данные для XRP
+    data = await api("GET", "/fapi/v1/klines", {"symbol": "XRPUSDT", "interval": "5m", "limit": 100}, signed=False)
+    candles = []
+    for c in data:
+        candles.append({
+            "t": c[0],
+            "o": float(c[1]),
+            "h": float(c[2]),
+            "l": float(c[3]),
+            "c": float(c[4]),
+            "v": float(c[5])
+        })
+    
+    return HTMLResponse(f"""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>ТЕРМИНАТОР 2026 — СКАНЕР</title>
-        <meta charset="utf-8">
+        <title>ТЕРМИНАТОР 2026 — СВОЙ ГРАФИК</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
-            body {margin:0; background:#000; color:#0f0; font-family: monospace;}
-            .header {text-align:center; padding:10px; background:#111; text-shadow:0 0 10px #0f0;}
-            .widget {width:100%; height:90vh;}
-            .footer {text-align:center; padding:5px; font-size:12px;}
+            body {{background:#000; color:#0f0; font-family:monospace; padding:20px;}}
+            canvas {{background:#111; border:1px solid #0f0; border-radius:10px;}}
         </style>
     </head>
     <body>
-        <div class="header">
-            <h1>ТЕРМИНАТОР 2026 — АВТОТРЕЙДИНГ</h1>
-            <p>XRP • SOL • ETH • BTC • DOGE | OZ Стратегия</p>
-        </div>
-        <div class="widget">
-            <!-- TradingView Widget BEGIN -->
-            <div class="tradingview-widget-container">
-                <div id="tvchart"></div>
-                <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
-                <script type="text/javascript">
-                new TradingView.widget({
-                    "width": "100%",
-                    "height": "100%",
-                    "symbol": "BINANCE:XRPUSDT",
-                    "interval": "5",
-                    "timezone": "Etc/UTC",
-                    "theme": "dark",
-                    "style": "1",
-                    "locale": "ru",
-                    "toolbar_bg": "#f1f3f6",
-                    "enable_publishing": false,
-                    "hide_top_toolbar": false,
-                    "save_image": false,
-                    "container_id": "tvchart",
-                    "studies": ["MASimple@tv-basicstudies"],
-                    "lineColors": ["#0f0","#0f0","#0f0"]
-                });
-                </script>
-            </div>
-            <!-- TradingView Widget END -->
-        </div>
-        <div class="footer">Автообновление каждые 10 сек | Сигналы OZ: EMA5 + RSI7 + Volume</div>
-        <script>setInterval(() => location.reload(), 10000);</script>
+        <h1>ТЕРМИНАТОР 2026 — XRP 5M</h1>
+        <canvas id="chart" width="1200" height="600"></canvas>
+        <script>
+            const ctx = document.getElementById('chart').getContext('2d');
+            const chart = new Chart(ctx, {{
+                type: 'candlestick',
+                data: {{
+                    datasets: [{{
+                        label: 'XRP/USDT',
+                        data: {json.dumps(candles)},
+                        borderColor: '#0f0',
+                        backgroundColor: '#0f0'
+                    }}]
+                }},
+                options: {{
+                    scales: {{
+                        x: {{ type: 'time' }},
+                        y: {{ type: 'linear' }}
+                    }},
+                    plugins: {{ legend: {{ display: false }} }}
+                }}
+            }});
+        </script>
     </body>
     </html>
     """)
