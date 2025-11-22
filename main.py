@@ -12,7 +12,6 @@ import urllib.parse
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
-
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
@@ -25,22 +24,22 @@ for var in required:
     if not os.getenv(var):
         raise EnvironmentError(f"Нет переменной: {var}")
 
-TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID   = int(os.getenv("TELEGRAM_CHAT_ID"))
-BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
-WEBHOOK_SECRET     = os.getenv("WEBHOOK_SECRET", "supersecret123")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "supersecret123")
 
 COINS = {
-    "XRP":  {"amount_usd": 10,  "leverage": 10,  "enabled": True,  "disable_tpsl": True},
-    "SOL":  {"amount_usd": 15,  "leverage": 20,  "enabled": False, "disable_tpsl": True},
-    "ETH":  {"amount_usd": 20,  "leverage": 5,   "enabled": False, "disable_tpsl": True},
-    "BTC":  {"amount_usd": 50,  "leverage": 3,   "enabled": False, "disable_tpsl": True},
-    "DOGE": {"amount_usd": 5,   "leverage": 50,  "enabled": False, "disable_tpsl": True},
+    "XRP": {"amount_usd": 10, "leverage": 10, "enabled": True, "disable_tpsl": True},
+    "SOL": {"amount_usd": 15, "leverage": 20, "enabled": False, "disable_tpsl": True},
+    "ETH": {"amount_usd": 20, "leverage": 5, "enabled": False, "disable_tpsl": True},
+    "BTC": {"amount_usd": 50, "leverage": 3, "enabled": False, "disable_tpsl": True},
+    "DOGE": {"amount_usd": 5, "leverage": 50, "enabled": False, "disable_tpsl": True},
 }
 
 SETTINGS_FILE = "settings.json"
-STATS_FILE    = "stats.json"
+STATS_FILE = "stats.json"
 
 # ====================== НАСТРОЙКИ ======================
 def load_settings() -> Dict:
@@ -59,8 +58,8 @@ def load_settings() -> Dict:
         save_settings(default)
         return default
 
-def save_settings(s: Dict): 
-    with open(SETTINGS_FILE, "w") as f: 
+def save_settings(s: Dict):
+    with open(SETTINGS_FILE, "w") as f:
         json.dump(s, f, indent=2)
 
 def load_stats() -> Dict:
@@ -72,12 +71,12 @@ def load_stats() -> Dict:
         save_stats(default)
         return default
 
-def save_stats(s: Dict): 
-    with open(STATS_FILE, "w") as f: 
+def save_stats(s: Dict):
+    with open(STATS_FILE, "w") as f:
         json.dump(s, f, indent=2)
 
 settings = load_settings()
-stats    = load_stats()
+stats = load_stats()
 
 # ====================== ГЛОБАЛЬНЫЕ ======================
 client = httpx.AsyncClient(timeout=60.0)
@@ -187,8 +186,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         coin = data[5:]
         status = "ON" if settings[coin]["enabled"] else "OFF"
         kb = [
-            [InlineKeyboardButton("ВКЛ/ВЫКЛ", callback_data=f"toggle_{coin}")],
-            [InlineKeyboardButton("Назад", callback_data="main")],
+            [InlineKeyboardButton("ВКЛ / ВЫКЛ", callback_data=f"toggle_{coin}")],
+            [InlineKeyboardButton("Назад", callback_data="back")],
         ]
         await q.edit_message_text(
             f"<b>{coin}</b> — {status}\n"
@@ -201,14 +200,14 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         coin = data[7:]
         settings[coin]["enabled"] = not settings[coin]["enabled"]
         save_settings(settings)
-        await button(update, context)  # обновить текущее меню
+        await button(update, context)  # обновляем текущее меню
 
     elif data == "bal":
         b = await balance()
         await q.edit_message_text(
             f"<b>Баланс Futures:</b> <code>{b:,.2f}</code> USDT",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="main")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="back")]])
         )
 
     elif data == "stats":
@@ -216,10 +215,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for c in COINS:
             text += f"{c}: <code>{stats['per_coin'].get(c,0):+.2f}</code> USDT\n"
         await q.edit_message_text(text, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="main")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="back")]])
         )
 
-    elif data == "main":
+    elif data == "back":  # ← теперь работает!
         await start(update, context)
 
 # ====================== FASTAPI ======================
@@ -243,15 +242,22 @@ app = FastAPI(lifespan=lifespan)
 async def root():
     return HTMLResponse("<h1>Бот работает</h1>")
 
+# ====================== Webhook ======================
 @app.post("/webhook")
 async def webhook(req: Request):
     try:
         data = await req.json()
         if data.get("secret") != WEBHOOK_SECRET:
             raise HTTPException(403)
+        
         sig = data.get("signal", "").lower()
-        coin = data.get("coin", "XRP").upper()
-        if coin not in COINS: return {"error": "unknown coin"}
+        coin_raw = data.get("coin", "XRP").upper()
+        coin = coin_raw.replace("USDT", "").replace(".P", "")   # ← вот эта магия
+        
+        if coin not in COINS:
+            await tg(f"Неизвестный коин: {coin} (получено: {coin_raw})")
+            return {"error": "unknown coin"}
+        
         if sig in ["buy", "long"]:
             asyncio.create_task(open_long(coin))
         elif sig == "close_all":
