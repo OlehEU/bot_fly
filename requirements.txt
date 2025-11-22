@@ -8,6 +8,8 @@ requests
 httpx
 pydantic
 python-dotenv
+pandas
+pandas-ta
 
 
 
