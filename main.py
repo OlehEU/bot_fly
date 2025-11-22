@@ -246,54 +246,61 @@ async def root():
 # ====================== SCANNER ======================
 @app.get("/scanner")
 async def scanner_dashboard():
-    # Получаем свежие данные для XRP
-    data = await api("GET", "/fapi/v1/klines", {"symbol": "XRPUSDT", "interval": "5m", "limit": 100}, signed=False)
-    candles = []
-    for c in data:
-        candles.append({
-            "t": c[0],
-            "o": float(c[1]),
-            "h": float(c[2]),
-            "l": float(c[3]),
-            "c": float(c[4]),
-            "v": float(c[5])
-        })
-    
-    return HTMLResponse(f"""
+    return HTMLResponse("""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>ТЕРМИНАТОР 2026 — СВОЙ ГРАФИК</title>
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <title>ТЕРМИНАТОР 2026 — ЖИВ</title>
+        <meta charset="utf-8">
         <style>
-            body {{background:#000; color:#0f0; font-family:monospace; padding:20px;}}
-            canvas {{background:#111; border:1px solid #0f0; border-radius:10px;}}
+            body {margin:0; background:#000; color:#0f0; font-family: 'Courier New', monospace; overflow:hidden;}
+            .header {text-align:center; padding:15px; background:#111; border-bottom:2px solid #0f0; text-shadow:0 0 10px #0f0;}
+            h1 {margin:0; font-size:2.5em;}
+            .status {font-size:1.2em; margin-top:8px;}
+            .widget {width:100%; height:calc(100vh - 100px);}
         </style>
     </head>
     <body>
-        <h1>ТЕРМИНАТОР 2026 — XRP 5M</h1>
-        <canvas id="chart" width="1200" height="600"></canvas>
-        <script>
-            const ctx = document.getElementById('chart').getContext('2d');
-            const chart = new Chart(ctx, {{
-                type: 'candlestick',
-                data: {{
-                    datasets: [{{
-                        label: 'XRP/USDT',
-                        data: {json.dumps(candles)},
-                        borderColor: '#0f0',
-                        backgroundColor: '#0f0'
-                    }}]
-                }},
-                options: {{
-                    scales: {{
-                        x: {{ type: 'time' }},
-                        y: {{ type: 'linear' }}
-                    }},
-                    plugins: {{ legend: {{ display: false }} }}
-                }}
-            }});
-        </script>
+        <div class="header">
+            <h1>ТЕРМИНАТОР 2026</h1>
+            <div class="status">АВТОТРЕЙДИНГ 24/7 • OZ СТРАТЕГИЯ • XRP • SOL • ETH • BTC • DOGE</div>
+        </div>
+
+        <div class="widget">
+            <!-- TradingView Widget (официальный, без ограничений) -->
+            <div class="tradingview-widget-container">
+                <div id="tvchart" style="height:100%; width:100%;"></div>
+                <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+                <script type="text/javascript">
+                new TradingView.widget({
+                    "container_id": "tvchart",
+                    "width": "100%",
+                    "height": "100%",
+                    "symbol": "BINANCE:XRPUSDT",
+                    "interval": "5",
+                    "timezone": "Etc/UTC",
+                    "theme": "dark",
+                    "style": "1",
+                    "locale": "ru",
+                    "toolbar_bg": "#0f0f0f",
+                    "enable_publishing": false,
+                    "hide_side_toolbar": false,
+                    "allow_symbol_change": true,
+                    "studies": [
+                        "MASimple@tv-basicstudies",
+                        "RSI@tv-basicstudies",
+                        "Volume@tv-basicstudies"
+                    ],
+                    "show_popup_button": true,
+                    "popup_width": "1000",
+                    "popup_height": "650"
+                });
+                </script>
+            </div>
+        </div>
+
+        <!-- УБРАЛИ ЭТУ СТРОКУ — БОЛЬШЕ НИКАКИХ ПЕРЕЗАГРУЗОК! -->
+        <!-- <script>setInterval(() => location.reload(), 10000);</script> -->
     </body>
     </html>
     """)
