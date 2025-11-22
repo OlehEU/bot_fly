@@ -245,16 +245,49 @@ async def root():
 
 # ====================== SCANNER ======================
 @app.get("/scanner")
-async def scanner():
+async def scanner_dashboard():
     return HTMLResponse("""
+    <!DOCTYPE html>
     <html>
-    <head><title>СКАНЕР OZ 2026</title></head>
-    <body style="background:black;color:lime;font-family:monospace">
-        <h1>🚀 ТЕРМИНАТОР АКТИВЕН</h1>
-        <p>Мониторим: XRP, SOL, ETH, BTC, DOGE</p>
-        <iframe src="https://www.tradingview.com/chart/?symbol=BINANCE:XRPUSDT&theme=dark" width="100%" height="600" frameborder="0"></iframe>
-        <p><small>Автообновление каждые 10 сек</small></p>
-        <script>setInterval(() => location.reload(), 10000)</script>
+    <head>
+        <title>ТЕРМИНАТОР 2026 — ЖИВ</title>
+        <meta charset="utf-8">
+        <style>
+            body {margin:0; background:#000; color:#0f0; font-family: monospace;}
+            .header {text-align:center; padding:10px; background:#111; text-shadow:0 0 10px #0f0;}
+            .chart {width:100%; height:90vh;}
+            .footer {text-align:center; padding:5px; font-size:12px;}
+        </style>
+        <!-- TradingView Widget BEGIN -->
+        <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+        <script type="text/javascript">
+        new TradingView.widget({
+          "width": "100%",
+          "height": "100%",
+          "symbol": "BINANCE:XRPUSDT",
+          "interval": "5",
+          "timezone": "Etc/UTC",
+          "theme": "dark",
+          "style": "1",
+          "locale": "ru",
+          "toolbar_bg": "#0f0f0f",
+          "enable_publishing": false,
+          "hide_top_toolbar": false,
+          "save_image": false,
+          "container_id": "tvchart"
+        });
+        </script>
+    </head>
+    <body>
+        <div class="header">
+            <h1>ТЕРМИНАТОР 2026 — АВТОТРЕЙДИНГ 24/7</h1>
+            <p>XRP • SOL • ETH • BTC • DOGE</p>
+        </div>
+        <div class="chart" id="tvchart"></div>
+        <div class="footer">Автообновление каждые 10 сек</div>
+        <script>
+            setInterval(() => location.reload(), 10000);
+        </script>
     </body>
     </html>
     """)
