@@ -220,7 +220,22 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "back":  # ← теперь работает!
         await start(update, context)
-
+        
+# ====================== SCANNER ======================
+@app.get("/scanner")
+async def scanner():
+    return HTMLResponse("""
+    <html>
+    <head><title>СКАНЕР OZ 2026</title></head>
+    <body style="background:black;color:lime;font-family:monospace">
+        <h1>🚀 ТЕРМИНАТОР АКТИВЕН</h1>
+        <p>Мониторим: XRP, SOL, ETH, BTC, DOGE</p>
+        <iframe src="https://www.tradingview.com/chart/?symbol=BINANCE:XRPUSDT&theme=dark" width="100%" height="600" frameborder="0"></iframe>
+        <p><small>Автообновление каждые 10 сек</small></p>
+        <script>setInterval(() => location.reload(), 10000)</script>
+    </body>
+    </html>
+    """)
 # ====================== FASTAPI ======================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
