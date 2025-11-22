@@ -250,44 +250,49 @@ async def scanner_dashboard():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>ТЕРМИНАТОР 2026 — ЖИВ</title>
+        <title>ТЕРМИНАТОР 2026 — СКАНЕР</title>
         <meta charset="utf-8">
         <style>
             body {margin:0; background:#000; color:#0f0; font-family: monospace;}
             .header {text-align:center; padding:10px; background:#111; text-shadow:0 0 10px #0f0;}
-            .chart {width:100%; height:90vh;}
+            .widget {width:100%; height:90vh;}
             .footer {text-align:center; padding:5px; font-size:12px;}
         </style>
-        <!-- TradingView Widget BEGIN -->
-        <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
-        <script type="text/javascript">
-        new TradingView.widget({
-          "width": "100%",
-          "height": "100%",
-          "symbol": "BINANCE:XRPUSDT",
-          "interval": "5",
-          "timezone": "Etc/UTC",
-          "theme": "dark",
-          "style": "1",
-          "locale": "ru",
-          "toolbar_bg": "#0f0f0f",
-          "enable_publishing": false,
-          "hide_top_toolbar": false,
-          "save_image": false,
-          "container_id": "tvchart"
-        });
-        </script>
     </head>
     <body>
         <div class="header">
-            <h1>ТЕРМИНАТОР 2026 — АВТОТРЕЙДИНГ 24/7</h1>
-            <p>XRP • SOL • ETH • BTC • DOGE</p>
+            <h1>ТЕРМИНАТОР 2026 — АВТОТРЕЙДИНГ</h1>
+            <p>XRP • SOL • ETH • BTC • DOGE | OZ Стратегия</p>
         </div>
-        <div class="chart" id="tvchart"></div>
-        <div class="footer">Автообновление каждые 10 сек</div>
-        <script>
-            setInterval(() => location.reload(), 10000);
-        </script>
+        <div class="widget">
+            <!-- TradingView Widget BEGIN -->
+            <div class="tradingview-widget-container">
+                <div id="tvchart"></div>
+                <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+                <script type="text/javascript">
+                new TradingView.widget({
+                    "width": "100%",
+                    "height": "100%",
+                    "symbol": "BINANCE:XRPUSDT",
+                    "interval": "5",
+                    "timezone": "Etc/UTC",
+                    "theme": "dark",
+                    "style": "1",
+                    "locale": "ru",
+                    "toolbar_bg": "#f1f3f6",
+                    "enable_publishing": false,
+                    "hide_top_toolbar": false,
+                    "save_image": false,
+                    "container_id": "tvchart",
+                    "studies": ["MASimple@tv-basicstudies"],
+                    "lineColors": ["#0f0","#0f0","#0f0"]
+                });
+                </script>
+            </div>
+            <!-- TradingView Widget END -->
+        </div>
+        <div class="footer">Автообновление каждые 10 сек | Сигналы OZ: EMA5 + RSI7 + Volume</div>
+        <script>setInterval(() => location.reload(), 10000);</script>
     </body>
     </html>
     """)
