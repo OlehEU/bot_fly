@@ -304,6 +304,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# ===== Root endpoint для health check =====
+@app.get("/")
+async def root():
+    """
+    Просто чтобы health check Fly.io проходил успешно.
+    """
+    return {"status": "ok", "message": "TERMINATOR 2026 active"}
+
 # ===== Scanner API =====
 @app.post("/scanner_ping")
 async def scanner_ping(request: Request):
