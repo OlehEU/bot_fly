@@ -16,7 +16,7 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 from fastapi.staticfiles import StaticFiles # ИМПОРТ ЛОГОВ
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup # ИМПОРТ для меню ТГ, сканер+кнопка
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -224,48 +224,89 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "back":  # ← теперь работает!
         await start(update, context)
 
-# ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
-# ВСЁ, ЧТО НИЖЕ — ДОБАВЛЯЙ В КОНЕЦ main.py (перед polling)
-# ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
+# ====================== НОВАЯ КОМАНДА /scanner + КНОПКА ВКЛ/ВЫКЛ ======================
 
+# Глобальные переменные для статуса сканера
+scanner_status = {
+    "online": False,
+    "last_seen": 0,
+    "enabled": True
+}
 
+# Пинг от сканера (добавь в scanner.py — в конец цикла)
+@app.post("/scanner_ping")
+async def scanner_ping():
+    scanner_status["online"] = True
+    scanner_status["last_seen"] = int(time.time())
+    return {"ok": True}
 
-# Команда /scanner — показывает статус и кнопку
-@dp.message_handler(commands=['scanner'])
-async def cmd_scanner(message: types.Message):
-    if message.from_user.id != ADMIN_ID:        # ← твой ADMIN_ID уже есть в коде
+# Вкл/Выкл сканера
+@app.post("/toggle_scanner")
+async def toggle_scanner():
+    scanner_status["enabled"] = not scanner_status["enabled"]
+    await tg_send(f"СКАНЕР OZ теперь {'ВКЛЮЧЁН 🟢' if scanner_status['enabled'] else 'ВЫКЛЮЧЕН 🔴'}")
+    return {"enabled": scanner_status["enabled"]}
+
+# Статус для команды /scanner
+@app.get("/scanner_status")
+async def get_scanner_status():
+    ago = int(time.time()) - scanner_status["last_seen"]
+    if ago > 120:  # больше 2 минут — считаем оффлайн
+        scanner_status["online"] = False
+    return {
+        "online": scanner_status["online"],
+        "enabled": scanner_status["enabled"],
+        "last_seen_seconds_ago": ago
+    }
+
+# Команда /scanner в Telegram
+async def cmd_scanner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != TELEGRAM_CHAT_ID:
         return
-    
     try:
-        status = (await httpx.AsyncClient().get("https://bot-fly-oz.fly.dev/scanner_status")).json()
+        status = (await httpx.get("https://bot-fly-oz.fly.dev/scanner_status")).json()
     except:
         status = {"online": False, "enabled": False, "last_seen_seconds_ago": 999}
 
     text = (
-        f"СКАНЕР OZ 2026\n\n"
+        f"<b>СКАНЕР OZ 2026</b>\n\n"
         f"Статус: {'🟢 ОНЛАЙН' if status['online'] else '🔴 ОФФЛАЙН'}\n"
         f"Режим: {'ВКЛЮЧЁН' if status['enabled'] else 'ВЫКЛЮЧЕН'}\n"
         f"Последний пинг: {status['last_seen_seconds_ago']} сек назад\n\n"
-        f"Торговля: {'АКТИВНА' if status['enabled'] and status['online'] else 'ОСТАНОВЛЕНА'}"
+        f"Торговля: {'АКТИВНА ✅' if status['enabled'] and status['online'] else 'ОСТАНОВЛЕНА ⛔'}"
     )
-    
-    keyboard = InlineKeyboardMarkup()
-    btn_text = "ВЫКЛЮЧИТЬ СКАНЕР" if status['enabled'] else "ВКЛЮЧИТЬ СКАНЕР"
-    keyboard.add(InlineKeyboardButton(btn_text, callback_data="toggle_scanner"))
-    
-    await message.answer(text, reply_markup=keyboard)
 
-# Кнопка ВКЛ/ВЫКЛ
-@dp.callback_query_handler(lambda c: c.data == "toggle_scanner")
-async def toggle_scanner_btn(call: types.CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        return
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "ВЫКЛЮЧИТЬ СКАНЕР" if status['enabled'] else "ВКЛЮЧИТЬ СКАНЕР",
+            callback_data="toggle_scanner"
+        )
+    ]])
+
+    await update.message.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+# Обработчик кнопки
+async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "toggle_scanner":
+        await httpx.post("https://bot-fly-oz.fly.dev/toggle_scanner")
+        await query.message.edit_reply_markup(reply_markup=None)
+        await cmd_scanner(update, context)
+
+# Добавь эти обработчики в lifespan (там, где остальные add_handler)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global bot
+    bot = Bot(TELEGRAM_TOKEN)
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    await httpx.post("https://bot-fly-oz.fly.dev/toggle_scanner")
-    await call.answer("Готово!", show_alert=True)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("scanner", cmd_scanner))  # ← новая команда
+    application.add_handler(CallbackQueryHandler(button_click))     # ← кнопка
     
-    # Обновляем сообщение
-    await cmd_scanner(call.message)
+    # ... остальной код lifespan без изменений ...
         
 # ====================== FASTAPI ======================
 @asynccontextmanager
