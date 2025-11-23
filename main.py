@@ -309,11 +309,64 @@ async def get_scanner_status():
 async def root():
     return HTMLResponse("<h1>ТЕРМИНАТОР 2026 — РАБОТАЕТ 24/7</h1><p><a href='/scanner'>График</a> | <a href='/logs'>Логи сигналов</a></p>")
 
+# ------------------------СКАНЕР--------------------------
 @app.get("/scanner")
 async def scanner_dashboard():
-    return HTMLResponse("""... твой красивый дашборд с TradingView ...""")  # оставь свой
+    return HTMLResponse("""
+    <!DOCTYPE html>
+    <html lang="ru">
+    <head>
+        <meta charset="utf-8">
+        <title>ТЕРМИНАТОР 2026 — СКАНЕР</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body,html {margin:0;padding:0;height:100%;background:#000;color:#0f0;font-family:'Courier New',monospace;overflow:hidden;}
+            .header {text-align:center;padding:15px;background:#111;border-bottom:2px solid #0f0;box-shadow:0 0 20px #0f0;}
+            h1 {margin:0;font-size:2.8em;text-shadow:0 0 15px #0f0;}
+            .status {font-size:1.3em;margin-top:8px;}
+            .container {height:calc(100vh - 100px);width:100%;}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>ТЕРМИНАТОР 2026</h1>
+            <div class="status">XRP • SOL • ETH • BTC • DOGE — 5m сканер OZ 2026</div>
+        </div>
+        <div class="container">
+            <div class="tradingview-widget-container" style="height:100%;width:100%;">
+                <div id="tradingview_chart"></div>
+                <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+                <script type="text/javascript">
+                new TradingView.widget({
+                    "width": "100%",
+                    "height": "100%",
+                    "symbol": "BINANCE:XRPUSDT.P",
+                    "interval": "5",
+                    "timezone": "Etc/UTC",
+                    "theme": "dark",
+                    "style": "1",
+                    "locale": "ru",
+                    "toolbar_bg": "#f1f3f6",
+                    "enable_publishing": false,
+                    "allow_symbol_change": true,
+                    "studies": [
+                        "MASimple@tv-basicstudies",
+                        "RSI@tv-basicstudies",
+                        "Volume@tv-basicstudies"
+                    ],
+                    "container_id": "tradingview_chart",
+                    "hide_side_toolbar": false,
+                    "save_image": false
+                });
+                </script>
+            </div>
+        </div>
+    </body>
+    </html>
+    """)
+# ------------------------/СКАНЕР--------------------------
 
-# Страница с логами
+# ------------------------ЛОГИ, СИГНАЛЫ--------------------
 @app.get("/logs")
 async def signal_logs():
     try:
@@ -361,6 +414,7 @@ async def signal_logs():
     </body>
     </html>
     """)
+# --------------------/ЛОГИ, СИГНАЛЫ--------------------
 
 # ====================== WEBHOOK ======================
 @app.post("/webhook")
