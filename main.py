@@ -219,11 +219,12 @@ async def get_scanner_status_remote():
     try:
         r = await client.get(f"{BOT_BASE}/scanner_status", timeout=5)
         status = r.json()
-        config = load_scanner_config()
+        config = status.get("tf", load_scanner_config())  # <- берём актуальные таймфреймы
     except Exception:
         status = {"online": False, "enabled": False, "last_seen_seconds_ago": 999}
-        config = {}
+        config = load_scanner_config()
     return status, config
+    
 
 def generate_scanner_text(status: dict, config: dict):
     tf_text = "\n".join([f"{c}: <b>{config.get(c, '—')}</b>" for c in COINS])
