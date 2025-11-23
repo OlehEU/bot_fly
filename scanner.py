@@ -1,133 +1,85 @@
-# scanner.py — БЕСПЛАТНЫЙ СКАНЕР OZ 2026 (работает на Python 3.11)
+# scanner.py — ПОЛНАЯ ЗАМЕНА TRADINGVIEW (бесплатно, быстро, надёжно)
 import asyncio
 import httpx
-import pandas as pd
 import ccxt.async_support as ccxt
+import pandas as pd
 from datetime import datetime
-import os
-import numpy as np
 
-# ====================== НАСТРОЙКИ ======================
-WEBHOOK_URL = "https://bot-fly-oz.fly.dev/webhook"
+# === НАСТРОЙКИ ===
+WEBHOOK = "https://bot-fly-oz.fly.dev/webhook"
 SECRET = "supersecret123"
 
+# Коины, которые мониторим (добавляй сколько хочешь)
 COINS = ["XRP", "SOL", "ETH", "BTC", "DOGE"]
-TIMEFRAME = "5m"
-CHECK_INTERVAL = 30  # секунд
 
-# Параметры OZ стратегии
+# Параметры твоей стратегии OZ (точно как в Pine Script)
 EMA_LENGTH = 5
 RSI_LENGTH = 7
 RSI_THRESHOLD = 40
 VOLUME_MULTIPLIER = 1.5
+TIMEFRAME = "5m"
+CHECK_INTERVAL = 25  # секунд (можно и 10)
 
 exchange = ccxt.binance({
     'enableRateLimit': True,
     'options': {'defaultType': 'future'}
 })
 
-# ====================== RSI ФУНКЦИЯ (вместо pandas-ta) ======================
-def calculate_rsi(prices, window=14):
-    delta = prices.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+# === RSI и EMA вручную (без pandas-ta) ===
+def rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-# ====================== EMA ФУНКЦИЯ ======================
-def calculate_ema(prices, window):
-    return prices.ewm(span=window).mean()
-
-# ====================== СИГНАЛЫ ======================
 async def send_signal(coin: str, signal: str):
-    payload = {
-        "secret": SECRET,
-        "signal": signal,
-        "coin": coin
-    }
-    try:
-        async with httpx.AsyncClient() as client:
-            await client.post(WEBHOOK_URL, json=payload, timeout=10.0)
-        print(f"✅ СИГНАЛ {signal.upper()} {coin} отправлен в бот!")
-    except Exception as e:
-        print(f"❌ Ошибка отправки {coin}: {e}")
+    payload = {"secret": SECRET, "signal": signal, "coin": coin}
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.post(WEBHOOK, json=payload, timeout=10)
+            print(f"{datetime.now().strftime('%H:%M:%S')} → {signal.upper()} {coin}")
+        except:
+            print(f"Ошибка отправки сигнала {coin}")
 
-# ====================== ПОЛУЧЕНИЕ ДАННЫХ ======================
-async def fetch_ohlcv(symbol: str):
+async def check_coin(coin: str):
     try:
+        symbol = f"{coin}/USDT"
         bars = await exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=100)
-        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df
-    except Exception as e:
-        print(f"❌ Ошибка загрузки {symbol}: {e}")
-        return pd.DataFrame()
+        df = pd.DataFrame(bars, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
+        
+        df['ema'] = df['close'].ewm(span=EMA_LENGTH).mean()
+        df['rsi'] = rsi(df['close'], RSI_LENGTH)
+        df['vol_sma'] = df['volume'].rolling(20).mean()
 
-# ====================== СТРАТЕГИЯ OZ ======================
-async def check_oz_strategy(coin: str):
-    symbol = f"{coin}/USDT"
-    df = await fetch_ohlcv(symbol)
-    
-    if len(df) < 50:
-        return
+        close = df['close'].iloc[-1]
+        ema = df['ema'].iloc[-1]
+        rsi_val = df['rsi'].iloc[-1]
+        vol_spike = df['volume'].iloc[-1] > df['vol_sma'].iloc[-1] * VOLUME_MULTIPLIER
 
-    # Индикаторы (встроенные в pandas)
-    df['ema'] = calculate_ema(df['close'], EMA_LENGTH)
-    df['rsi'] = calculate_rsi(df['close'], RSI_LENGTH)
-    df['vol_sma'] = df['volume'].rolling(window=20).mean()
-
-    # Текущие значения
-    current_close = df['close'].iloc[-1]
-    current_ema = df['ema'].iloc[-1]
-    current_rsi = df['rsi'].iloc[-1]
-    current_volume = df['volume'].iloc[-1]
-    vol_sma = df['vol_sma'].iloc[-1]
-
-    volume_spike = current_volume > vol_sma * VOLUME_MULTIPLIER
-
-    # Проверяем текущую позицию
-    try:
+        # Проверяем, есть ли уже позиция
         positions = await exchange.fetch_positions([symbol])
         has_position = any(p['contracts'] > 0 for p in positions)
+
+        # === ТОЧНО КАК В ТВОЕЙ СТРАТЕГИИ ===
+        buy = close > ema and rsi_val > RSI_THRESHOLD and vol_spike and not has_position
+        sell = close < ema and has_position
+
+        if buy:
+            await send_signal(coin, "buy")
+        elif sell:
+            await send_signal(coin, "close_all")
+
     except Exception as e:
-        print(f"❌ Ошибка проверки позиции {coin}: {e}")
-        has_position = False
+        print(f"Ошибка {coin}: {e}")
 
-    # СИГНАЛЫ
-    buy_signal = (current_close > current_ema and 
-                  current_rsi > RSI_THRESHOLD and 
-                  volume_spike and 
-                  not has_position)
-
-    sell_signal = (current_close < current_ema and has_position)
-
-    if buy_signal:
-        await send_signal(coin, "buy")
-    elif sell_signal:
-        await send_signal(coin, "close_all")
-
-# ====================== ГЛАВНЫЙ ЦИКЛ ======================
 async def main():
-    print("🚀 OZ СКАНЕР 2026 ЗАПУЩЕН — БЕСПЛАТНО!")
-    print(f"📊 Мониторим: {', '.join(COINS)}")
-    print(f"⏱️  Таймфрейм: {TIMEFRAME} | Проверка каждые {CHECK_INTERVAL} сек")
-    print(f"🔗  Сигналы в: {WEBHOOK_URL}")
-    print("=" * 50)
-
+    print("ЗАМЕНА TRADINGVIEW ЗАПУЩЕНА — СВОБОДА!")
+    print(f"Мониторим: {', '.join(COINS)} | {TIMEFRAME} | Каждые {CHECK_INTERVAL}с")
     while True:
-        try:
-            # Проверяем все коины параллельно
-            tasks = [check_oz_strategy(coin) for coin in COINS]
-            await asyncio.gather(*tasks, return_exceptions=True)
-            
-            print(f"✅ {datetime.now().strftime('%H:%M:%S')} — Проверка завершена")
-        except KeyboardInterrupt:
-            print("\n🛑 Сканер остановлен")
-            break
-        except Exception as e:
-            print(f"❌ Критическая ошибка: {e}")
-        
+        await asyncio.gather(*[check_coin(c) for c in COINS])
         await asyncio.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
