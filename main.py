@@ -197,6 +197,7 @@ async def close_all(coin: str):
 
 # ===== Telegram helpers =====
 async def tg(text: str):
+    global bot
     if bot:
         try:
             await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
@@ -270,13 +271,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bot
-    bot = Bot(TELEGRAM_TOKEN)
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_handler))
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
+
+    bot = application.bot
     await tg("ТЕРМИНАТОР 2026 АКТИВИРОВАН")
     yield
     await application.stop()
