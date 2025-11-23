@@ -211,7 +211,10 @@ async def tg_balance():
     except Exception:
         log.exception("tg_balance failed")
 
-async def show_scanner_status(query_or_update):
+# ===== Scanner helpers =====
+ALLOWED_TFS = {"1m","3m","5m","15m","30m","45m","1h"}
+
+async def get_scanner_status_remote():
     try:
         r = await client.get(f"{BOT_BASE}/scanner_status", timeout=5)
         status = r.json()
@@ -219,8 +222,11 @@ async def show_scanner_status(query_or_update):
     except Exception:
         status = {"online": False, "enabled": False, "last_seen_seconds_ago": 999}
         config = {}
+    return status, config
+
+def generate_scanner_text(status: dict, config: dict):
     tf_text = "\n".join([f"{c}: <b>{config.get(c, '—')}</b>" for c in COINS])
-    text = (
+    return (
         f"<b>СКАНЕР OZ 2026</b>\n\n"
         f"Статус: {'ОНЛАЙН' if status.get('online') else 'ОФФЛАЙН'}\n"
         f"Режим: {'ВКЛЮЧЁН' if status.get('enabled') else 'ВЫКЛЮЧЕН'}\n"
@@ -228,13 +234,20 @@ async def show_scanner_status(query_or_update):
         f"<b>Таймфреймы:</b>\n{tf_text}\n\n"
         f"Торговля: {'АКТИВНА' if status.get('enabled') and status.get('online') else 'ОСТАНОВЛЕНА'}"
     )
-    keyboard = InlineKeyboardMarkup([
+
+def generate_scanner_keyboard(status: dict):
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("XRP", callback_data="tf_XRP"), InlineKeyboardButton("SOL", callback_data="tf_SOL")],
         [InlineKeyboardButton("ETH", callback_data="tf_ETH"), InlineKeyboardButton("BTC", callback_data="tf_BTC")],
         [InlineKeyboardButton("DOGE", callback_data="tf_DOGE")],
         [InlineKeyboardButton("ВЫКЛ СКАНЕР" if status.get('enabled') else "ВКЛ СКАНЕР", callback_data="toggle_scanner")],
         [InlineKeyboardButton("Назад", callback_data="back")]
     ])
+
+async def show_scanner_status(query_or_update):
+    status, config = await get_scanner_status_remote()
+    text = generate_scanner_text(status, config)
+    keyboard = generate_scanner_keyboard(status)
     if hasattr(query_or_update, "edit_message_text"):
         await query_or_update.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
     else:
@@ -257,15 +270,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+
     if data.startswith("tf_"):
         coin = data.split("_")[1]
-        await send_set_tf_to_scanner(coin, "5m")
-        await show_scanner_status(query)
+        tf = "5m"  # Для примера, можно сделать динамический выбор
+        if coin in COINS and tf in ALLOWED_TFS:
+            await send_set_tf_to_scanner(coin, tf)
     elif data == "toggle_scanner":
-        scanner_status["enabled"] = not scanner_status["enabled"]
-        await show_scanner_status(query)
+        try:
+            headers = {"Authorization": f"Bearer {WEBHOOK_SECRET}"}
+            await client.post(f"{BOT_BASE}/toggle_scanner", headers=headers, timeout=5)
+        except Exception:
+            log.exception("toggle_scanner request failed")
     elif data == "back":
-        await show_scanner_status(query)
+        pass
+    await show_scanner_status(query)
 
 # ===== FastAPI app =====
 @asynccontextmanager
@@ -319,8 +338,7 @@ async def set_tf(req: Request):
     data = await req.json()
     coin = data.get("coin")
     tf = data.get("tf")
-    allowed = {"1m","3m","5m","15m","30m","45m","1h"}
-    if coin in COINS and tf in allowed:
+    if coin in COINS and tf in ALLOWED_TFS:
         config = load_scanner_config()
         config[coin] = tf
         atomic_write_json(SCANNER_CONFIG_FILE, config)
