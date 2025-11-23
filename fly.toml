@@ -25,10 +25,10 @@ primary_region = "fra"
     soft_limit = 25
     hard_limit = 50
 
-  # Health check на рабочий путь /health
   [[services.http_checks]]
     interval = "10s"
     timeout = "5s"
     grace_period = "15s"
     method = "GET"
-    path = "/health"
+    path = "/" # ← соответствует твоему root endpoint
+
