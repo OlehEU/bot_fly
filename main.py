@@ -1,4 +1,4 @@
-# main.py — ТЕРМИНАТОР 2026 PATCHED FULL
+# main.py — ТЕРМИНАТОР 2026 PATCHED FULL (с исправленным меню TF)
 import os
 import json
 import time
@@ -235,14 +235,21 @@ def generate_scanner_text(status: dict, config: dict):
         f"Торговля: {'АКТИВНА' if status.get('enabled') and status.get('online') else 'ОСТАНОВЛЕНА'}"
     )
 
-def generate_scanner_keyboard(status: dict):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("XRP", callback_data="tf_XRP"), InlineKeyboardButton("SOL", callback_data="tf_SOL")],
-        [InlineKeyboardButton("ETH", callback_data="tf_ETH"), InlineKeyboardButton("BTC", callback_data="tf_BTC")],
-        [InlineKeyboardButton("DOGE", callback_data="tf_DOGE")],
-        [InlineKeyboardButton("ВЫКЛ СКАНЕР" if status.get('enabled') else "ВКЛ СКАНЕР", callback_data="toggle_scanner")],
-        [InlineKeyboardButton("Назад", callback_data="back")]
-    ])
+def generate_scanner_keyboard(status: dict, current_coin: Optional[str] = None):
+    if current_coin:
+        buttons = [
+            [InlineKeyboardButton(tf, callback_data=f"settf_{current_coin}_{tf}") for tf in TF_OPTIONS[i:i+3]]
+            for i in range(0, len(TF_OPTIONS), 3)
+        ]
+        buttons.append([InlineKeyboardButton("Назад", callback_data="back")])
+    else:
+        buttons = [
+            [InlineKeyboardButton("XRP", callback_data="tf_XRP"), InlineKeyboardButton("SOL", callback_data="tf_SOL")],
+            [InlineKeyboardButton("ETH", callback_data="tf_ETH"), InlineKeyboardButton("BTC", callback_data="tf_BTC")],
+            [InlineKeyboardButton("DOGE", callback_data="tf_DOGE")],
+            [InlineKeyboardButton("ВЫКЛ СКАНЕР" if status.get('enabled') else "ВКЛ СКАНЕР", callback_data="toggle_scanner")],
+        ]
+    return InlineKeyboardMarkup(buttons)
 
 async def show_scanner_status(query_or_update):
     status, config = await get_scanner_status_remote()
@@ -262,6 +269,8 @@ async def send_set_tf_to_scanner(coin: str, tf: str):
         log.exception("Не удалось послать set_tf на сканер")
 
 # ===== Telegram Handlers =====
+TF_OPTIONS = ["1m","3m","5m","15m","30m","45m","1h"]
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("ТЕРМИНАТОР 2026 активирован! 🚀", parse_mode="HTML")
     await show_scanner_status(update)
@@ -271,20 +280,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
+    status, config = await get_scanner_status_remote()
+
+    # ----- выбор монеты -----
     if data.startswith("tf_"):
         coin = data.split("_")[1]
-        tf = "5m"  # Для примера, можно сделать динамический выбор
-        if coin in COINS and tf in ALLOWED_TFS:
+        keyboard = generate_scanner_keyboard(status, current_coin=coin)
+        text = f"Выберите таймфрейм для <b>{coin}</b> (текущий: {config.get(coin,'—')})"
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+    # ----- выбор таймфрейма -----
+    elif data.startswith("settf_"):
+        _, coin, tf = data.split("_")
+        if coin in COINS and tf in TF_OPTIONS:
             await send_set_tf_to_scanner(coin, tf)
+            await tg(f"{coin} → таймфрейм изменён на <b>{tf}</b>")
+        await show_scanner_status(query)
+
+    # ----- toggle сканера -----
     elif data == "toggle_scanner":
         try:
             headers = {"Authorization": f"Bearer {WEBHOOK_SECRET}"}
             await client.post(f"{BOT_BASE}/toggle_scanner", headers=headers, timeout=5)
         except Exception:
             log.exception("toggle_scanner request failed")
+        await show_scanner_status(query)
+
+    # ----- назад -----
     elif data == "back":
-        pass
-    await show_scanner_status(query)
+        await show_scanner_status(query)
 
 # ===== FastAPI app =====
 @asynccontextmanager
@@ -296,7 +320,6 @@ async def lifespan(app: FastAPI):
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
-
     bot = application.bot
     await tg("ТЕРМИНАТОР 2026 АКТИВИРОВАН")
     yield
@@ -307,9 +330,6 @@ app = FastAPI(lifespan=lifespan)
 # ===== Root endpoint для health check =====
 @app.get("/")
 async def root():
-    """
-    Просто чтобы health check Fly.io проходил успешно.
-    """
     return {"status": "ok", "message": "TERMINATOR 2026 active"}
 
 # ===== Scanner API =====
