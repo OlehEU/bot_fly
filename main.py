@@ -1,4 +1,4 @@
-# main.py — ТЕРМИНАТОР 2026 PATCHED FULL (с исправленным меню TF)
+# main.py — ТЕРМИНАТОР 2026 PATCHED FULL (с главным меню)
 import os
 import json
 import time
@@ -211,104 +211,93 @@ async def tg_balance():
     except Exception:
         log.exception("tg_balance failed")
 
-# ===== Scanner helpers =====
-ALLOWED_TFS = {"1m","3m","5m","15m","30m","45m","1h"}
+# ===== Меню Telegram =====
+TF_OPTIONS = ["1m","3m","5m","15m","30m","45m","1h"]
 
-async def get_scanner_status_remote():
-    try:
-        r = await client.get(f"{BOT_BASE}/scanner_status", timeout=5)
-        status = r.json()
-        config = load_scanner_config()
-    except Exception:
-        status = {"online": False, "enabled": False, "last_seen_seconds_ago": 999}
-        config = {}
-    return status, config
+def main_menu_keyboard():
+    buttons = [
+        [InlineKeyboardButton("Баланс 💰", callback_data="show_balance")],
+        [InlineKeyboardButton("Монеты 📊", callback_data="show_coins")],
+        [InlineKeyboardButton("Статистика 📈", callback_data="show_stats")],
+        [InlineKeyboardButton("Сканер 🔍", callback_data="show_scanner")],
+    ]
+    return InlineKeyboardMarkup(buttons)
 
-def generate_scanner_text(status: dict, config: dict):
-    tf_text = "\n".join([f"{c}: <b>{config.get(c, '—')}</b>" for c in COINS])
-    return (
+async def show_main_menu(query_or_update):
+    text = "<b>Главное меню TERMINATOR 2026</b>\nВыберите раздел:"
+    if hasattr(query_or_update, "edit_message_text"):
+        await query_or_update.edit_message_text(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
+    else:
+        await query_or_update.message.reply_text(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
+
+async def show_balance(query_or_update):
+    b = await balance()
+    text = f"<b>Баланс:</b> {b:,.2f} USDT"
+    if hasattr(query_or_update, "edit_message_text"):
+        await query_or_update.edit_message_text(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
+    else:
+        await query_or_update.message.reply_text(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
+
+async def show_coins(query_or_update):
+    lines = []
+    for c in COINS:
+        cfg = settings[c]
+        lines.append(f"{c}: ${cfg['amount_usd']} × {cfg['leverage']}x")
+    text = "<b>Монеты:</b>\n" + "\n".join(lines)
+    if hasattr(query_or_update, "edit_message_text"):
+        await query_or_update.edit_message_text(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
+    else:
+        await query_or_update.message.reply_text(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
+
+async def show_stats(query_or_update):
+    lines = []
+    for c, pnl in stats["per_coin"].items():
+        lines.append(f"{c}: {pnl:+.2f} USDT")
+    text = f"<b>Статистика по монетам:</b>\n" + "\n".join(lines)
+    text += f"\n\n<b>Итоговый PnL:</b> {stats['total_pnl']:+.2f} USDT"
+    if hasattr(query_or_update, "edit_message_text"):
+        await query_or_update.edit_message_text(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
+    else:
+        await query_or_update.message.reply_text(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
+
+# ===== Scanner =====
+async def show_scanner_status(query_or_update):
+    status, config = await get_scanner_status_remote()
+    tf_text = "\n".join([f"{c}: <b>{config.get(c,'—')}</b>" for c in COINS])
+    text = (
         f"<b>СКАНЕР OZ 2026</b>\n\n"
         f"Статус: {'ОНЛАЙН' if status.get('online') else 'ОФФЛАЙН'}\n"
         f"Режим: {'ВКЛЮЧЁН' if status.get('enabled') else 'ВЫКЛЮЧЕН'}\n"
-        f"Пинг: {status.get('last_seen_seconds_ago', 0)} сек назад\n\n"
+        f"Пинг: {status.get('last_seen_seconds_ago',0)} сек назад\n\n"
         f"<b>Таймфреймы:</b>\n{tf_text}\n\n"
         f"Торговля: {'АКТИВНА' if status.get('enabled') and status.get('online') else 'ОСТАНОВЛЕНА'}"
     )
-
-def generate_scanner_keyboard(status: dict, current_coin: Optional[str] = None):
-    if current_coin:
-        buttons = [
-            [InlineKeyboardButton(tf, callback_data=f"settf_{current_coin}_{tf}") for tf in TF_OPTIONS[i:i+3]]
-            for i in range(0, len(TF_OPTIONS), 3)
-        ]
-        buttons.append([InlineKeyboardButton("Назад", callback_data="back")])
-    else:
-        buttons = [
-            [InlineKeyboardButton("XRP", callback_data="tf_XRP"), InlineKeyboardButton("SOL", callback_data="tf_SOL")],
-            [InlineKeyboardButton("ETH", callback_data="tf_ETH"), InlineKeyboardButton("BTC", callback_data="tf_BTC")],
-            [InlineKeyboardButton("DOGE", callback_data="tf_DOGE")],
-            [InlineKeyboardButton("ВЫКЛ СКАНЕР" if status.get('enabled') else "ВКЛ СКАНЕР", callback_data="toggle_scanner")],
-        ]
-    return InlineKeyboardMarkup(buttons)
-
-async def show_scanner_status(query_or_update):
-    status, config = await get_scanner_status_remote()
-    text = generate_scanner_text(status, config)
-    keyboard = generate_scanner_keyboard(status)
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Назад ↩", callback_data="back")]])
     if hasattr(query_or_update, "edit_message_text"):
         await query_or_update.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
     else:
         await query_or_update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
-async def send_set_tf_to_scanner(coin: str, tf: str):
-    url = f"{SCANNER_BASE}/set_tf"
-    headers = {"X-Scanner-Secret": f"Bearer {WEBHOOK_SECRET}"}
-    try:
-        await client.post(url, json={"coin": coin, "tf": tf}, headers=headers, timeout=5)
-    except Exception:
-        log.exception("Не удалось послать set_tf на сканер")
-
 # ===== Telegram Handlers =====
-TF_OPTIONS = ["1m","3m","5m","15m","30m","45m","1h"]
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("ТЕРМИНАТОР 2026 активирован! 🚀", parse_mode="HTML")
-    await show_scanner_status(update)
+    await show_main_menu(update)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
-    status, config = await get_scanner_status_remote()
-
-    # ----- выбор монеты -----
-    if data.startswith("tf_"):
-        coin = data.split("_")[1]
-        keyboard = generate_scanner_keyboard(status, current_coin=coin)
-        text = f"Выберите таймфрейм для <b>{coin}</b> (текущий: {config.get(coin,'—')})"
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
-
-    # ----- выбор таймфрейма -----
-    elif data.startswith("settf_"):
-        _, coin, tf = data.split("_")
-        if coin in COINS and tf in TF_OPTIONS:
-            await send_set_tf_to_scanner(coin, tf)
-            await tg(f"{coin} → таймфрейм изменён на <b>{tf}</b>")
+    if data == "show_balance":
+        await show_balance(query)
+    elif data == "show_coins":
+        await show_coins(query)
+    elif data == "show_stats":
+        await show_stats(query)
+    elif data == "show_scanner":
         await show_scanner_status(query)
-
-    # ----- toggle сканера -----
-    elif data == "toggle_scanner":
-        try:
-            headers = {"Authorization": f"Bearer {WEBHOOK_SECRET}"}
-            await client.post(f"{BOT_BASE}/toggle_scanner", headers=headers, timeout=5)
-        except Exception:
-            log.exception("toggle_scanner request failed")
-        await show_scanner_status(query)
-
-    # ----- назад -----
     elif data == "back":
-        await show_scanner_status(query)
+        await show_main_menu(query)
 
 # ===== FastAPI app =====
 @asynccontextmanager
@@ -366,7 +355,7 @@ async def set_tf(req: Request):
     data = await req.json()
     coin = data.get("coin")
     tf = data.get("tf")
-    if coin in COINS and tf in ALLOWED_TFS:
+    if coin in COINS and tf in TF_OPTIONS:
         config = load_scanner_config()
         config[coin] = tf
         atomic_write_json(SCANNER_CONFIG_FILE, config)
