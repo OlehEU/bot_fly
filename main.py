@@ -38,6 +38,7 @@ COINS = ["XRP", "SOL", "ETH", "BTC", "DOGE"]
 SETTINGS_FILE = "settings.json"
 STATS_FILE = "stats.json"
 SCANNER_CONFIG_FILE = "scanner_config.json"
+SIGNAL_LOG_FILE = "signal_log.json"
 
 # ===== Helpers =====
 def atomic_write_json(path: str, data: Any):
@@ -56,13 +57,7 @@ def load_settings() -> Dict:
                 data[coin] = {"amount_usd": 10, "leverage": 10, "enabled": True, "disable_tpsl": True}
         return data
     except Exception:
-        default = {
-            "XRP": {"amount_usd": 10, "leverage": 10, "enabled": True, "disable_tpsl": True},
-            "SOL": {"amount_usd": 15, "leverage": 20, "enabled": False, "disable_tpsl": True},
-            "ETH": {"amount_usd": 20, "leverage": 5, "enabled": False, "disable_tpsl": True},
-            "BTC": {"amount_usd": 50, "leverage": 3, "enabled": False, "disable_tpsl": True},
-            "DOGE": {"amount_usd": 5, "leverage": 50, "enabled": False, "disable_tpsl": True},
-        }
+        default = {c: {"amount_usd": 10, "leverage": 10, "enabled": True, "disable_tpsl": True} for c in COINS}
         atomic_write_json(SETTINGS_FILE, default)
         return default
 
@@ -219,12 +214,11 @@ async def get_scanner_status_remote():
     try:
         r = await client.get(f"{BOT_BASE}/scanner_status", timeout=5)
         status = r.json()
-        config = status.get("tf", load_scanner_config())  # <- берём актуальные таймфреймы
+        config = load_scanner_config()  # всегда актуальные таймфреймы
     except Exception:
         status = {"online": False, "enabled": False, "last_seen_seconds_ago": 999}
         config = load_scanner_config()
     return status, config
-    
 
 def generate_scanner_text(status: dict, config: dict):
     tf_text = "\n".join([f"{c}: <b>{config.get(c, '—')}</b>" for c in COINS])
@@ -254,7 +248,8 @@ def generate_scanner_keyboard(status: dict, current_coin: Optional[str] = None):
     return InlineKeyboardMarkup(buttons)
 
 async def show_scanner_status(query_or_update):
-    status, config = await get_scanner_status_remote()
+    status, _ = await get_scanner_status_remote()
+    config = load_scanner_config()  # свежие таймфреймы
     text = generate_scanner_text(status, config)
     keyboard = generate_scanner_keyboard(status)
     if hasattr(query_or_update, "edit_message_text"):
@@ -326,8 +321,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await client.post(url, json={"coin": coin, "tf": tf}, headers=headers, timeout=5)
                 except Exception:
                     log.exception("Не удалось послать set_tf на сканер")
+                # после изменения заново загружаем конфиг
+                await show_scanner_status(query)
                 await tg(f"{coin} → таймфрейм изменён на <b>{tf}</b>")
-            await show_scanner_status(query)
         elif data == "toggle_scanner":
             try:
                 headers = {"Authorization": f"Bearer {WEBHOOK_SECRET}"}
@@ -355,7 +351,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# ===== Root endpoint для health check =====
+# ===== Root endpoint =====
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "TERMINATOR 2026 active"}
@@ -417,3 +413,27 @@ async def webhook(req: Request):
     elif sig == "close_all":
         asyncio.create_task(close_all(coin))
     return {"ok": True}
+
+# ===== Logs page =====
+@app.get("/logs")
+async def logs_page():
+    try:
+        if os.path.exists(SIGNAL_LOG_FILE):
+            with open(SIGNAL_LOG_FILE, "r", encoding="utf-8") as f:
+                logs = json.load(f)
+        else:
+            logs = []
+    except Exception:
+        logs = []
+    rows = "".join(f"<tr><td>{l['date']}</td><td>{l['time']}</td><td>{l['coin']}</td><td>{l['action']}</td><td>{l['price']}</td></tr>" for l in logs)
+    html = f"<table border='1' style='border-collapse: collapse;'><tr><th>Дата</th><th>Время</th><th>Монета</th><th>Сигнал</th><th>Цена</th></tr>{rows}</table>"
+    return html
+
+# ===== Scanner page =====
+@app.get("/scanner")
+async def scanner_page():
+    config = load_scanner_config()
+    status, _ = await get_scanner_status_remote()
+    rows = "".join(f"<tr><td>{c}</td><td>{config.get(c,'—')}</td></tr>" for c in COINS)
+    html = f"<h2>Scanner OZ 2026</h2><p>Статус: {'Онлайн' if status.get('online') else 'Офлайн'}<br>Режим: {'Включён' if status.get('enabled') else 'Выключен'}</p><table border='1' style='border-collapse: collapse;'><tr><th>Монета</th><th>Таймфрейм</th></tr>{rows}</table>"
+    return html
