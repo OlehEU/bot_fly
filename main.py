@@ -305,6 +305,36 @@ async def scanner_dashboard():
     </html>
     """)
 
+from fastapi.staticfiles import StaticFiles
+
+# ====================== Логи сигналов ======================
+@app.get("/logs")
+async def signal_logs():
+    try:
+        with open("signal_log.json") as f:
+            logs = json.load(f)
+    except:
+        logs = []
+    rows = ""
+    for entry in reversed(logs[-30:]):
+        rows += f"<tr><td>{entry['date']}</td><td>{entry['time']}</td><td>{entry['coin']}</td><td style='color:{'lime' if entry['action']=='BUY' else 'red'}'><b>{entry['action']}</b></td><td>{entry['price']}</td></tr>"
+    
+    return HTMLResponse(f"""
+    <html><head><title>ЛОГИ СИГНАЛОВ</title>
+    <style>body{{background:#000;color:#0f0;font-family:monospace;padding:20px}}
+    table{{width:100%;border-collapse:collapse}}
+    th,td{{border:1px solid #0f0;padding:8px;text-align:center}}
+    th{{background:#111}}</style></head>
+    <body>
+    <h1>ЛОГИ СИГНАЛОВ — ПОСЛЕДНИЕ 30</h1>
+    <table><tr><th>Дата</th><th>Время</th><th>Коин</th><th>Сигнал</th><th>Цена</th></tr>
+    {rows or "<tr><td colspan=5>Сигналов пока нет</td></tr>"}
+    </table>
+    <p><a href="/scanner">← График</a> | <a href="/">Главная</a></p>
+    <script>setInterval(() => location.reload(), 10000)</script>
+    </body></html>
+    """)
+
 # ====================== Webhook ======================
 @app.post("/webhook")
 async def webhook(req: Request):
