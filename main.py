@@ -1,4 +1,4 @@
-# main.py — ТЕРМИНАТОР 2026 PATCHED FULL (главное меню + сканер)
+# main.py — ТЕРМИНАТОР 2026 PATCHED FULL (главное меню + сканер + темные страницы)
 import os
 import json
 import time
@@ -85,6 +85,26 @@ def load_scanner_config() -> Dict:
         atomic_write_json(SCANNER_CONFIG_FILE, default)
         return default
 
+def append_signal_log(coin: str, action: str, price: float):
+    entry = {
+        "date": time.strftime("%Y-%m-%d"),
+        "time": time.strftime("%H:%M:%S"),
+        "coin": coin,
+        "action": action,
+        "price": price
+    }
+    logs = []
+    if os.path.exists(SIGNAL_LOG_FILE):
+        try:
+            with open(SIGNAL_LOG_FILE, "r", encoding="utf-8") as f:
+                logs = json.load(f)
+        except Exception:
+            logs = []
+    logs.append(entry)
+    if len(logs) > 200:
+        logs = logs[-200:]
+    atomic_write_json(SIGNAL_LOG_FILE, logs)
+
 # ===== Global =====
 settings = load_settings()
 stats = load_stats()
@@ -158,6 +178,7 @@ async def open_long(coin: str):
         entry = await price(coin)
         await api("POST", "/fapi/v1/order", {"side":"BUY","type":"MARKET","quantity":str(q),"newClientOrderId":oid}, symbol=coin)
         last_balance[coin] = await balance()
+        append_signal_log(coin, "LONG", entry)
         await tg(f"LONG {coin}\n${settings[coin]['amount_usd']} × {settings[coin]['leverage']}x\nEntry: <code>{entry:.5f}</code>")
         await tg_balance()
     except Exception:
@@ -184,6 +205,7 @@ async def close_all(coin: str):
         stats["per_coin"][coin] = stats["per_coin"].get(coin,0) + pnl
         stats["total_pnl"] = stats.get("total_pnl",0) + pnl
         save_stats(stats)
+        append_signal_log(coin, "CLOSE_ALL", bal)
         await tg(f"{coin} ЗАКРЫТ\nПрибыль: <code>{pnl:+.2f}</code> USDT")
         await tg_balance()
     except Exception:
@@ -300,28 +322,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    # проверяем, что это кнопка главного меню или сканера
-    if query.data in ["balance","coins","stats","scanner"]:
+    data = query.data
+
+    if data in ["balance","coins","stats","scanner"]:
         await handle_main_menu_buttons(update, context)
     else:
-        # кнопки сканера
-        data = query.data
-        status, config = await get_scanner_status_remote()
+        status, _ = await get_scanner_status_remote()
         if data.startswith("tf_"):
             coin = data.split("_")[1]
             keyboard = generate_scanner_keyboard(status, current_coin=coin)
+            config = load_scanner_config()
             text = f"Выберите таймфрейм для <b>{coin}</b> (текущий: {config.get(coin,'—')})"
             await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
         elif data.startswith("settf_"):
             _, coin, tf = data.split("_")
             if coin in COINS and tf in TF_OPTIONS:
-                url = f"{SCANNER_BASE}/set_tf"
-                headers = {"X-Scanner-Secret": f"Bearer {WEBHOOK_SECRET}"}
                 try:
-                    await client.post(url, json={"coin": coin, "tf": tf}, headers=headers, timeout=5)
+                    headers = {"X-Scanner-Secret": f"Bearer {WEBHOOK_SECRET}"}
+                    await client.post(f"{SCANNER_BASE}/set_tf", json={"coin": coin, "tf": tf}, headers=headers, timeout=5)
                 except Exception:
                     log.exception("Не удалось послать set_tf на сканер")
-                # после изменения заново загружаем конфиг
                 await show_scanner_status(query)
                 await tg(f"{coin} → таймфрейм изменён на <b>{tf}</b>")
         elif data == "toggle_scanner":
@@ -414,7 +434,7 @@ async def webhook(req: Request):
         asyncio.create_task(close_all(coin))
     return {"ok": True}
 
-# ===== Logs page =====
+# ===== Logs page (dark style) =====
 @app.get("/logs")
 async def logs_page():
     try:
@@ -426,14 +446,59 @@ async def logs_page():
     except Exception:
         logs = []
     rows = "".join(f"<tr><td>{l['date']}</td><td>{l['time']}</td><td>{l['coin']}</td><td>{l['action']}</td><td>{l['price']}</td></tr>" for l in logs)
-    html = f"<table border='1' style='border-collapse: collapse;'><tr><th>Дата</th><th>Время</th><th>Монета</th><th>Сигнал</th><th>Цена</th></tr>{rows}</table>"
+    html = f"""
+    <html>
+    <head>
+        <title>Signal Logs</title>
+        <style>
+            body {{ background-color:#1e1e2f; color:#fff; font-family:sans-serif; }}
+            table {{ border-collapse: collapse; width: 80%; margin: 20px auto; }}
+            th, td {{ border: 1px solid #555; padding: 8px; text-align:center; }}
+            th {{ background-color: #333; }}
+            tr:nth-child(even) {{ background-color:#2a2a3f; }}
+            tr:hover {{ background-color:#444; }}
+        </style>
+    </head>
+    <body>
+        <h2 style="text-align:center;">Signal Logs</h2>
+        <table>
+            <tr><th>Дата</th><th>Время</th><th>Монета</th><th>Сигнал</th><th>Цена</th></tr>
+            {rows}
+        </table>
+    </body>
+    </html>
+    """
     return html
 
-# ===== Scanner page =====
+# ===== Scanner page (dark style) =====
 @app.get("/scanner")
 async def scanner_page():
     config = load_scanner_config()
     status, _ = await get_scanner_status_remote()
     rows = "".join(f"<tr><td>{c}</td><td>{config.get(c,'—')}</td></tr>" for c in COINS)
-    html = f"<h2>Scanner OZ 2026</h2><p>Статус: {'Онлайн' if status.get('online') else 'Офлайн'}<br>Режим: {'Включён' if status.get('enabled') else 'Выключен'}</p><table border='1' style='border-collapse: collapse;'><tr><th>Монета</th><th>Таймфрейм</th></tr>{rows}</table>"
+    html = f"""
+    <html>
+    <head>
+        <title>Scanner OZ 2026</title>
+        <style>
+            body {{ background-color:#1e1e2f; color:#fff; font-family:sans-serif; }}
+            table {{ border-collapse: collapse; width: 50%; margin: 20px auto; }}
+            th, td {{ border: 1px solid #555; padding: 8px; text-align:center; }}
+            th {{ background-color: #333; }}
+            tr:nth-child(even) {{ background-color:#2a2a3f; }}
+            tr:hover {{ background-color:#444; }}
+            h2 {{ text-align:center; }}
+            p {{ text-align:center; }}
+        </style>
+    </head>
+    <body>
+        <h2>Scanner OZ 2026</h2>
+        <p>Статус: {'Онлайн' if status.get('online') else 'Офлайн'}<br>Режим: {'Включён' if status.get('enabled') else 'Выключен'}</p>
+        <table>
+            <tr><th>Монета</th><th>Таймфрейм</th></tr>
+            {rows}
+        </table>
+    </body>
+    </html>
+    """
     return html
