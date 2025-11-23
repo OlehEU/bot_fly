@@ -335,6 +335,39 @@ async def signal_logs():
     </body></html>
     """)
 
+# Глобальные перемены для статуса сканера
+scanner_status = {
+    "online": False,
+    "last_seen": 0,
+    "enabled": True
+}
+
+# Сканер будет каждые 30–60 сек слать сюда "пинг"
+@app.post("/scanner_ping")
+async def scanner_ping():
+    scanner_status["online"] = True
+    scanner_status["last_seen"] = int(time.time())
+    return {"status": "ok"}
+
+# Включаем/выключаем сканер
+@app.post("/toggle_scanner")
+async def toggle_scanner():
+    scanner_status["enabled"] = not scanner_status["enabled"]
+    await bot.send_message(ADMIN_ID, f"СКАНЕР {'ВКЛЮЧЁН' if scanner_status['enabled'] else 'ВЫКЛЮЧЕН'}")
+    return {"enabled": scanner_status["enabled"]}
+
+# Статус сканера для админа
+@app.get("/scanner_status")
+async def get_status():
+    ago = int(time.time()) - scanner_status["last_seen"]
+    if ago > 120:
+        scanner_status["online"] = False
+    return {
+        "online": scanner_status["online"],
+        "enabled": scanner_status["enabled"],
+        "last_seen_seconds_ago": ago
+    }
+
 # ====================== Webhook ======================
 @app.post("/webhook")
 async def webhook(req: Request):
