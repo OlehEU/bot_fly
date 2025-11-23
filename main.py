@@ -1,4 +1,4 @@
-# main.py — ТЕРМИНАТОР 2026 PATCHED FULL (главное меню + сканер + темные страницы)
+# main.py — ТЕРМИНАТОР 2026 PATCHED FULL (главное меню + сканер + логи)
 import os
 import json
 import time
@@ -85,26 +85,6 @@ def load_scanner_config() -> Dict:
         atomic_write_json(SCANNER_CONFIG_FILE, default)
         return default
 
-def append_signal_log(coin: str, action: str, price: float):
-    entry = {
-        "date": time.strftime("%Y-%m-%d"),
-        "time": time.strftime("%H:%M:%S"),
-        "coin": coin,
-        "action": action,
-        "price": price
-    }
-    logs = []
-    if os.path.exists(SIGNAL_LOG_FILE):
-        try:
-            with open(SIGNAL_LOG_FILE, "r", encoding="utf-8") as f:
-                logs = json.load(f)
-        except Exception:
-            logs = []
-    logs.append(entry)
-    if len(logs) > 200:
-        logs = logs[-200:]
-    atomic_write_json(SIGNAL_LOG_FILE, logs)
-
 # ===== Global =====
 settings = load_settings()
 stats = load_stats()
@@ -178,7 +158,6 @@ async def open_long(coin: str):
         entry = await price(coin)
         await api("POST", "/fapi/v1/order", {"side":"BUY","type":"MARKET","quantity":str(q),"newClientOrderId":oid}, symbol=coin)
         last_balance[coin] = await balance()
-        append_signal_log(coin, "LONG", entry)
         await tg(f"LONG {coin}\n${settings[coin]['amount_usd']} × {settings[coin]['leverage']}x\nEntry: <code>{entry:.5f}</code>")
         await tg_balance()
     except Exception:
@@ -205,7 +184,6 @@ async def close_all(coin: str):
         stats["per_coin"][coin] = stats["per_coin"].get(coin,0) + pnl
         stats["total_pnl"] = stats.get("total_pnl",0) + pnl
         save_stats(stats)
-        append_signal_log(coin, "CLOSE_ALL", bal)
         await tg(f"{coin} ЗАКРЫТ\nПрибыль: <code>{pnl:+.2f}</code> USDT")
         await tg_balance()
     except Exception:
@@ -236,10 +214,9 @@ async def get_scanner_status_remote():
     try:
         r = await client.get(f"{BOT_BASE}/scanner_status", timeout=5)
         status = r.json()
-        config = load_scanner_config()  # всегда актуальные таймфреймы
     except Exception:
         status = {"online": False, "enabled": False, "last_seen_seconds_ago": 999}
-        config = load_scanner_config()
+    config = load_scanner_config()  # всегда актуальные таймфреймы
     return status, config
 
 def generate_scanner_text(status: dict, config: dict):
@@ -269,11 +246,10 @@ def generate_scanner_keyboard(status: dict, current_coin: Optional[str] = None):
         ]
     return InlineKeyboardMarkup(buttons)
 
-async def show_scanner_status(query_or_update):
-    status, _ = await get_scanner_status_remote()
-    config = load_scanner_config()  # свежие таймфреймы
+async def show_scanner_status(query_or_update, current_coin: Optional[str] = None):
+    status, config = await get_scanner_status_remote()
     text = generate_scanner_text(status, config)
-    keyboard = generate_scanner_keyboard(status)
+    keyboard = generate_scanner_keyboard(status, current_coin=current_coin)
     if hasattr(query_or_update, "edit_message_text"):
         await query_or_update.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
     else:
@@ -323,36 +299,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-
+    # кнопки главного меню
     if data in ["balance","coins","stats","scanner"]:
         await handle_main_menu_buttons(update, context)
-    else:
-        status, _ = await get_scanner_status_remote()
-        if data.startswith("tf_"):
-            coin = data.split("_")[1]
-            keyboard = generate_scanner_keyboard(status, current_coin=coin)
-            config = load_scanner_config()
-            text = f"Выберите таймфрейм для <b>{coin}</b> (текущий: {config.get(coin,'—')})"
-            await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
-        elif data.startswith("settf_"):
-            _, coin, tf = data.split("_")
-            if coin in COINS and tf in TF_OPTIONS:
-                try:
-                    headers = {"X-Scanner-Secret": f"Bearer {WEBHOOK_SECRET}"}
-                    await client.post(f"{SCANNER_BASE}/set_tf", json={"coin": coin, "tf": tf}, headers=headers, timeout=5)
-                except Exception:
-                    log.exception("Не удалось послать set_tf на сканер")
-                await show_scanner_status(query)
-                await tg(f"{coin} → таймфрейм изменён на <b>{tf}</b>")
-        elif data == "toggle_scanner":
+        return
+    # кнопки сканера
+    if data.startswith("tf_"):
+        coin = data.split("_")[1]
+        await show_scanner_status(query, current_coin=coin)
+    elif data.startswith("settf_"):
+        _, coin, tf = data.split("_")
+        if coin in COINS and tf in TF_OPTIONS:
+            url = f"{SCANNER_BASE}/set_tf"
+            headers = {"X-Scanner-Secret": f"Bearer {WEBHOOK_SECRET}"}
             try:
-                headers = {"Authorization": f"Bearer {WEBHOOK_SECRET}"}
-                await client.post(f"{BOT_BASE}/toggle_scanner", headers=headers, timeout=5)
+                await client.post(url, json={"coin": coin, "tf": tf}, headers=headers, timeout=5)
             except Exception:
-                log.exception("toggle_scanner request failed")
-            await show_scanner_status(query)
-        elif data == "back":
-            await show_main_menu(update)
+                log.exception("Не удалось послать set_tf на сканер")
+            await tg(f"{coin} → таймфрейм изменён на <b>{tf}</b>")
+        await show_scanner_status(query)
+    elif data == "toggle_scanner":
+        try:
+            headers = {"Authorization": f"Bearer {WEBHOOK_SECRET}"}
+            await client.post(f"{BOT_BASE}/toggle_scanner", headers=headers, timeout=5)
+        except Exception:
+            log.exception("toggle_scanner request failed")
+        await show_scanner_status(query)
+    elif data == "back":
+        await show_main_menu(update)
 
 # ===== FastAPI app =====
 @asynccontextmanager
@@ -434,7 +408,7 @@ async def webhook(req: Request):
         asyncio.create_task(close_all(coin))
     return {"ok": True}
 
-# ===== Logs page (dark style) =====
+# ===== Logs page (тёмный стиль) =====
 @app.get("/logs")
 async def logs_page():
     try:
@@ -445,7 +419,11 @@ async def logs_page():
             logs = []
     except Exception:
         logs = []
-    rows = "".join(f"<tr><td>{l['date']}</td><td>{l['time']}</td><td>{l['coin']}</td><td>{l['action']}</td><td>{l['price']}</td></tr>" for l in logs)
+
+    rows = "".join(
+        f"<tr><td>{l['date']}</td><td>{l['time']}</td><td>{l['coin']}</td><td>{l['action']}</td><td>{l['price']}</td></tr>"
+        for l in logs
+    )
     html = f"""
     <html>
     <head>
@@ -470,7 +448,7 @@ async def logs_page():
     """
     return html
 
-# ===== Scanner page (dark style) =====
+# ===== Scanner page (тёмный стиль) =====
 @app.get("/scanner")
 async def scanner_page():
     config = load_scanner_config()
