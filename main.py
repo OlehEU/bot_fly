@@ -313,18 +313,54 @@ async def root():
 async def scanner_dashboard():
     return HTMLResponse("""... твой красивый дашборд с TradingView ...""")  # оставь свой
 
+# Страница с логами
 @app.get("/logs")
 async def signal_logs():
     try:
         with open("signal_log.json") as f:
             logs = json.load(f)
     except:
-        logs = []
+        logs = []  # если файла нет — пустой список
+
+    # Генерируем строки таблицы
     rows = ""
-    for entry in reversed(logs[-30:]):
-        color = "lime" if entry['action'] == 'BUY' else "red"
-        rows += f"<tr><td>{entry['date']}</td><td>{entry['time']}</td><td>{entry['coin']}</td><td style='color:{color}'><b>{entry['action']}</b></td><td>{entry['price']}</td></tr>"
-    return HTMLResponse(f"""... твой HTML с логами ...""")
+    for entry in reversed(logs[-30:]):  # последние 30 сигналов
+        color = "lime" if entry.get("action") == "BUY" else "red"
+        rows += f'<tr><td>{entry["date"]}</td><td>{entry["time"]}</td><td>{entry["coin"]}</td><td style="color:{color}"><b>{entry["action"]}</b></td><td>{entry["price"]}</td></tr>'
+
+    # Если логов нет — показываем пустую таблицу
+    if not rows:
+        rows = '<tr><td colspan="5" style="color:yellow">Сигналов пока нет. Ждём первого от сканера...</td></tr>'
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>ЛОГИ СИГНАЛОВ — ТЕРМИНАТОР 2026</title>
+        <meta charset="utf-8">
+        <style>
+            body {{background:#000; color:#0f0; font-family:'Courier New', monospace; padding:20px;}}
+            h1 {{text-align:center; text-shadow:0 0 10px #0f0;}}
+            table {{width:100%; border-collapse:collapse; margin-top:20px;}}
+            th, td {{border:1px solid #0f0; padding:10px; text-align:center;}}
+            th {{background:#111;}}
+            tr:nth-child(even) {{background:#0a0a0a;}}
+            a {{color:#0f0; text-decoration:none;}}
+        </style>
+    </head>
+    <body>
+        <h1>ЛОГИ СИГНАЛОВ (последние 30)</h1>
+        <table>
+            <tr><th>Дата</th><th>Время</th><th>Коин</th><th>Сигнал</th><th>Цена</th></tr>
+            {rows}
+        </table>
+        <p style="text-align:center;">
+            <a href="/scanner">График</a> • <a href="/">Главная</a>
+        </p>
+        <script>setInterval(() => location.reload(), 15000);</script>  <!-- обновление каждые 15 сек -->
+    </body>
+    </html>
+    """)
 
 # ====================== WEBHOOK ======================
 @app.post("/webhook")
