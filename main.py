@@ -1,4 +1,4 @@
-# main.py — ТЕРМИНАТОР 2026 PATCHED FULL (главное меню + сканер + логи)
+# main.py — ТЕРМИНАТОР 2026 PATCHED FULL (главное меню + сканер + тёмные страницы)
 import os
 import json
 import time
@@ -81,9 +81,18 @@ def load_scanner_config() -> Dict:
         with open(SCANNER_CONFIG_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        default = {"XRP": "3m", "SOL": "5m", "ETH": "15m", "BTC": "15m", "DOGE": "1m"}
+        default = {c: "1m" for c in COINS}
         atomic_write_json(SCANNER_CONFIG_FILE, default)
         return default
+
+def load_signal_log() -> list:
+    try:
+        if os.path.exists(SIGNAL_LOG_FILE):
+            with open(SIGNAL_LOG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
 
 # ===== Global =====
 settings = load_settings()
@@ -160,6 +169,11 @@ async def open_long(coin: str):
         last_balance[coin] = await balance()
         await tg(f"LONG {coin}\n${settings[coin]['amount_usd']} × {settings[coin]['leverage']}x\nEntry: <code>{entry:.5f}</code>")
         await tg_balance()
+        # записываем в лог
+        log_entry = {"date": time.strftime("%Y-%m-%d"), "time": time.strftime("%H:%M:%S"), "coin": coin, "action": "LONG", "price": entry}
+        logs = load_signal_log()
+        logs.append(log_entry)
+        atomic_write_json(SIGNAL_LOG_FILE, logs)
     except Exception:
         log.exception("Ошибка open_long %s", coin)
         await tg(f"Ошибка LONG {coin}: проверь логи")
@@ -186,6 +200,11 @@ async def close_all(coin: str):
         save_stats(stats)
         await tg(f"{coin} ЗАКРЫТ\nПрибыль: <code>{pnl:+.2f}</code> USDT")
         await tg_balance()
+        # запись в лог
+        log_entry = {"date": time.strftime("%Y-%m-%d"), "time": time.strftime("%H:%M:%S"), "coin": coin, "action": "CLOSE", "price": bal}
+        logs = load_signal_log()
+        logs.append(log_entry)
+        atomic_write_json(SIGNAL_LOG_FILE, logs)
     except Exception:
         log.exception("Ошибка close_all %s", coin)
         await tg(f"Ошибка закрытия {coin}: проверь логи")
@@ -214,9 +233,11 @@ async def get_scanner_status_remote():
     try:
         r = await client.get(f"{BOT_BASE}/scanner_status", timeout=5)
         status = r.json()
+        r2 = await client.get(f"{SCANNER_BASE}/get_config", timeout=5)
+        config = r2.json()
     except Exception:
         status = {"online": False, "enabled": False, "last_seen_seconds_ago": 999}
-    config = load_scanner_config()  # всегда актуальные таймфреймы
+        config = load_scanner_config()
     return status, config
 
 def generate_scanner_text(status: dict, config: dict):
@@ -246,10 +267,10 @@ def generate_scanner_keyboard(status: dict, current_coin: Optional[str] = None):
         ]
     return InlineKeyboardMarkup(buttons)
 
-async def show_scanner_status(query_or_update, current_coin: Optional[str] = None):
+async def show_scanner_status(query_or_update):
     status, config = await get_scanner_status_remote()
     text = generate_scanner_text(status, config)
-    keyboard = generate_scanner_keyboard(status, current_coin=current_coin)
+    keyboard = generate_scanner_keyboard(status)
     if hasattr(query_or_update, "edit_message_text"):
         await query_or_update.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
     else:
@@ -257,11 +278,10 @@ async def show_scanner_status(query_or_update, current_coin: Optional[str] = Non
 
 # ===== Главное меню =====
 def generate_main_menu():
-    buttons = [
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("Баланс", callback_data="balance"), InlineKeyboardButton("Монеты", callback_data="coins")],
         [InlineKeyboardButton("Статистика", callback_data="stats"), InlineKeyboardButton("Сканер", callback_data="scanner")],
-    ]
-    return InlineKeyboardMarkup(buttons)
+    ])
 
 async def show_main_menu(update: Update):
     text = "<b>ТЕРМИНАТОР 2026 — Главное меню</b>"
@@ -271,7 +291,6 @@ async def handle_main_menu_buttons(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
     data = query.data
-
     if data == "balance":
         b = await balance()
         await query.edit_message_text(f"<b>Баланс:</b> {b:,.2f} USDT", parse_mode="HTML", reply_markup=generate_main_menu())
@@ -299,34 +318,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    # кнопки главного меню
     if data in ["balance","coins","stats","scanner"]:
         await handle_main_menu_buttons(update, context)
-        return
-    # кнопки сканера
-    if data.startswith("tf_"):
-        coin = data.split("_")[1]
-        await show_scanner_status(query, current_coin=coin)
-    elif data.startswith("settf_"):
-        _, coin, tf = data.split("_")
-        if coin in COINS and tf in TF_OPTIONS:
-            url = f"{SCANNER_BASE}/set_tf"
-            headers = {"X-Scanner-Secret": f"Bearer {WEBHOOK_SECRET}"}
+    else:
+        status, config = await get_scanner_status_remote()
+        if data.startswith("tf_"):
+            coin = data.split("_")[1]
+            keyboard = generate_scanner_keyboard(status, current_coin=coin)
+            text = f"Выберите таймфрейм для <b>{coin}</b> (текущий: {config.get(coin,'—')})"
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+        elif data.startswith("settf_"):
+            _, coin, tf = data.split("_")
+            if coin in COINS and tf in TF_OPTIONS:
+                url = f"{SCANNER_BASE}/set_tf"
+                headers = {"X-Scanner-Secret": f"Bearer {WEBHOOK_SECRET}"}
+                try:
+                    await client.post(url, json={"coin": coin, "tf": tf}, headers=headers, timeout=5)
+                except Exception:
+                    log.exception("Не удалось послать set_tf на сканер")
+                await show_scanner_status(query)
+                await tg(f"{coin} → таймфрейм изменён на <b>{tf}</b>")
+        elif data == "toggle_scanner":
             try:
-                await client.post(url, json={"coin": coin, "tf": tf}, headers=headers, timeout=5)
+                headers = {"Authorization": f"Bearer {WEBHOOK_SECRET}"}
+                await client.post(f"{BOT_BASE}/toggle_scanner", headers=headers, timeout=5)
             except Exception:
-                log.exception("Не удалось послать set_tf на сканер")
-            await tg(f"{coin} → таймфрейм изменён на <b>{tf}</b>")
-        await show_scanner_status(query)
-    elif data == "toggle_scanner":
-        try:
-            headers = {"Authorization": f"Bearer {WEBHOOK_SECRET}"}
-            await client.post(f"{BOT_BASE}/toggle_scanner", headers=headers, timeout=5)
-        except Exception:
-            log.exception("toggle_scanner request failed")
-        await show_scanner_status(query)
-    elif data == "back":
-        await show_main_menu(update)
+                log.exception("toggle_scanner request failed")
+            await show_scanner_status(query)
+        elif data == "back":
+            await show_main_menu(update)
 
 # ===== FastAPI app =====
 @asynccontextmanager
@@ -345,10 +365,70 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# ===== Root endpoint =====
+# ===== Web pages =====
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "TERMINATOR 2026 active"}
+
+@app.get("/logs")
+async def logs_page():
+    logs = load_signal_log()
+    rows = "".join(f"<tr><td>{l['date']}</td><td>{l['time']}</td><td>{l['coin']}</td><td>{l['action']}</td><td>{l['price']}</td></tr>" for l in logs)
+    html = f"""
+    <html>
+    <head>
+        <title>Signal Logs</title>
+        <style>
+            body {{ background-color:#1e1e2f; color:#fff; font-family:sans-serif; }}
+            table {{ border-collapse: collapse; width: 80%; margin: 20px auto; }}
+            th, td {{ border: 1px solid #555; padding: 8px; text-align:center; }}
+            th {{ background-color: #333; }}
+            tr:nth-child(even) {{ background-color:#2a2a3f; }}
+            tr:hover {{ background-color:#444; }}
+        </style>
+    </head>
+    <body>
+        <h2 style="text-align:center;">Signal Logs</h2>
+        <table>
+            <tr><th>Дата</th><th>Время</th><th>Монета</th><th>Сигнал</th><th>Цена</th></tr>
+            {rows}
+        </table>
+    </body>
+    </html>
+    """
+    return html
+
+@app.get("/scanner")
+async def scanner_page():
+    config = load_scanner_config()
+    status, _ = await get_scanner_status_remote()
+    rows = "".join(f"<tr><td>{c}</td><td>{config.get(c,'—')}</td></tr>" for c in COINS)
+    html = f"""
+    <html>
+    <head>
+        <title>Scanner OZ 2026</title>
+        <style>
+            body {{ background-color:#1e1e2f; color:#fff; font-family:sans-serif; }}
+            table {{ border-collapse: collapse; width: 50%; margin: 20px auto; }}
+            th, td {{ border: 1px solid #555; padding: 8px; text-align:center; }}
+            th {{ background-color:#333; }}
+            tr:nth-child(even) {{ background-color:#2a2a3f; }}
+            tr:hover {{ background-color:#444; }}
+            h2 {{ text-align:center; }}
+            p {{ text-align:center; }}
+        </style>
+    </head>
+    <body>
+        <h2>Scanner OZ 2026</h2>
+        <p>Статус: {'Онлайн' if status.get('online') else 'Офлайн'}<br>Режим: {'Включён' if status.get('enabled') else 'Выключен'}</p>
+        <table>
+            <tr><th>Монета</th><th>Таймфрейм</th></tr>
+            {rows}
+        </table>
+    </body>
+    </html>
+    """
+    return html
 
 # ===== Scanner API =====
 @app.post("/scanner_ping")
@@ -407,76 +487,3 @@ async def webhook(req: Request):
     elif sig == "close_all":
         asyncio.create_task(close_all(coin))
     return {"ok": True}
-
-# ===== Logs page (тёмный стиль) =====
-@app.get("/logs")
-async def logs_page():
-    try:
-        if os.path.exists(SIGNAL_LOG_FILE):
-            with open(SIGNAL_LOG_FILE, "r", encoding="utf-8") as f:
-                logs = json.load(f)
-        else:
-            logs = []
-    except Exception:
-        logs = []
-
-    rows = "".join(
-        f"<tr><td>{l['date']}</td><td>{l['time']}</td><td>{l['coin']}</td><td>{l['action']}</td><td>{l['price']}</td></tr>"
-        for l in logs
-    )
-    html = f"""
-    <html>
-    <head>
-        <title>Signal Logs</title>
-        <style>
-            body {{ background-color:#1e1e2f; color:#fff; font-family:sans-serif; }}
-            table {{ border-collapse: collapse; width: 80%; margin: 20px auto; }}
-            th, td {{ border: 1px solid #555; padding: 8px; text-align:center; }}
-            th {{ background-color: #333; }}
-            tr:nth-child(even) {{ background-color:#2a2a3f; }}
-            tr:hover {{ background-color:#444; }}
-        </style>
-    </head>
-    <body>
-        <h2 style="text-align:center;">Signal Logs</h2>
-        <table>
-            <tr><th>Дата</th><th>Время</th><th>Монета</th><th>Сигнал</th><th>Цена</th></tr>
-            {rows}
-        </table>
-    </body>
-    </html>
-    """
-    return html
-
-# ===== Scanner page (тёмный стиль) =====
-@app.get("/scanner")
-async def scanner_page():
-    config = load_scanner_config()
-    status, _ = await get_scanner_status_remote()
-    rows = "".join(f"<tr><td>{c}</td><td>{config.get(c,'—')}</td></tr>" for c in COINS)
-    html = f"""
-    <html>
-    <head>
-        <title>Scanner OZ 2026</title>
-        <style>
-            body {{ background-color:#1e1e2f; color:#fff; font-family:sans-serif; }}
-            table {{ border-collapse: collapse; width: 50%; margin: 20px auto; }}
-            th, td {{ border: 1px solid #555; padding: 8px; text-align:center; }}
-            th {{ background-color: #333; }}
-            tr:nth-child(even) {{ background-color:#2a2a3f; }}
-            tr:hover {{ background-color:#444; }}
-            h2 {{ text-align:center; }}
-            p {{ text-align:center; }}
-        </style>
-    </head>
-    <body>
-        <h2>Scanner OZ 2026</h2>
-        <p>Статус: {'Онлайн' if status.get('online') else 'Офлайн'}<br>Режим: {'Включён' if status.get('enabled') else 'Выключен'}</p>
-        <table>
-            <tr><th>Монета</th><th>Таймфрейм</th></tr>
-            {rows}
-        </table>
-    </body>
-    </html>
-    """
-    return html
