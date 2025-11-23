@@ -15,6 +15,8 @@ from contextlib import asynccontextmanager
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
+from fastapi.staticfiles import StaticFiles # ИМПОРТ ЛОГОВ
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -304,9 +306,7 @@ async def scanner_dashboard():
     </body>
     </html>
     """)
-
-from fastapi.staticfiles import StaticFiles
-
+    
 # ====================== Логи сигналов ======================
 @app.get("/logs")
 async def signal_logs():
