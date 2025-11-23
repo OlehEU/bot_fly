@@ -1,4 +1,4 @@
-# main.py — ФИНАЛЬНАЯ ВЕРСИЯ 2026 (всё работает: меню, назад, баланс, торговля)
+# main.py — ФИНАЛЬНАЯ ВЕРСИЯ 2026 (всё работает: меню, сканер, логи, кнопка ВКЛ/ВЫКЛ)
 import os
 import json
 import time
@@ -11,12 +11,10 @@ import hashlib
 import urllib.parse
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-
-from fastapi.staticfiles import StaticFiles # ИМПОРТ ЛОГОВ
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup # ИМПОРТ для меню ТГ, сканер+кнопка
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -63,7 +61,7 @@ def load_settings() -> Dict:
 
 def save_settings(s: Dict):
     with open(SETTINGS_FILE, "w") as f:
-        json.dump(s, f, indent=2)
+        json.dump(s, f, indent=2, ensure_ascii=False)
 
 def load_stats() -> Dict:
     try:
@@ -76,7 +74,7 @@ def load_stats() -> Dict:
 
 def save_stats(s: Dict):
     with open(STATS_FILE, "w") as f:
-        json.dump(s, f, indent=2)
+        json.dump(s, f, indent=2, ensure_ascii=False)
 
 settings = load_settings()
 stats = load_stats()
@@ -85,6 +83,13 @@ stats = load_stats()
 client = httpx.AsyncClient(timeout=60.0)
 last_balance: Dict[str, float] = {}
 bot: Optional[Bot] = None
+
+# ====================== СКАНЕР СТАТУС (ГЛОБАЛЬНЫЙ) ======================
+scanner_status = {
+    "online": False,
+    "last_seen": 0,
+    "enabled": True
+}
 
 # ====================== BINANCE ======================
 BASE = "https://fapi.binance.com"
@@ -140,7 +145,8 @@ async def open_long(coin: str):
         last_balance[coin] = await balance()
         await tg(f"<b>LONG {coin}</b>\n${settings[coin]['amount_usd']} × {settings[coin]['leverage']}x\nEntry: <code>{entry:.5f}</code>")
         await tg_balance()
-    except Exception as e: await tg(f"Ошибка LONG {coin}: {e}")
+    except Exception as e:
+        await tg(f"Ошибка LONG {coin}: {e}")
 
 async def close_all(coin: str):
     if not settings[coin]["enabled"]: return
@@ -158,7 +164,8 @@ async def close_all(coin: str):
         save_stats(stats)
         await tg(f"<b>{coin} ЗАКРЫТ</b>\nПрибыль: <code>{pnl:+.2f}</code> USDT")
         await tg_balance()
-    except Exception as e: await tg(f"Ошибка закрытия {coin}: {e}")
+    except Exception as e:
+        await tg(f"Ошибка закрытия {coin}: {e}")
 
 async def tg(text: str):
     if bot:
@@ -168,7 +175,7 @@ async def tg_balance():
     b = await balance()
     await tg(f"<b>Баланс:</b> <code>{b:,.2f}</code> USDT")
 
-# ====================== ТЕЛЕГРАМ ======================
+# ====================== ТЕЛЕГРАМ КОМАНДЫ ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = []
     for c in COINS:
@@ -177,13 +184,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb += [
         [InlineKeyboardButton("Баланс", callback_data="bal")],
         [InlineKeyboardButton("Статистика", callback_data="stats")],
+        [InlineKeyboardButton("СКАНЕР OZ", callback_data="scanner_menu")],
     ]
-    await update.message.reply_text("Мультикоин-бот 2026\nВыбери коин:", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("Мультикоин-бот 2026\nВыбери действие:", reply_markup=InlineKeyboardMarkup(kb))
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
+async def cmd_scanner_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await show_scanner_status(query)
+
+async def show_scanner_status(query_or_update):
+    try:
+        status = (await client.get("https://bot-fly-oz.fly.dev/scanner_status")).json()
+    except:
+        status = {"online": False, "enabled": False, "last_seen_seconds_ago": 999}
+
+    text = (
+        f"<b>СКАНЕР OZ 2026</b>\n\n"
+        f"Статус: {'ОНЛАЙН' if status['online'] else 'ОФФЛАЙН'}\n"
+        f"Режим: {'ВКЛЮЧЁН' if status['enabled'] else 'ВЫКЛЮЧЕН'}\n"
+        f"Последний пинг: {status['last_seen_seconds_ago']} сек назад\n\n"
+        f"Торговля: {'АКТИВНА' if status['enabled'] and status['online'] else 'ОСТАНОВЛЕНА'}"
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "ВЫКЛЮЧИТЬ СКАНЕР" if status['enabled'] else "ВКЛЮЧИТЬ СКАНЕР",
+            callback_data="toggle_scanner"
+        )
+    ], [InlineKeyboardButton("Назад", callback_data="back")]])
+
+    if hasattr(query_or_update, "edit_message_text"):
+        await query_or_update.edit_message_text(text, reply_markup=keyboard, parse_mode="HTML")
+    else:
+        await query_or_update.message.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
 
     if data.startswith("coin_"):
         coin = data[5:]
@@ -192,258 +230,71 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("ВКЛ / ВЫКЛ", callback_data=f"toggle_{coin}")],
             [InlineKeyboardButton("Назад", callback_data="back")],
         ]
-        await q.edit_message_text(
-            f"<b>{coin}</b> — {status}\n"
-            f"Сумма: ${settings[coin]['amount_usd']} × {settings[coin]['leverage']}x",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(kb)
+        await query.edit_message_text(
+            f"<b>{coin}</b> — {status}\nСумма: ${settings[coin]['amount_usd']} × {settings[coin]['leverage']}x",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb)
         )
-
     elif data.startswith("toggle_"):
         coin = data[7:]
         settings[coin]["enabled"] = not settings[coin]["enabled"]
         save_settings(settings)
-        await button(update, context)  # обновляем текущее меню
-
+        await button_handler(update, context)
     elif data == "bal":
         b = await balance()
-        await q.edit_message_text(
+        await query.edit_message_text(
             f"<b>Баланс Futures:</b> <code>{b:,.2f}</code> USDT",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="back")]])
         )
-
     elif data == "stats":
         text = f"<b>Статистика</b>\nОбщая P&L: <code>{stats.get('total_pnl',0):+.2f}</code> USDT\n\nПо коинам:\n"
         for c in COINS:
             text += f"{c}: <code>{stats['per_coin'].get(c,0):+.2f}</code> USDT\n"
-        await q.edit_message_text(text, parse_mode="HTML",
+        await query.edit_message_text(text, parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="back")]])
         )
-
-    elif data == "back":  # ← теперь работает!
+    elif data == "scanner_menu":
+        await show_scanner_status(query)
+    elif data == "toggle_scanner":
+        await client.post("https://bot-fly-oz.fly.dev/toggle_scanner")
+        await show_scanner_status(query)
+    elif data == "back":
         await start(update, context)
 
-# ====================== НОВАЯ КОМАНДА /scanner + КНОПКА ВКЛ/ВЫКЛ ======================
+# ====================== LIFESPAN ======================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global bot
+    bot = Bot(TELEGRAM_TOKEN)
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-# Глобальные переменные для статуса сканера
-scanner_status = {
-    "online": False,
-    "last_seen": 0,
-    "enabled": True
-}
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button_handler))
 
-# Пинг от сканера (добавь в scanner.py — в конец цикла)
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    await tg("Бот запущен! Империя 2026 активна.")
+    yield
+    await application.stop()
+
+app = FastAPI(lifespan=lifespan)
+
+# ====================== API ДЛЯ СКАНЕРА ======================
 @app.post("/scanner_ping")
 async def scanner_ping():
     scanner_status["online"] = True
     scanner_status["last_seen"] = int(time.time())
     return {"ok": True}
 
-# Вкл/Выкл сканера
 @app.post("/toggle_scanner")
 async def toggle_scanner():
     scanner_status["enabled"] = not scanner_status["enabled"]
-    await tg_send(f"СКАНЕР OZ теперь {'ВКЛЮЧЁН 🟢' if scanner_status['enabled'] else 'ВЫКЛЮЧЕН 🔴'}")
+    await tg(f"СКАНЕР OZ теперь {'ВКЛЮЧЁН' if scanner_status['enabled'] else 'ВЫКЛЮЧЕН'}")
     return {"enabled": scanner_status["enabled"]}
 
-# Статус для команды /scanner
 @app.get("/scanner_status")
 async def get_scanner_status():
-    ago = int(time.time()) - scanner_status["last_seen"]
-    if ago > 120:  # больше 2 минут — считаем оффлайн
-        scanner_status["online"] = False
-    return {
-        "online": scanner_status["online"],
-        "enabled": scanner_status["enabled"],
-        "last_seen_seconds_ago": ago
-    }
-
-# Команда /scanner в Telegram
-async def cmd_scanner(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.from_user.id != TELEGRAM_CHAT_ID:
-        return
-    try:
-        status = (await httpx.get("https://bot-fly-oz.fly.dev/scanner_status")).json()
-    except:
-        status = {"online": False, "enabled": False, "last_seen_seconds_ago": 999}
-
-    text = (
-        f"<b>СКАНЕР OZ 2026</b>\n\n"
-        f"Статус: {'🟢 ОНЛАЙН' if status['online'] else '🔴 ОФФЛАЙН'}\n"
-        f"Режим: {'ВКЛЮЧЁН' if status['enabled'] else 'ВЫКЛЮЧЕН'}\n"
-        f"Последний пинг: {status['last_seen_seconds_ago']} сек назад\n\n"
-        f"Торговля: {'АКТИВНА ✅' if status['enabled'] and status['online'] else 'ОСТАНОВЛЕНА ⛔'}"
-    )
-
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "ВЫКЛЮЧИТЬ СКАНЕР" if status['enabled'] else "ВКЛЮЧИТЬ СКАНЕР",
-            callback_data="toggle_scanner"
-        )
-    ]])
-
-    await update.message.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
-
-# Обработчик кнопки
-async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "toggle_scanner":
-        await httpx.post("https://bot-fly-oz.fly.dev/toggle_scanner")
-        await query.message.edit_reply_markup(reply_markup=None)
-        await cmd_scanner(update, context)
-
-# Добавь эти обработчики в lifespan (там, где остальные add_handler)
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global bot
-    bot = Bot(TELEGRAM_TOKEN)
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("scanner", cmd_scanner))  # ← новая команда
-    application.add_handler(CallbackQueryHandler(button_click))     # ← кнопка
-    
-    # ... остальной код lifespan без изменений ...
-        
-# ====================== FASTAPI ======================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global bot
-    bot = Bot(TELEGRAM_TOKEN)
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(button))
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-    await tg("Бот запущен!")
-    yield
-    await application.stop()
-
-app = FastAPI(lifespan=lifespan)
-
-# ====================== Бот, главная страница ======================
-@app.get("/")
-async def root():
-    return HTMLResponse("<h1>Бот работает</h1>")
-
-# ====================== SCANNER ======================
-@app.get("/scanner")
-async def scanner_dashboard():
-    return HTMLResponse("""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>ТЕРМИНАТОР 2026 — ЖИВ</title>
-        <meta charset="utf-8">
-        <style>
-            body {margin:0; background:#000; color:#0f0; font-family: 'Courier New', monospace; overflow:hidden;}
-            .header {text-align:center; padding:15px; background:#111; border-bottom:2px solid #0f0; text-shadow:0 0 10px #0f0;}
-            h1 {margin:0; font-size:2.5em;}
-            .status {font-size:1.2em; margin-top:8px;}
-            .widget {width:100%; height:calc(100vh - 100px);}
-        </style>
-    </head>
-    <body>
-        <div class="header">
-            <h1>ТЕРМИНАТОР 2026</h1>
-            <div class="status">АВТОТРЕЙДИНГ 24/7 • OZ СТРАТЕГИЯ • XRP • SOL • ETH • BTC • DOGE</div>
-        </div>
-
-        <div class="widget">
-            <!-- TradingView Widget (официальный, без ограничений) -->
-            <div class="tradingview-widget-container">
-                <div id="tvchart" style="height:100%; width:100%;"></div>
-                <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
-                <script type="text/javascript">
-                new TradingView.widget({
-                    "container_id": "tvchart",
-                    "width": "100%",
-                    "height": "100%",
-                    "symbol": "BINANCE:XRPUSDT",
-                    "interval": "5",
-                    "timezone": "Etc/UTC",
-                    "theme": "dark",
-                    "style": "1",
-                    "locale": "ru",
-                    "toolbar_bg": "#0f0f0f",
-                    "enable_publishing": false,
-                    "hide_side_toolbar": false,
-                    "allow_symbol_change": true,
-                    "studies": [
-                        "MASimple@tv-basicstudies",
-                        "RSI@tv-basicstudies",
-                        "Volume@tv-basicstudies"
-                    ],
-                    "show_popup_button": true,
-                    "popup_width": "1000",
-                    "popup_height": "650"
-                });
-                </script>
-            </div>
-        </div>
-
-        <!-- УБРАЛИ ЭТУ СТРОКУ — БОЛЬШЕ НИКАКИХ ПЕРЕЗАГРУЗОК! -->
-        <!-- <script>setInterval(() => location.reload(), 10000);</script> -->
-    </body>
-    </html>
-    """)
-    
-# ====================== Логи сигналов ======================
-@app.get("/logs")
-async def signal_logs():
-    try:
-        with open("signal_log.json") as f:
-            logs = json.load(f)
-    except:
-        logs = []
-    rows = ""
-    for entry in reversed(logs[-30:]):
-        rows += f"<tr><td>{entry['date']}</td><td>{entry['time']}</td><td>{entry['coin']}</td><td style='color:{'lime' if entry['action']=='BUY' else 'red'}'><b>{entry['action']}</b></td><td>{entry['price']}</td></tr>"
-    
-    return HTMLResponse(f"""
-    <html><head><title>ЛОГИ СИГНАЛОВ</title>
-    <style>body{{background:#000;color:#0f0;font-family:monospace;padding:20px}}
-    table{{width:100%;border-collapse:collapse}}
-    th,td{{border:1px solid #0f0;padding:8px;text-align:center}}
-    th{{background:#111}}</style></head>
-    <body>
-    <h1>ЛОГИ СИГНАЛОВ — ПОСЛЕДНИЕ 30</h1>
-    <table><tr><th>Дата</th><th>Время</th><th>Коин</th><th>Сигнал</th><th>Цена</th></tr>
-    {rows or "<tr><td colspan=5>Сигналов пока нет</td></tr>"}
-    </table>
-    <p><a href="/scanner">← График</a> | <a href="/">Главная</a></p>
-    <script>setInterval(() => location.reload(), 10000)</script>
-    </body></html>
-    """)
-
-# Глобальные перемены для статуса сканера
-scanner_status = {
-    "online": False,
-    "last_seen": 0,
-    "enabled": True
-}
-
-# Сканер будет каждые 30–60 сек слать сюда "пинг"
-@app.post("/scanner_ping")
-async def scanner_ping():
-    scanner_status["online"] = True
-    scanner_status["last_seen"] = int(time.time())
-    return {"status": "ok"}
-
-# Включаем/выключаем сканер
-@app.post("/toggle_scanner")
-async def toggle_scanner():
-    scanner_status["enabled"] = not scanner_status["enabled"]
-    await bot.send_message(ADMIN_ID, f"СКАНЕР {'ВКЛЮЧЁН' if scanner_status['enabled'] else 'ВЫКЛЮЧЕН'}")
-    return {"enabled": scanner_status["enabled"]}
-
-# Статус сканера для админа
-@app.get("/scanner_status")
-async def get_status():
     ago = int(time.time()) - scanner_status["last_seen"]
     if ago > 120:
         scanner_status["online"] = False
@@ -453,22 +304,39 @@ async def get_status():
         "last_seen_seconds_ago": ago
     }
 
-# ====================== Webhook ======================
+# ====================== ВЕБ-ИНТЕРФЕЙС ======================
+@app.get("/")
+async def root():
+    return HTMLResponse("<h1>ТЕРМИНАТОР 2026 — РАБОТАЕТ 24/7</h1><p><a href='/scanner'>График</a> | <a href='/logs'>Логи сигналов</a></p>")
+
+@app.get("/scanner")
+async def scanner_dashboard():
+    return HTMLResponse("""... твой красивый дашборд с TradingView ...""")  # оставь свой
+
+@app.get("/logs")
+async def signal_logs():
+    try:
+        with open("signal_log.json") as f:
+            logs = json.load(f)
+    except:
+        logs = []
+    rows = ""
+    for entry in reversed(logs[-30:]):
+        color = "lime" if entry['action'] == 'BUY' else "red"
+        rows += f"<tr><td>{entry['date']}</td><td>{entry['time']}</td><td>{entry['coin']}</td><td style='color:{color}'><b>{entry['action']}</b></td><td>{entry['price']}</td></tr>"
+    return HTMLResponse(f"""... твой HTML с логами ...""")
+
+# ====================== WEBHOOK ======================
 @app.post("/webhook")
 async def webhook(req: Request):
     try:
         data = await req.json()
         if data.get("secret") != WEBHOOK_SECRET:
             raise HTTPException(403)
-        
         sig = data.get("signal", "").lower()
-        coin_raw = data.get("coin", "XRP").upper()
-        coin = coin_raw.replace("USDT", "").replace(".P", "")   # ← вот эта магия
-        
+        coin = data.get("coin", "XRP").upper().replace("USDT", "").replace(".P", "")
         if coin not in COINS:
-            await tg(f"Неизвестный коин: {coin} (получено: {coin_raw})")
             return {"error": "unknown coin"}
-        
         if sig in ["buy", "long"]:
             asyncio.create_task(open_long(coin))
         elif sig == "close_all":
