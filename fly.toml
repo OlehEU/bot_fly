@@ -25,10 +25,10 @@ primary_region = "fra"
     soft_limit = 25
     hard_limit = 50
 
-  # ←←← ЭТО ГЛАВНОЕ — ЗАМЕНИ tcp_checks НА http_checks!
+  # HTTP health checks вместо tcp_checks
   [[services.http_checks]]
     interval = "10s"
     timeout = "5s"
-    grace_period = "15s"        # важно! preload может занять 8–12 сек
+    grace_period = "20s"      # увеличил для надежности
     method = "GET"
-    path = "/"
+    path = "/"                # убедись, что "/" возвращает 200
