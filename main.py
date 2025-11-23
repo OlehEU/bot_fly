@@ -1,4 +1,4 @@
-# main.py — УЛЬТИМАТИВНАЯ ВЕРСИЯ 2026: управление таймфреймами + всё остальное
+# main.py — ТЕРМИНАТОР 2026: ПОЛНАЯ ФИНАЛЬНАЯ ВЕРСИЯ С 45m И ВСЕМ НА СВЕТЕ
 import os
 import json
 import time
@@ -31,7 +31,6 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "supersecret123")
 
 COINS = ["XRP", "SOL", "ETH", "BTC", "DOGE"]
-
 SETTINGS_FILE = "settings.json"
 STATS_FILE = "stats.json"
 SCANNER_CONFIG_FILE = "scanner_config.json"
@@ -41,18 +40,18 @@ def load_settings() -> Dict:
     try:
         with open(SETTINGS_FILE) as f:
             data = json.load(f)
-        default_coin = {"amount_usd": 10, "leverage": 10, "enabled": True, "disable_tpsl": True}
         for coin in COINS:
             if coin not in data:
-                data[coin] = default_coin.copy()
+                data[coin] = {"amount_usd": 10, "leverage": 10, "enabled": True, "disable_tpsl": True}
         return data
-    except Exception:
-        default = {c: {"amount_usd": 10, "leverage": 10, "enabled": True, "disable_tpsl": True} for c in COINS}
-        default["XRP"]["amount_usd"], default["XRP"]["leverage"] = 10, 10
-        default["SOL"]["amount_usd"], default["SOL"]["leverage"] = 15, 20
-        default["ETH"]["amount_usd"], default["ETH"]["leverage"] = 20, 5
-        default["BTC"]["amount_usd"], default["BTC"]["leverage"] = 50, 3
-        default["DOGE"]["amount_usd"], default["DOGE"]["leverage"] = 5, 50
+    except:
+        default = {
+            "XRP": {"amount_usd": 10, "leverage": 10, "enabled": True, "disable_tpsl": True},
+            "SOL": {"amount_usd": 15, "leverage": 20, "enabled": False, "disable_tpsl": True},
+            "ETH": {"amount_usd": 20, "leverage": 5, "enabled": False, "disable_tpsl": True},
+            "BTC": {"amount_usd": 50, "leverage": 3, "enabled": False, "disable_tpsl": True},
+            "DOGE": {"amount_usd": 5, "leverage": 50, "enabled": False, "disable_tpsl": True},
+        }
         save_settings(default)
         return default
 
@@ -64,7 +63,7 @@ def load_stats() -> Dict:
     try:
         with open(STATS_FILE) as f:
             return json.load(f)
-    except Exception:
+    except:
         default = {"total_pnl": 0.0, "per_coin": {c: 0.0 for c in COINS}}
         save_stats(default)
         return default
@@ -134,7 +133,7 @@ async def open_long(coin: str):
         entry = await price(coin)
         await api("POST", "/fapi/v1/order", {"side":"BUY","type":"MARKET","quantity":str(q),"newClientOrderId":oid}, symbol=coin)
         last_balance[coin] = await balance()
-        await tg(f"<b>LONG {coin}</b>\n${settings[coin]['amount_usd']} × {settings[coin]['leverage']}x\nEntry: <code>{entry:.5f}</code>")
+        await tg(f"LONG {coin}\n${settings[coin]['amount_usd']} × {settings[coin]['leverage']}x\nEntry: <code>{entry:.5f}</code>")
         await tg_balance()
     except Exception as e:
         await tg(f"Ошибка LONG {coin}: {e}")
@@ -153,7 +152,7 @@ async def close_all(coin: str):
         stats["per_coin"][coin] = stats["per_coin"].get(coin,0) + pnl
         stats["total_pnl"] = stats.get("total_pnl",0) + pnl
         save_stats(stats)
-        await tg(f"<b>{coin} ЗАКРЫТ</b>\nПрибыль: <code>{pnl:+.2f}</code> USDT")
+        await tg(f"{coin} ЗАКРЫТ\nПрибыль: <code>{pnl:+.2f}</code> USDT")
         await tg_balance()
     except Exception as e:
         await tg(f"Ошибка закрытия {coin}: {e}")
@@ -164,9 +163,9 @@ async def tg(text: str):
 
 async def tg_balance():
     b = await balance()
-    await tg(f"<b>Баланс:</b> <code>{b:,.2f}</code> USDT")
+    await tg(f"Баланс: <code>{b:,.2f}</code> USDT")
 
-# ====================== СКАНЕР СТАТУС + ТАЙМФРЕЙМЫ ======================
+# ====================== СКАНЕР + ТАЙМФРЕЙМЫ ======================
 async def get_scanner_config():
     try:
         with open(SCANNER_CONFIG_FILE) as f:
@@ -185,11 +184,11 @@ async def show_scanner_status(query_or_update):
         status = {"online": False, "enabled": False, "last_seen_seconds_ago": 999}
         config = {}
 
-    tf_text = "\n".join([f"{coin}: <b>{config.get(coin, '—')}</b>" for coin in COINS])
+    tf_text = "\n".join([f"{c}: <b>{config.get(c, '—')}</b>" for c in COINS])
 
     text = (
         f"<b>СКАНЕР OZ 2026</b>\n\n"
-        f"Статус: {'🟢 ОНЛАЙН' if status['online'] else '🔴 ОФФЛАЙН'}\n"
+        f"Статус: {'ОНЛАЙН' if status['online'] else 'ОФФЛАЙН'}\n"
         f"Режим: {'ВКЛЮЧЁН' if status['enabled'] else 'ВЫКЛЮЧЕН'}\n"
         f"Пинг: {status['last_seen_seconds_ago']} сек назад\n\n"
         f"<b>Таймфреймы:</b>\n{tf_text}\n\n"
@@ -220,30 +219,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("Статистика", callback_data="stats")],
         [InlineKeyboardButton("СКАНЕР OZ", callback_data="scanner_menu")],
     ]
-    await update.message.reply_text("Мультикоин-бот 2026\nВыбери действие:", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("ТЕРМИНАТОР 2026\nВыбери действие:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
-    # Управление таймфреймами
+    # ТАЙМФРЕЙМЫ (45m добавлен!)
     if data.startswith("tf_"):
         coin = data[3:]
         kb = [
-            [InlineKeyboardButton("1m", callback_data=f"settf_{coin}_1m")],
-            [InlineKeyboardButton("3m", callback_data=f"settf_{coin}_3m")],
-            [InlineKeyboardButton("5m", callback_data=f"settf_{coin}_5m")],
+            [InlineKeyboardButton("1m",  callback_data=f"settf_{coin}_1m")],
+            [InlineKeyboardButton("3m",  callback_data=f"settf_{coin}_3m")],
+            [InlineKeyboardButton("5m",  callback_data=f"settf_{coin}_5m")],
             [InlineKeyboardButton("15m", callback_data=f"settf_{coin}_15m")],
             [InlineKeyboardButton("30m", callback_data=f"settf_{coin}_30m")],
-            [InlineKeyboardButton("1h", callback_data=f"settf_{coin}_1h")],
+            [InlineKeyboardButton("45m", callback_data=f"settf_{coin}_45m")],
+            [InlineKeyboardButton("1h",  callback_data=f"settf_{coin}_1h")],
             [InlineKeyboardButton("Назад", callback_data="scanner_menu")],
         ]
         await query.edit_message_text(f"Выбери таймфрейм для <b>{coin}</b>:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
         return
 
     if data.startswith("settf_"):
-        parts = data.split("_")
+        parts = data.split("_", 2)
         coin = parts[1]
         tf = parts[2]
         await client.post("https://scanner-fly-oz.fly.dev/set_tf", json={"coin": coin, "tf": tf})
@@ -255,7 +255,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("coin_"):
         coin = data[5:]
         kb = [[InlineKeyboardButton("ВКЛ / ВЫКЛ", callback_data=f"toggle_{coin}")], [InlineKeyboardButton("Назад", callback_data="back")]]
-        await query.edit_message_text(f"<b>{coin}</b> — {'ON' if settings[coin]['enabled'] else 'OFF'}\nСумма: ${settings[coin]['amount_usd']} × {settings[coin]['leverage']}x", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        await query.edit_message_text(f"<b>{coin}</b> — {'ON' if settings[coin]['enabled'] else 'OFF'}", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
     elif data.startswith("toggle_"):
         coin = data[7:]
         settings[coin]["enabled"] = not settings[coin]["enabled"]
@@ -263,7 +263,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await button_handler(update, context)
     elif data == "bal":
         b = await balance()
-        await query.edit_message_text(f"<b>Баланс Futures:</b> <code>{b:,.2f}</code> USDT", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="back")]]))
+        await query.edit_message_text(f"Баланс Futures: <code>{b:,.2f}</code> USDT", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="back")]]))
     elif data == "stats":
         text = f"<b>Статистика</b>\nОбщая P&L: <code>{stats.get('total_pnl',0):+.2f}</code> USDT\n\nПо коинам:\n"
         for c in COINS:
@@ -288,7 +288,7 @@ async def lifespan(app: FastAPI):
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
-    await tg("ТЕРМИНАТОР 2026 ЗАПУЩЕН")
+    await tg("ТЕРМИНАТОР 2026 АКТИВИРОВАН")
     yield
     await application.stop()
 
@@ -311,7 +311,7 @@ async def toggle_scanner():
 async def get_scanner_status():
     ago = int(time.time()) - scanner_status["last_seen"]
     if ago > 120:
-        scanner_status["online"] = False
+       scanner_status["online"] = False
     return {"online": scanner_status["online"], "enabled": scanner_status["enabled"], "last_seen_seconds_ago": ago}
 
 @app.post("/set_tf")
@@ -319,7 +319,7 @@ async def set_tf(req: Request):
     data = await req.json()
     coin = data.get("coin")
     tf = data.get("tf")
-    if coin in COINS and tf in ["1m","3m","5m","15m","30m","1h"]:
+    if coin in COINS and tf in ["1m","3m","5m","15m","30m","45m","1h"]:
         config = await get_scanner_config()
         config[coin] = tf
         with open(SCANNER_CONFIG_FILE, "w") as f:
@@ -331,16 +331,49 @@ async def set_tf(req: Request):
 # ====================== ВЕБ-СТРАНИЦЫ ======================
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>ТЕРМИНАТОР 2026 — РАБОТАЕТ 24/7</h1><p><a href='/scanner'>График</a> | <a href='/logs'>Логи</a></p>")
+    return HTMLResponse("<h1>ТЕРМИНАТОР 2026 — 24/7</h1><p><a href='/scanner'>График</a> • <a href='/logs'>Логи сигналов</a></p>")
 
 @app.get("/scanner")
 async def scanner_dashboard():
-    return HTMLResponse("""твой красивый TradingView дашборд — оставь как есть""")
+    return HTMLResponse("""
+    <!DOCTYPE html>
+    <html><head><meta charset="utf-8"><title>ТЕРМИНАТОР 2026 — СКАНЕР</title>
+    <style>body,html{margin:0;padding:0;height:100%;background:#000;color:#0f0;font-family:Courier New;overflow:hidden;}
+    .header{text-align:center;padding:20px;background:#111;border-bottom:3px solid #0f0;box-shadow:0 0 30px #0f0;}
+    h1{font-size:3em;text-shadow:0 0 20px #0f0;}</style></head>
+    <body><div class="header"><h1>ТЕРМИНАТОР 2026</h1><p>XRP • SOL • ETH • BTC • DOGE — OZ 2026</p></div>
+    <div class="tradingview-widget-container" style="height:calc(100vh - 120px);width:100%;">
+      <div id="tradingview_chart"></div>
+      <script src="https://s3.tradingview.com/tv.js"></script>
+      <script>new TradingView.widget({"width":"100%","height":"100%","symbol":"BINANCE:XRPUSDT.P","interval":"5","theme":"dark",
+      "allow_symbol_change":true,"studies":["MASimple@tv-basicstudies","RSI@tv-basicstudies","Volume@tv-basicstudies"],
+      "container_id":"tradingview_chart"});</script>
+    </div></body></html>
+    """)
 
 @app.get("/logs")
 async def signal_logs():
-    # твой код логов — оставь как есть
-    pass
+    try:
+        with open("signal_log.json") as f:
+            logs = json.load(f)
+    except:
+        logs = []
+    rows = ""
+    for entry in reversed(logs[-30:]):
+        color = "lime" if entry.get("action") == "BUY" else "red"
+        rows += f'<tr><td>{entry["date"]}</td><td>{entry["time"]}</td><td>{entry["coin"]}</td><td style="color:{color}"><b>{entry["action"]}</b></td><td>{entry["price"]}</td></tr>'
+    if not rows:
+        rows = '<tr><td colspan="5" style="color:yellow">Сигналов пока нет...</td></tr>'
+    return HTMLResponse(f"""
+    <!DOCTYPE html><html><head><title>ЛОГИ СИГНАЛОВ</title><meta charset="utf-8">
+    <style>body{{background:#000;color:#0f0;font-family:Courier New;padding:20px;}}
+    table{{width:100%;border-collapse:collapse;}} th,td{{border:1px solid #0f0;padding:10px;text-align:center;}}
+    th{{background:#111;}} tr:nth-child(even){{background:#0a0a0a;}}</style></head>
+    <body><h1>ЛОГИ СИГНАЛОВ (последние 30)</h1>
+    <table><tr><th>Дата</th><th>Время</th><th>Коин</th><th>Сигнал</th><th>Цена</th></tr>{rows}</table>
+    <p style="text-align:center;"><a href="/scanner">График</a> • <a href="/">Главная</a></p>
+    <script>setInterval(()=>location.reload(),15000);</script></body></html>
+    """)
 
 # ====================== WEBHOOK ======================
 @app.post("/webhook")
