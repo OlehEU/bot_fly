@@ -16,6 +16,7 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 from fastapi.staticfiles import StaticFiles # ИМПОРТ ЛОГОВ
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -222,6 +223,49 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "back":  # ← теперь работает!
         await start(update, context)
+
+# ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
+# ВСЁ, ЧТО НИЖЕ — ДОБАВЛЯЙ В КОНЕЦ main.py (перед polling)
+# ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
+
+
+
+# Команда /scanner — показывает статус и кнопку
+@dp.message_handler(commands=['scanner'])
+async def cmd_scanner(message: types.Message):
+    if message.from_user.id != ADMIN_ID:        # ← твой ADMIN_ID уже есть в коде
+        return
+    
+    try:
+        status = (await httpx.AsyncClient().get("https://bot-fly-oz.fly.dev/scanner_status")).json()
+    except:
+        status = {"online": False, "enabled": False, "last_seen_seconds_ago": 999}
+
+    text = (
+        f"СКАНЕР OZ 2026\n\n"
+        f"Статус: {'🟢 ОНЛАЙН' if status['online'] else '🔴 ОФФЛАЙН'}\n"
+        f"Режим: {'ВКЛЮЧЁН' if status['enabled'] else 'ВЫКЛЮЧЕН'}\n"
+        f"Последний пинг: {status['last_seen_seconds_ago']} сек назад\n\n"
+        f"Торговля: {'АКТИВНА' if status['enabled'] and status['online'] else 'ОСТАНОВЛЕНА'}"
+    )
+    
+    keyboard = InlineKeyboardMarkup()
+    btn_text = "ВЫКЛЮЧИТЬ СКАНЕР" if status['enabled'] else "ВКЛЮЧИТЬ СКАНЕР"
+    keyboard.add(InlineKeyboardButton(btn_text, callback_data="toggle_scanner"))
+    
+    await message.answer(text, reply_markup=keyboard)
+
+# Кнопка ВКЛ/ВЫКЛ
+@dp.callback_query_handler(lambda c: c.data == "toggle_scanner")
+async def toggle_scanner_btn(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    
+    await httpx.post("https://bot-fly-oz.fly.dev/toggle_scanner")
+    await call.answer("Готово!", show_alert=True)
+    
+    # Обновляем сообщение
+    await cmd_scanner(call.message)
         
 # ====================== FASTAPI ======================
 @asynccontextmanager
