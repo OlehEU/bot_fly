@@ -1,8 +1,4 @@
-# main.py — ТЕРМИНАТОР 2026 PATCHED
-# Требует окружения:
-# TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, BINANCE_API_KEY, BINANCE_API_SECRET, WEBHOOK_SECRET
-# Optional: SCANNER_URL (https://scanner-fly-oz.fly.dev), BOT_URL (https://bot-fly-oz.fly.dev)
-
+# main.py — ТЕРМИНАТОР 2026 PATCHED FULL
 import os
 import json
 import time
@@ -14,15 +10,16 @@ import urllib.parse
 from typing import Dict, Optional, Any
 import httpx
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse
-from contextlib import asynccontextmanager
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from contextlib import asynccontextmanager
+import tempfile
 
+# ===== Logging =====
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("terminator")
 
-# ========== Environment checks ==========
+# ===== Environment =====
 required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "BINANCE_API_KEY", "BINANCE_API_SECRET", "WEBHOOK_SECRET"]
 for var in required:
     if not os.getenv(var):
@@ -32,7 +29,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # used both by bot and scanner (shared secret)
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 SCANNER_BASE = os.getenv("SCANNER_BASE", "https://scanner-fly-oz.fly.dev")
 BOT_BASE = os.getenv("BOT_BASE", "https://bot-fly-oz.fly.dev")
@@ -42,8 +39,7 @@ SETTINGS_FILE = "settings.json"
 STATS_FILE = "stats.json"
 SCANNER_CONFIG_FILE = "scanner_config.json"
 
-# ========== Simple atomic write helper ==========
-import tempfile
+# ===== Helpers =====
 def atomic_write_json(path: str, data: Any):
     dirpath = os.path.dirname(path) or "."
     with tempfile.NamedTemporaryFile("w", dir=dirpath, delete=False, encoding="utf-8") as tf:
@@ -51,7 +47,6 @@ def atomic_write_json(path: str, data: Any):
         tmp = tf.name
     os.replace(tmp, path)
 
-# ========== Settings & stats ==========
 def load_settings() -> Dict:
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
@@ -86,17 +81,24 @@ def load_stats() -> Dict:
 def save_stats(s: Dict):
     atomic_write_json(STATS_FILE, s)
 
+def load_scanner_config() -> Dict:
+    try:
+        with open(SCANNER_CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        default = {"XRP": "3m", "SOL": "5m", "ETH": "15m", "BTC": "15m", "DOGE": "1m"}
+        atomic_write_json(SCANNER_CONFIG_FILE, default)
+        return default
+
+# ===== Global =====
 settings = load_settings()
 stats = load_stats()
-
-# ========== Global client ==========
 client = httpx.AsyncClient(timeout=30.0)
-
 last_balance: Dict[str, float] = {}
 bot: Optional[Bot] = None
 scanner_status = {"online": False, "last_seen": 0, "enabled": True}
 
-# ========== Binance low-level helpers ==========
+# ===== Binance helpers =====
 BASE = "https://fapi.binance.com"
 
 def sign(p: Dict) -> str:
@@ -139,9 +141,9 @@ async def balance() -> float:
             return float(a["balance"])
     return 0.0
 
-# ========== Trading operations (safety checks, dedupe) ==========
+# ===== Trading =====
 _order_id_lock = asyncio.Lock()
-_sent_order_ids = set()  # in-memory dedupe; for persistence consider DB
+_sent_order_ids = set()
 
 async def open_long(coin: str):
     if not settings[coin]["enabled"]:
@@ -152,16 +154,13 @@ async def open_long(coin: str):
         if q <= 0:
             log.warning("Q <= 0 для %s", coin)
             return
-        # build client order id
         oid = f"{coin.lower()}_{int(time.time()*1000)}"
-        # dedupe
         async with _order_id_lock:
             if oid in _sent_order_ids:
                 log.warning("Duplicate oid %s", oid)
                 return
             _sent_order_ids.add(oid)
         entry = await price(coin)
-        # place order
         await api("POST", "/fapi/v1/order", {"side":"BUY","type":"MARKET","quantity":str(q),"newClientOrderId":oid}, symbol=coin)
         last_balance[coin] = await balance()
         await tg(f"LONG {coin}\n${settings[coin]['amount_usd']} × {settings[coin]['leverage']}x\nEntry: <code>{entry:.5f}</code>")
@@ -180,7 +179,6 @@ async def close_all(coin: str):
         if cur:
             q = abs(float(cur["positionAmt"]))
             side = "SELL" if float(cur["positionAmt"]) > 0 else "BUY"
-            # try market reduce-only
             try:
                 await api("POST", "/fapi/v1/order", {"side":side,"type":"MARKET","quantity":str(q),"reduceOnly":"true"}, symbol=coin)
             except Exception:
@@ -197,7 +195,7 @@ async def close_all(coin: str):
         log.exception("Ошибка close_all %s", coin)
         await tg(f"Ошибка закрытия {coin}: проверь логи")
 
-# ========== Telegram helpers ==========
+# ===== Telegram helpers =====
 async def tg(text: str):
     if bot:
         try:
@@ -211,16 +209,6 @@ async def tg_balance():
         await tg(f"Баланс: <code>{b:,.2f}</code> USDT")
     except Exception:
         log.exception("tg_balance failed")
-
-# ========== Scanner config helpers ==========
-def load_scanner_config() -> Dict:
-    try:
-        with open(SCANNER_CONFIG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        default = {"XRP": "3m", "SOL": "5m", "ETH": "15m", "BTC": "15m", "DOGE": "1m"}
-        atomic_write_json(SCANNER_CONFIG_FILE, default)
-        return default
 
 async def show_scanner_status(query_or_update):
     try:
@@ -251,10 +239,6 @@ async def show_scanner_status(query_or_update):
     else:
         await query_or_update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
-# ========== Telegram UI handlers (unchanged logic, but set_tf calls protected) ==========
-# ... (start, button_handler etc) - keep same as before, but when invoking scanner URL include header
-
-# For brevity include only the modified part where we call scanner set_tf:
 async def send_set_tf_to_scanner(coin: str, tf: str):
     url = f"{SCANNER_BASE}/set_tf"
     headers = {"X-Scanner-Secret": f"Bearer {WEBHOOK_SECRET}"}
@@ -263,10 +247,26 @@ async def send_set_tf_to_scanner(coin: str, tf: str):
     except Exception:
         log.exception("Не удалось послать set_tf на сканер")
 
-# in your CallbackQuery handler replace direct client.post(...) with send_set_tf_to_scanner(...)
+# ===== Telegram Handlers =====
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("ТЕРМИНАТОР 2026 активирован! 🚀", parse_mode="HTML")
+    await show_scanner_status(update)
 
-# ========== Lifespan / FastAPI app ==========
-from contextlib import asynccontextmanager
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data.startswith("tf_"):
+        coin = data.split("_")[1]
+        await send_set_tf_to_scanner(coin, "5m")
+        await show_scanner_status(query)
+    elif data == "toggle_scanner":
+        scanner_status["enabled"] = not scanner_status["enabled"]
+        await show_scanner_status(query)
+    elif data == "back":
+        await show_scanner_status(query)
+
+# ===== FastAPI app =====
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bot
@@ -283,7 +283,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# ========== API for scanner (protected) ==========
+# ===== Scanner API =====
 @app.post("/scanner_ping")
 async def scanner_ping(request: Request):
     auth = request.headers.get("Authorization", "")
@@ -311,7 +311,6 @@ async def get_scanner_status():
 
 @app.post("/set_tf")
 async def set_tf(req: Request):
-    # local /set_tf UI for external callers — protect with header
     auth = req.headers.get("X-Scanner-Secret") or req.headers.get("Authorization")
     if auth != f"Bearer {WEBHOOK_SECRET}":
         raise HTTPException(403)
@@ -327,10 +326,8 @@ async def set_tf(req: Request):
         return {"ok": True}
     return {"error": "invalid"}
 
-# ========== webhook to receive signals ==========
 @app.post("/webhook")
 async def webhook(req: Request):
-    # Expect Authorization: Bearer <WEBHOOK_SECRET>
     auth = req.headers.get("Authorization", "")
     if auth != f"Bearer {WEBHOOK_SECRET}":
         raise HTTPException(403)
