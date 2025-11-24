@@ -1,4 +1,4 @@
-# main.py — ТЕРМИНАТОР 2026 ULTIMATE — РАБОТАЕТ НА FLY.IO НА 1000%
+# main.py — ТЕРМИНАТОР 2026 | ПОЛНОЕ МЕНЮ + УПРАВЛЕНИЕ СКАНЕРОМ
 import os
 import json
 import time
@@ -16,218 +16,206 @@ from contextlib import asynccontextmanager
 import tempfile
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("terminator")
+log = logging.getLogger("OZ2026")
 
-# ====== ENV CHECK ======
+# ====== ENV ======
 required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "BINANCE_API_KEY", "BINANCE_API_SECRET", "WEBHOOK_SECRET"]
-for var in required:
-    if not os.getenv(var):
-        raise EnvironmentError(f"ОТСУТСТВУЕТ ПЕРЕМЕННАЯ: {var}")
+for v in required:
+    if not os.getenv(v):
+        raise EnvironmentError(f"Нет {v}")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-SCANNER_BASE = os.getenv("SCANNER_BASE", "https://scanner-fly-oz.fly.dev")
-BOT_BASE = os.getenv("BOT_BASE", "https://bot-fly-oz.fly.dev")
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
+BINANCE_KEY = os.getenv("BINANCE_API_KEY")
+BINANCE_SECRET = os.getenv("BINANCE_API_SECRET")
+SECRET = os.getenv("WEBHOOK_SECRET")
+SCANNER_URL = os.getenv("SCANNER_BASE", "https://scanner-fly-oz.fly.dev")
+BOT_URL = os.getenv("BOT_BASE", "https://bot-fly-oz.fly.dev")
 
 COINS = ["XRP", "SOL", "ETH", "BTC", "DOGE"]
-SETTINGS_FILE = "settings.json"
-STATS_FILE = "stats.json"
-SCANNER_CONFIG_FILE = "scanner_config.json"
+TF_LIST = ["1m", "3m", "5m", "15m", "30m", "1h"]
+
 SIGNAL_LOG_FILE = "signal_log.json"
-
-# ====== JSON HELPERS ======
-def atomic_write_json(path: str, data: Any):
-    dirpath = os.path.dirname(path) or "."
-    with tempfile.NamedTemporaryFile("w", dir=dirpath, delete=False, encoding="utf-8") as tf:
-        json.dump(data, tf, ensure_ascii=False, indent=2)
-        tmp = tf.name
-    os.replace(tmp, path)
-
-def load_json(path: str, default: Any):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        atomic_write_json(path, default)
-        return default
-
-settings = load_json(SETTINGS_FILE, {c: {"amount_usd": 10, "leverage": 10, "enabled": True} for c in COINS})
-stats = load_json(STATS_FILE, {"total_pnl": 0.0, "per_coin": {c: 0.0 for c in COINS}})
-signal_log = load_json(SIGNAL_LOG_FILE, [])
+signal_log = []
 
 client = httpx.AsyncClient(timeout=20.0)
 bot: Bot = None
-scanner_status = {"online": False, "last_seen": 0, "enabled": True}
+
+# ====== JSON ======
+def save_log():
+    with open(SIGNAL_LOG_FILE, "w", encoding="utf-8") as f:
+        json.dump(signal_log[-500:], f, ensure_ascii=False, indent=2)
+
+try:
+    with open(SIGNAL_LOG_FILE, "r", encoding="utf-8") as f:
+        signal_log = json.load(f)
+except:
+    signal_log = []
 
 # ====== Binance ======
-BASE = "https://fapi.binance.com"
-def sign(params: Dict) -> str:
-    query = urllib.parse.urlencode({k: str(v).lower() if isinstance(v, bool) else str(v) for k, v in params.items() if v is not None})
-    return hmac.new(BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+def sign(p: Dict) -> str:
+    q = urllib.parse.urlencode({k: str(v).lower() if isinstance(v,bool) else str(v) for k,v in p.items() if v is not None})
+    return hmac.new(BINANCE_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
 
-async def api(method: str, endpoint: str, params: Dict = None, signed: bool = True, symbol: str = None):
-    url = f"{BASE}{endpoint}"
-    p = params.copy() if params else {}
-    if symbol:
-        p["symbol"] = f"{symbol}USDT"
-    if signed:
-        p["timestamp"] = int(time.time() * 1000)
-        p["signature"] = sign(p)
-    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
-    resp = await (client.get if method == "GET" else client.post)(url, params=p, headers=headers)
-    resp.raise_for_status()
-    return resp.json()
+async def binance_get(ep: str, params: Dict = None):
+    p = params or {}
+    p["timestamp"] = int(time.time()*1000)
+    p["signature"] = sign(p)
+    async with client:
+        r = await client.get(f"https://fapi.binance.com{ep}", params=p, headers={"X-MBX-APIKEY": BINANCE_KEY})
+        r.raise_for_status()
+        return r.json()
 
 async def get_balance() -> float:
-    data = await api("GET", "/fapi/v2/balance")
-    for item in data:
-        if item["asset"] == "USDT":
-            return float(item["balance"])
+    data = await binance_get("/fapi/v2/balance")
+    for a in data:
+        if a["asset"] == "USDT":
+            return float(a["balance"])
     return 0.0
 
-# ====== Telegram ======
 async def tg(text: str):
     global bot
     if bot:
         try:
-            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML", disable_web_page_preview=True)
+            await bot.send_message(CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
         except Exception as e:
-            log.error(f"TG error: {e}")
+            log.error(f"TG: {e}")
 
-# ====== FastAPI APP — ВОТ ОНО, В САМОМ НИЗУ! ======
-app = FastAPI()  # ← ЭТО ДОЛЖНО БЫТЬ ДО ВСЕХ @app.get/post!
+# ====== FastAPI + Lifespan ======
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global bot
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(btn))
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    bot = app.bot
+    await tg("ТЕРМИНАТОР 2026 ONLINE")
+    log.info("BOT UP")
+    yield
+    await app.stop()
 
-# ====== Web Pages ======
-HTML_CSS = """
-<style>
-    body {background:#0d1117;color:#c9d1d9;font-family:Arial;margin:0;padding:20px;}
-    h1,h2 {color:#58a6ff;text-align:center;}
-    table {width:90%;max-width:1000px;margin:30px auto;border-collapse:collapse;background:#161b22;}
-    th,td {border:1px solid #30363d;padding:14px;text-align:center;}
-    th {background:#21262d;color:#58a6ff;}
-    tr:nth-child(even) {background:#0d1117;}
-    tr:hover {background:#1f6feb22;}
-    .btn {padding:12px 24px;margin:10px;background:#238636;color:white;border:none;border-radius:8px;font-size:16px;cursor:pointer;}
-    .status-on {color:#7ce38b;font-weight:bold;}
-    .status-off {color:#f85149;font-weight:bold;}
-    .center {text-align:center;}
-</style>
-"""
+app = FastAPI(lifespan=lifespan)
 
+# ====== Роуты ======
 @app.get("/")
-async def root():
-    return {"status": "alive", "message": "ТЕРМИНАТОР 2026 ЗАПУЩЕН"}
+async def root(): return {"status": "OZ 2026 ALIVE"}
 
 @app.get("/logs")
 async def logs_page():
-    logs = signal_log[-150:]
-    rows = "".join(f"<tr><td>{l.get('date','—')}</td><td>{l.get('time','—')}</td><td><b>{l.get('coin','—')}</b></td><td>{l.get('action','—')}</td><td>{l.get('price','—')}</td></tr>" for l in logs)
-    return Response(content=f"<html><head><title>Логи OZ 2026</title>{HTML_CSS}</head><body><h1>СИГНАЛЫ</h1><div class='center'><a href='/scanner'><button class='btn'>СКАНЕР</button></a></div><table><tr><th>Дата</th><th>Время</th><th>Монета</th><th>Действие</th><th>Цена</th></tr>{rows}</table></body></html>", media_type="text/html")
+    rows = "".join(f"<tr><td>{e.get('date','—')}</td><td>{e.get('time','—')}</td><td><b>{e.get('coin')}</b></td><td>{e.get('action')}</td></tr>" for e in signal_log[-200:])
+    return Response(f"<html><body bgcolor=#0d1117 text=#c9d1d9><h1 align=center>СИГНАЛЫ OZ 2026</h1><table width=90% align=center border=1 cellpadding=10 cellspacing=0><tr bgcolor=#21262d><th>Дата</th><th>Время</th><th>Монета</th><th>Сигнал</th></tr>{rows}</table><center><a href='/scanner'><button style='padding:15px;background:#238636;color:white;border:none;border-radius:8px;font-size:18px'>СКАНЕР</button></a></center></body></html>", media_type="text/html")
 
 @app.get("/scanner")
 async def scanner_page():
     try:
-        status = (await client.get(f"{SCANNER_BASE}/scanner_status", timeout=6)).json()
+        s = (await client.get(f"{SCANNER_URL}/scanner_status", timeout=6)).json()
     except:
-        status = {"online": False, "enabled": False, "tf": {c: "—" for c in COINS}}
-    rows = "".join(f"<tr><td><b>{c}</b></td><td>{status['tf'].get(c, '—')}</td></tr>" for c in COINS)
-    return Response(content=f"<html><head><title>Сканер OZ 2026</title>{HTML_CSS}</head><body><h1>СКАНЕР OZ 2026</h1><p class='center'>Статус: <span class='{'status-on' if status.get('online') else 'status-off'}'>{'ОНЛАЙН' if status.get('online') else 'ОФФЛАЙН'}</span><br>Режим: <span class='{'status-on' if status.get('enabled') else 'status-off'}'>{'ВКЛ' if status.get('enabled') else 'ВЫКЛ'}</span></p><table><tr><th>Монета</th><th>ТФ</th></tr>{rows}</table><div class='center'><a href='/logs'><button class='btn'>ЛОГИ</button></a></div></body></html>", media_type="text/html")
-
-# ====== Scanner API ======
-@app.post("/scanner_ping")
-async def scanner_ping(request: Request):
-    if request.headers.get("Authorization") != f"Bearer {WEBHOOK_SECRET}":
-        raise HTTPException(403)
-    scanner_status["online"] = True
-    scanner_status["last_seen"] = int(time.time())
-    return {"ok": True}
-
-@app.post("/toggle_scanner")
-async def toggle_scanner(request: Request):
-    if request.headers.get("Authorization") != f"Bearer {WEBHOOK_SECRET}":
-        raise HTTPException(403)
-    scanner_status["enabled"] = not scanner_status["enabled"]
-    await tg(f"СКАНЕР OZ 2026 → {'ВКЛЮЧЁН' if scanner_status['enabled'] else 'ВЫКЛЮЧЕН'}")
-    return {"enabled": scanner_status["enabled"]}
-
-@app.get("/scanner_status")
-async def get_scanner_status():
-    ago = int(time.time()) - scanner_status.get("last_seen", 0)
-    if ago > 90:
-        scanner_status["online"] = False
-    return {"online": scanner_status["online"], "enabled": scanner_status["enabled"], "last_seen_seconds_ago": ago}
+        s = {"online":False, "enabled":False, "coins":{}, "tf":{c:"—" for c in COINS}}
+    rows = "".join(f"<tr><td><b>{c}</b></td><td>{'ВКЛ' if s['coins'].get(c,True) else 'ВЫКЛ'}</td><td>{s['tf'].get(c,'—')}</td></tr>" for c in COINS)
+    return Response(f"<html><body bgcolor=#0d1117 text=#c9d1d9><h1 align=center>СКАНЕР OZ 2026</h1><p align=center><b>Статус:</b> {'<font color=lime>ОНЛАЙН</font>' if s.get('online') else '<font color=red>ОФФЛАЙН</font>'} | <b>Режим:</b> {'<font color=lime>ВКЛ</font>' if s.get('enabled') else '<font color=red>ВЫКЛ</font>'}</p><table width=90% align=center border=1 cellpadding=10 cellspacing=0><tr bgcolor=#21262d><th>Монета</th><th>Статус</th><th>ТФ</th></tr>{rows}</table><center><a href='/logs'><button style='padding:15px;background:#238636;color:white;border:none;border-radius:8px;font-size:18px'>ЛОГИ</button></a></center></body></html>", media_type="text/html")
 
 @app.post("/webhook")
-async def webhook(request: Request):
-    if request.headers.get("Authorization") != f"Bearer {WEBHOOK_SECRET}":
+async def webhook(req: Request):
+    if req.headers.get("Authorization") != f"Bearer {SECRET}":
         raise HTTPException(403)
-    data = await request.json()
-    signal = data.get("signal", "").lower()
-    coin = data.get("coin", "").upper()
-    if coin not in COINS:
-        return {"error": "bad coin"}
-    
-    entry = {"date": time.strftime("%Y-%m-%d"), "time": time.strftime("%H:%M:%S"), "coin": coin, "action": "LONG" if "buy" in signal else "CLOSE", "price": "—"}
-    signal_log.append(entry)
-    atomic_write_json(SIGNAL_LOG_FILE, signal_log[-500:])
+    data = await req.json()
+    signal = data.get("signal","").lower()
+    coin = data.get("coin","").upper()
+    if coin not in COINS: return {"error":"bad coin"}
 
-    if "buy" in signal:
-        await tg(f"LONG {coin}USDT\nСигнал от OZ 2026!")
-    elif signal == "close_all":
+    entry = {"date": time.strftime("%Y-%m-%d"), "time": time.strftime("%H:%M:%S"), "coin": coin, "action": "LONG" if "buy" in signal or "long" in signal else "CLOSE"}
+    signal_log.append(entry)
+    save_log()
+
+    if "buy" in signal or "long" in signal:
+        await tg(f"LONG {coin}USDT\nСканер OZ 2026 дал сигнал!")
+    elif "close" in signal:
         await tg(f"ЗАКРЫТИЕ {coin}USDT")
     return {"ok": True}
 
-# ====== Telegram Bot ======
+# ====== ТЕЛЕГРАМ МЕНЮ ======
 def main_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Баланс", callback_data="balance"), InlineKeyboardButton("Сканер OZ", callback_data="scanner")],
-        [InlineKeyboardButton("Логи", url=f"{BOT_BASE}/logs"), InlineKeyboardButton("Сканер", url=f"{BOT_BASE}/scanner")],
+        [InlineKeyboardButton("Баланс", callback_data="bal"), InlineKeyboardButton("Статистика", callback_data="stats")],
+        [InlineKeyboardButton("Управление сканером", callback_data="scanner_menu")],
+        [InlineKeyboardButton("Логи", url=f"{BOT_URL}/logs"), InlineKeyboardButton("Сканер", url=f"{BOT_URL}/scanner")],
     ])
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("<b>ТЕРМИНАТОР 2026 АКТИВИРОВАН</b>", parse_mode="HTML", reply_markup=main_menu())
+async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    await u.message.reply_text("ТЕРМИНАТОР 2026\nГотов к бою, командир!", reply_markup=main_menu())
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "balance":
-        bal = await get_balance()
-        await query.edit_message_text(f"<b>Баланс:</b> <code>{bal:,.2f}</code> USDT", parse_mode="HTML", reply_markup=main_menu())
-    elif query.data == "scanner":
+async def btn(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query
+    await q.answer()
+
+    if q.data == "back":
+        await q.edit_message_text("Главное меню", reply_markup=main_menu())
+        return
+
+    if q.data == "bal":
+        b = await get_balance()
+        await q.edit_message_text(f"Баланс: <code>{b:,.2f}</code> USDT", parse_mode="HTML", reply_markup=main_menu())
+
+    elif q.data == "stats":
+        await q.edit_message_text("Статистика в разработке\nСкоро будет PnL, профит-фактор и т.д.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="back")]]))
+
+    elif q.data == "scanner_menu":
         try:
-            status = (await client.get(f"{SCANNER_BASE}/scanner_status")).json()
+            s = (await client.get(f"{SCANNER_URL}/scanner_status")).json()
         except:
-            status = {"online": False, "enabled": False, "tf": {c: "—" for c in COINS}}
-        tf_text = "\n".join([f"{c}: <b>{status['tf'].get(c, '—')}</b>" for c in COINS])
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("ВЫКЛ СКАНЕР" if status.get("enabled") else "ВКЛ СКАНЕР", callback_data="toggle_scanner")],
+            s = {"enabled": False, "coins": {c: True for c in COINS}, "tf": {c:"5m" for c in COINS}}
+
+        keyboard = [
+            [InlineKeyboardButton("ВКЛ СКАНЕР" if not s.get("enabled") else "ВЫКЛ СКАНЕР", callback_data="toggle_global")],
+            [InlineKeyboardButton("XRP", callback_data="coin_XRP"), InlineKeyboardButton("SOL", callback_data="coin_SOL")],
+            [InlineKeyboardButton("ETH", callback_data="coin_ETH"), InlineKeyboardButton("BTC", callback_data="coin_BTC")],
+            [InlineKeyboardButton("DOGE", callback_data="coin_DOGE")],
             [InlineKeyboardButton("Назад", callback_data="back")]
-        ])
-        await query.edit_message_text(f"<b>СКАНЕР OZ 2026</b>\n\nСтатус: {'ОНЛАЙН' if status.get('online') else 'ОФФЛАЙН'}\nРежим: {'ВКЛ' if status.get('enabled') else 'ВЫКЛ'}\n\n<b>ТФ:</b>\n{tf_text}", parse_mode="HTML", reply_markup=keyboard)
-    elif query.data == "toggle_scanner":
-        await client.post(f"{BOT_BASE}/toggle_scanner", headers={"Authorization": f"Bearer {WEBHOOK_SECRET}"})
-        await button_handler(update, context)
-    elif query.data == "back":
-        await query.edit_message_text("Главное меню", reply_markup=main_menu())
+        ]
+        text = f"УПРАВЛЕНИЕ СКАНЕРОМ OZ 2026\n\nГлобально: {'ВКЛ' if s.get('enabled') else 'ВЫКЛ'}\n\nНажми на монету → вкл/выкл + смена ТФ"
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ====== Lifespan ======
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global bot
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(button_handler))
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-    bot = application.bot
-    await tg("<b>ТЕРМИНАТОР 2026 ONLINE</b>")
-    yield
-    await application.stop()
+    elif q.data == "toggle_global":
+        await client.post(f"{BOT_URL}/toggle_scanner", headers={"Authorization": f"Bearer {SECRET}"})
+        await btn(u, c)
 
-app = FastAPI(lifespan=lifespan)  # ← ВТОРОЙ РАЗ — ПЕРЕОПРЕДЕЛЯЕМ С LIFESPAN
+    elif q.data.startswith("coin_"):
+        coin = q.data.split("_")[1]
+        try:
+            s = (await client.get(f"{SCANNER_URL}/scanner_status")).json()
+        except:
+            s = {"coins": {c: True for c in COINS}, "tf": {c:"5m" for c in COINS}}
 
-# ГОТОВО! ДЕПЛОЙ И ЖИВИ В 2026
+        enabled = s["coins"].get(coin, True)
+        current_tf = s["tf"].get(coin, "5m")
+
+        tf_buttons = []
+        row = []
+        for tf in TF_LIST:
+            row.append(InlineKeyboardButton(f"{tf} ✓" if tf == current_tf else tf, callback_data=f"settf_{coin}_{tf}"))
+            if len(row) == 3:
+                tf_buttons.append(row)
+                row = []
+        if row: tf_buttons.append(row)
+
+        kb = [
+            [InlineKeyboardButton("ВЫКЛ" if enabled else "ВКЛ", callback_data=f"togglecoin_{coin}")],
+            *tf_buttons,
+            [InlineKeyboardButton("Назад", callback_data="scanner_menu")]
+        ]
+        await q.edit_message_text(f"Настройка {coin}\nСейчас: {'ВКЛ' if enabled else 'ВЫКЛ'} | ТФ: {current_tf}", reply_markup=InlineKeyboardMarkup(kb))
+
+    elif q.data.startswith("togglecoin_"):
+        coin = q.data.split("_")[1]
+        await client.post(f"{SCANNER_URL}/toggle_coin", json={"coin": coin}, headers={"Authorization": f"Bearer {SECRET}"})
+        await btn(u, c)
+
+    elif q.data.startswith("settf_"):
+        parts = q.data.split("_")
+        coin, tf = parts[1], parts[2]
+        await client.post(f"{SCANNER_URL}/set_tf", json={"coin": coin, "tf": tf}, headers={"Authorization": f"Bearer {SECRET}"})
+        await tg(f"{coin} → таймфрейм {tf}")
+        await btn(u, c)
