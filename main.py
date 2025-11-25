@@ -1,4 +1,4 @@
-# main.py — TERMINATOR 2026 HEDGE MODE — НАДЕЖНЫЙ XRP BOT
+# main.py — TERMINATOR 2026 HEDGE MODE — XRP BOT
 
 import os
 import time
@@ -37,7 +37,7 @@ async def tg_send(msg: str):
         print("Telegram error:", e)
 
 # ================= BINANCE REQUEST =================
-def create_signature(params: dict) -> str:
+def create_signature(params: dict) -> list:
     # параметры в виде списка кортежей
     p = []
     for k, v in (params or {}).items():
@@ -111,7 +111,7 @@ async def get_qty() -> float:
     return max(qty, min_qty)
 
 # ================== OPEN LONG =================
-async def open_long():
+async def open_long(symbol_override=None):
     global position_active
     if position_active:
         await tg_send("Позиция уже открыта!")
@@ -163,6 +163,35 @@ Qty: {qty}
         await tg_send(f"<b>OPEN LONG ERROR</b>\n<code>{traceback.format_exc()}</code>")
         position_active = False
 
+# ================== CLOSE POSITION =================
+async def close_position(symbol_override=None):
+    global position_active
+    try:
+        positions = await binance_request("GET", "/fapi/v2/positionRisk", {"symbol": SYMBOL_BINANCE})
+        amt = 0
+        for p in positions if isinstance(positions, list) else []:
+            if p.get("symbol") == SYMBOL_BINANCE and p.get("positionSide") == "LONG":
+                amt = float(p.get("positionAmt", 0))
+                break
+        if abs(amt) < 0.0001:
+            await tg_send(f"{SYMBOL_BINANCE} LONG already closed")
+            return
+
+        qty_str = f"{abs(amt):.6f}".rstrip("0").rstrip(".")
+        params = {
+            "symbol": SYMBOL_BINANCE,
+            "side": "SELL",
+            "type": "MARKET",
+            "quantity": qty_str,
+            "reduceOnly": "true",
+            "positionSide": "LONG"
+        }
+        await binance_request("POST", "/fapi/v1/order", params)
+        await tg_send(f"<b>{SYMBOL_BINANCE} LONG CLOSED</b>")
+        position_active = False
+    except Exception:
+        await tg_send(f"<b>CLOSE ERROR</b>\n<code>{traceback.format_exc()}</code>")
+
 # ================== LIFESPAN =================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -181,10 +210,23 @@ async def root():
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    if request.headers.get("X-Webhook-Secret") != WEBHOOK_SECRET:
+    if request.headers.get("Authorization") != f"Bearer {WEBHOOK_SECRET}":
         raise HTTPException(403)
     data = await request.json()
-    if data.get("signal") == "obuy":  # сигнал BUY
-        await tg_send("Signal BUY — opening LONG")
-        asyncio.create_task(open_long())
-    return {"ok": True}
+    symbol = data.get("symbol", "").upper().replace("USDT", "")
+    action = data.get("direction", "").upper()
+
+    if not symbol or action not in ["LONG", "CLOSE"]:
+        return {"error": "bad"}
+
+    if action == "LONG":
+        asyncio.create_task(open_long(symbol))
+    else:
+        asyncio.create_task(close_position(symbol))
+
+    return {"status": "ok"}
+
+# ================== RUN =================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
