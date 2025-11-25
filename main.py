@@ -1,4 +1,4 @@
-# main.py — ТЕРМИНАТОР 2026 | РАБОТАЕТ НА 100% | ОТКРЫВАЕТ СДЕЛКИ СРАЗУ
+# main.py — ТЕРМИНАТОР 2026 | 100% РАБОЧИЙ | ОТКРЫВАЕТ СДЕЛКИ СРАЗУ
 import os
 import time
 import hmac
@@ -18,13 +18,13 @@ BINANCE_SECRET = os.getenv("BINANCE_API_SECRET")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "supersecret123")
 
 if not all([TOKEN, CHAT_ID, BINANCE_KEY, BINANCE_SECRET]):
-    raise Exception("Ошибка: не хватает ключей в fly secrets!")
+    raise Exception("Нет ключей! fly secrets set TELEGRAM_TOKEN, BINANCE_API_KEY и т.д.")
 
 bot = Bot(token=TOKEN)
 client = httpx.AsyncClient(timeout=15.0)
 app = FastAPI()
 
-# ==================== 100% РАБОЧАЯ ПОДПИСЬ BINANCE ====================
+# ==================== ПРАВИЛЬНАЯ ПОДПИСЬ BINANCE ====================
 def create_signature(query_string: str) -> str:
     return hmac.new(BINANCE_SECRET.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
 
@@ -32,35 +32,29 @@ async def binance_request(method: str, endpoint: str, params: dict = None):
     url = f"https://fapi.binance.com{endpoint}"
     params = params or {}
 
-    # Все параметры кроме timestamp и signature
     base_params = {k: str(v) for k, v in params.items() if v is not None}
     query_parts = sorted(base_params.items())
     query_string = urllib.parse.urlencode(query_parts)
 
-    # Добавляем timestamp
     timestamp = int(time.time() * 1000)
     if query_string:
         query_string += "&"
     query_string += f"timestamp={timestamp}"
 
-    # Создаём подпись
     signature = create_signature(query_string)
     query_string += f"&signature={signature}"
 
     headers = {"X-MBX-APIKEY": BINANCE_KEY}
 
     try:
-        if method == "POST":
-            resp = await client.post(url + "?" + query_string, headers=headers)
-        else:
-            resp = await client.get(url + "?" + query_string, headers=headers)
-        
+        full_url = url + "?" + query_string
+        resp = await client.request(method, full_url, headers=headers)
         data = resp.json()
         if isinstance(data, dict) and data.get("code"):
-            print(f"BINANCE ОШИБКА: {data['code']}: {data['msg']}")
+            print(f"BINANCE ОШИБКА: {data}")
         return data
     except Exception as e:
-        print(f"Ошибка запроса к Binance: {e}")
+        print(f"Ошибка Binance: {e}")
         return {}
 
 # ==================== ОРДЕРА ====================
@@ -93,38 +87,28 @@ async def open_long(symbol: str, usd: float = 10.0):
         "quoteOrderQty": usd
     })
 
-# ==================== TELEGRAM ====================
+# ==================== TG ====================
 async def tg(text: str):
     try:
         await bot.send_message(CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
-        print(f"TG ошибка: {e}")
+        print(f"TG error: {e}")
 
-# ==================== СТАРТОВОЕ СООБЩЕНИЕ ====================
+# ==================== СТАРТ ====================
 @app.on_event("startup")
 async def startup():
     await tg(
-        "<b>ТЕРМИНАТОР 2026 ОНЛАЙН</b>\n\n"
-        f"Запущен: {datetime.datetime.now():%H:%M:%S %d.%m.%Y}\n"
+        "<b>ТОРГОВЫЙ БОТ OZ 2026 ЗАПУЩЕН</b>\n\n"
+        f"Время: {datetime.datetime.now():%H:%M %d.%m.%Y}\n"
         "• 10 USDT на сделку\n"
         "• Binance Futures\n"
-        "• Готов рвать рынок 24/7"
+        "• Готов к сигналам OZ SCANNER"
     )
 
 # ==================== ЗАГЛУШКА ====================
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    return HTMLResponse("""
-    <html><head><title>ТЕРМИНАТОР 2026</title><meta charset="utf-8"><style>
-    body{margin:0;background:#000;color:#0f0;font-family:'Courier New';text-align:center;padding-top:15%}
-    h1{font-size:4em;text-shadow:0 0 30px #0f0;letter-spacing:10px}
-    h2{font-size:2em;margin:30px}
-    </style></head><body>
-    <h1>ТЕРМИНАТОР 2026</h1>
-    <h2>ONLINE · ARMED · TRADING 10$</h2>
-    <p>OZ SCANNER → BINANCE FUTURES → PROFIT</p>
-    </body></html>
-    """)
+    return "<h1 style='color:#0f0;background:#000;text-align:center;padding:50px;font-family:monospace'>ТЕРМИНАТОР 2026<br>ONLINE · ARMED · TRADING</h1>"
 
 # ==================== ВЕБХУК ====================
 @app.post("/webhook")
@@ -141,20 +125,17 @@ async def webhook(request: Request):
     direction = data.get("direction", "").upper()
 
     if not symbol or direction not in ["LONG", "CLOSE"]:
-        return {"error": "bad data"}
-
-    }
+        return {"error": "bad symbol or direction"}
 
     if direction == "LONG":
         await open_long(symbol, 10.0)
-        await tg(f"<b>ОТКРЫЛ LONG {symbol}USDT</b>\nПо сигналу OZ SCANNER\n10 USDT в деле")
-    else:
+        await tg(f"<b>ОТКРЫЛ LONG {symbol}USDT</b>\nПо сигналу OZ SCANNER\n10 USDT")
+    elif direction == "CLOSE":
         await close_position(symbol)
-        await tg(f"<b>ЗАКРЫЛ позицию {symbol}USDT</b>\nПо сигналу OZ SCANNER")
+        await tg(f"<b>ЗАКРЫЛ {symbol}USDT</b>\nПо сигналу OZ SCANNER")
 
-    return {"status": "ok", "symbol": symbol, "action": direction}
+    return {"status": "ok", "action": direction, "symbol": symbol}
 
-# ==================== ЗАПУСК ====================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
