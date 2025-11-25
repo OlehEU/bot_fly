@@ -1,4 +1,4 @@
-# main.py — TERMINATOR 2026 HEDGE MODE — XRP BOT
+# main.py — TERMINATOR 2026 HEDGE MODE — XRP BOT (без TP/SL)
 
 import os
 import time
@@ -21,8 +21,6 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "supersecret123")
 
 FIXED_AMOUNT_USD = float(os.getenv("FIXED_AMOUNT_USD", "10"))
 LEVERAGE        = int(os.getenv("LEVERAGE", "10"))
-TP_PERCENT      = float(os.getenv("TP_PERCENT", "0.5"))
-SL_PERCENT      = float(os.getenv("SL_PERCENT", "1.0"))
 BASE_COIN       = "XRP"
 SYMBOL_BINANCE  = f"{BASE_COIN}USDT"
 
@@ -38,24 +36,16 @@ async def tg_send(msg: str):
 
 # ================= BINANCE REQUEST =================
 def create_signature(params: dict) -> list:
-    # параметры в виде списка кортежей
     p = []
     for k, v in (params or {}).items():
         if v is None:
             continue
         p.append((k, str(v)))
 
-    # timestamp
     p.append(("timestamp", str(int(time.time() * 1000))))
-
-    # сортировка
     p_sorted = sorted(p, key=lambda x: x[0])
-
-    # query string
     query_string = "&".join(f"{k}={v}" for k, v in p_sorted)
     signature = hmac.new(BINANCE_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
-
-    # добавить signature в конец
     p_sorted.append(("signature", signature))
     return p_sorted
 
@@ -120,9 +110,8 @@ async def open_long(symbol_override=None):
         qty = await get_qty()
         oid = f"xrp_{int(time.time()*1000)}"
         entry = await get_price()
-        tp = round(entry * (1 + TP_PERCENT/100), 4)
-        sl = round(entry * (1 - SL_PERCENT/100), 4)
 
+        # --- Создаём MARKET ордер на LONG без TP/SL ---
         params = {
             "symbol": SYMBOL_BINANCE,
             "side": "BUY",
@@ -135,27 +124,12 @@ async def open_long(symbol_override=None):
         response = await binance_request("POST", "/fapi/v1/order", params)
         if not response.get("orderId"):
             raise Exception(f"Order failed: {response}")
-        position_active = True
 
-        # TP / SL
-        for price, tp_type in [(tp, "TAKE_PROFIT_MARKET"), (sl, "STOP_MARKET")]:
-            tp_params = {
-                "symbol": SYMBOL_BINANCE,
-                "side": "SELL",
-                "type": tp_type,
-                "quantity": str(qty),
-                "positionSide": "LONG",
-                "reduceOnly": "true",
-                "stopPrice": str(price),
-                "newClientOrderId": f"{tp_type.lower()}_{oid}"
-            }
-            await binance_request("POST", "/fapi/v1/order", tp_params)
+        position_active = True
 
         await tg_send(f"""
 <b>LONG OPENED</b>
 Entry: <code>{entry:.4f}</code>
-TP: <code>{tp:.4f}</code>
-SL: <code>{sl:.4f}</code>
 Qty: {qty}
         """.strip())
 
