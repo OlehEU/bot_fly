@@ -142,16 +142,21 @@ async def close_position(symbol_override=None):
     global position_active
     try:
         positions = await binance_request("GET", "/fapi/v2/positionRisk", {"symbol": SYMBOL_BINANCE})
-        amt = 0
+        amt = 0.0
         for p in positions if isinstance(positions, list) else []:
             if p.get("symbol") == SYMBOL_BINANCE and p.get("positionSide") == "LONG":
                 amt = float(p.get("positionAmt", 0))
                 break
+
         if abs(amt) < 0.0001:
             await tg_send(f"{SYMBOL_BINANCE} LONG already closed")
+            position_active = False
             return
 
-        qty_str = f"{abs(amt):.6f}".rstrip("0").rstrip(".")
+        qty_str = f"{abs(amt):.{QTY_PRECISION}f}".rstrip("0").rstrip(".")
+        if float(qty_str) < MARKET["limits"]["amount"]["min"]:
+            qty_str = str(MARKET["limits"]["amount"]["min"])
+
         params = {
             "symbol": SYMBOL_BINANCE,
             "side": "SELL",
@@ -160,11 +165,17 @@ async def close_position(symbol_override=None):
             "reduceOnly": "true",
             "positionSide": "LONG"
         }
-        await binance_request("POST", "/fapi/v1/order", params)
+
+        response = await binance_request("POST", "/fapi/v1/order", params)
+        if not response.get("orderId"):
+            raise Exception(f"Close order failed: {response}")
+
         await tg_send(f"<b>{SYMBOL_BINANCE} LONG CLOSED</b>")
         position_active = False
+
     except Exception:
         await tg_send(f"<b>CLOSE ERROR</b>\n<code>{traceback.format_exc()}</code>")
+        position_active = False
 
 # ================== LIFESPAN =================
 @asynccontextmanager
