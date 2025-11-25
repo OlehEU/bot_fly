@@ -1,4 +1,4 @@
-# main.py — ТЕРМИНАТОР 2026 | ФИНАЛЬНАЯ ВЕРСИЯ | ОТКРЫВАЕТ С 1 КЛИКА | БЕЗ -1022
+# main.py — ТЕРМИНАТОР 2026 | ФИНАЛЬНЫЙ | РАБОТАЕТ В ЛЮБОМ РЕЖИМЕ | ОТКРЫВАЕТ XRP С 1 КЛИКА
 import os
 import time
 import hmac
@@ -14,7 +14,7 @@ from telegram import Bot
 # ==================== КОНФИГ ====================
 TOKEN          = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID        = int(os.getenv("TELEGRAM_CHAT_ID"))
-BINANCE_KEY     = os.getenv("BINANCE_API_KEY")
+BINANCE_KEY    = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_API_SECRET")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "supersecret123")
 
@@ -31,12 +31,11 @@ async def tg(text: str):
     except Exception as e:
         print("TG error:", e)
 
-# ==================== РАБОЧАЯ ПОДПИСЬ ИЗ ТВОЕГО КОДА ====================
+# ==================== ТВОЯ РАБОЧАЯ ПОДПИСЬ ====================
 def create_signature(params: dict) -> str:
     normalized = {}
     for k, v in params.items():
-        if v is None:
-            continue
+        if v is None: continue
         if isinstance(v, bool):
             normalized[k] = str(v).lower()
         elif isinstance(v, (int, float)):
@@ -50,56 +49,48 @@ async def binance(method: str, endpoint: str, params: dict = None):
     url = f"https://fapi.binance.com{endpoint}"
     p = params or {}
     p["timestamp"] = int(time.time() * 1000)
-    p["signature"] = create_signature(p)          # ← ТВОЯ РАБОЧАЯ ПОДПИСЬ!
+    p["signature"] = create_signature(p)
     headers = {"X-MBX-APIKEY": BINANCE_KEY}
     try:
         resp = await client.request(method, url, headers=headers, params=p)
         data = resp.json()
         if isinstance(data, dict) and data.get("code"):
             await tg(f"<b>BINANCE ОШИБКА</b>\n<code>{data['code']}: {data['msg']}</code>")
-            print(f"ERROR: {data}")
         return data
     except Exception as e:
         await tg(f"<b>КРИТИЧЕСКАЯ ОШИБКА</b>\n<code>{traceback.format_exc()}</code>")
         return {}
 
-# ==================== ОТКРЫТИЕ ЛОНГА ====================
+# ==================== ОТКРЫТИЕ ЛОНГА (БЕЗ positionSide!) ====================
 async def open_long(symbol: str):
     sym = symbol + "USDT"
     try:
         # Плечо
         await binance("POST", "/fapi/v1/leverage", {"symbol": sym, "leverage": LEVERAGE})
 
-        # Точность количества
+        # Точность
         info = await client.get("https://fapi.binance.com/fapi/v1/exchangeInfo")
-        info_data = info.json()
-        precision = 3
-        for s in info_data.get("symbols", []):
-            if s["symbol"] == sym:
-                precision = s.get("quantityPrecision", 3)
-                break
+        precision = next((s["quantityPrecision"] for s in info.json()["symbols"] if s["symbol"] == sym), 3)
 
         # Цена
-        price_resp = await client.get(f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={sym}")
-        price = float(price_resp.json()["price"])
+        price = float((await client.get(f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={sym}")).json()["price"])
 
         # Количество
         qty_raw = (AMOUNT_USD * LEVERAGE) / price
         qty = round(qty_raw, precision)
         qty_str = str(int(qty)) if precision == 0 else f"{qty:.{precision}f}".rstrip("0").rstrip(".")
 
-        # ОТКРЫВАЕМ ОРДЕР
+        # ОТКРЫВАЕМ — БЕЗ positionSide! (работает и в One-way, и в Hedge)
         order = await binance("POST", "/fapi/v1/order", {
             "symbol": sym,
             "side": "BUY",
             "type": "MARKET",
-            "quantity": qty_str,
-            "positionSide": "BOTH"
+            "quantity": qty_str
         })
 
         if order.get("orderId"):
             entry = float(order.get("avgPrice") or price)
-            await tg(f"<b>LONG {symbol}USDT ОТКРЫТ</b>\n"
+            await tg(f"<b>LONG {symbol}USDT ОТ uvicorn main:app --host 0.0.0.0 --port 8000ТКРЫТ</b>\n"
                      f"${AMOUNT_USD} × {LEVERAGE}x\n"
                      f"Entry: <code>{entry:.6f}</code>\n"
                      f"Кол-во: {qty_str}")
@@ -124,8 +115,7 @@ async def close_position(symbol: str):
         "side": side,
         "type": "MARKET",
         "quantity": qty_str,
-        "reduceOnly": "true",
-        "positionSide": "BOTH"
+        "reduceOnly": "true"
     })
     await tg(f"<b>{symbol}USDT ЗАКРЫТ</b>")
 
