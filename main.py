@@ -140,6 +140,20 @@ async def webhook(request: Request):
 
     return {"status": "ok", "action": direction, "symbol": symbol}
 
+# ==================== УВЕДОМЛЕНИЕ ПРИ СТАРТЕ ====================
+import datetime
+
+@app.on_event("startup")
+async def on_startup():
+    await tg(
+        "<b>ТОРГОВЫЙ БОТ OZ 2026 ЗАПУЩЕН</b>\n\n"
+        f"Время старта: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n"
+        "• 10 USDT на сделку\n"
+        "• Binance Futures\n"
+        "• OZ SCANNER → ТЕРМИНАТОР → Автотрейд\n"
+        "Готов ловить сигналы 24/7"
+    )
+
 # ==================== ЗАПУСК ====================
 if __name__ == "__main__":
     import uvicorn
