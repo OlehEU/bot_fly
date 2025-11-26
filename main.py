@@ -1,4 +1,4 @@
-# main.py — TERMINATOR 2026 | HEDGE MODE | РАБОТАЕТ НА ЛЮБОЙ МОНЕТЕ | БЕЗ БАГОВ 2025
+# main.py — TERMINATOR 2026 | HEDGE MODE | ПРИНИМАЕТ СИГНАЛЫ ОТ OZ SCANNER | БЕЗ БАГОВ
 import os
 import time
 import hmac
@@ -17,29 +17,26 @@ BINANCE_KEY    = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_API_SECRET")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "supersecret123")
 
-FIXED_AMOUNT_USD = float(os.getenv("FIXED_AMOUNT_USD", "10"))
-LEVERAGE         = int(os.getenv("LEVERAGE", "10"))
+AMOUNT_USD = float(os.getenv("AMOUNT_USD", "10"))
+LEVERAGE   = int(os.getenv("LEVERAGE", "10"))
 
-# Теперь бот работает с ЛЮБОЙ монетой из сигнала (XRP, SOL, DOGE и т.д.)
 bot    = Bot(token=TOKEN)
-client = httpx.AsyncClient(timeout=20.0, limits=httpx.Limits(max_connections=100, max_keepalive_connections=20))
+client = httpx.AsyncClient(timeout=20.0)
 
-# Глобальный кэш символов (чтобы не запрашивать exchangeInfo каждый раз)
-SYMBOL_CACHE = {}
+# Кэш для precision и minQty (чтобы не дергать exchangeInfo каждый раз)
+SYMBOL_INFO = {}
 
-# ================= TELEGRAM =================
-async def tg(msg: str):
+async def tg(text: str):
     try:
-        await bot.send_message(CHAT_ID, msg, parse_mode="HTML", disable_web_page_preview=True)
+        await bot.send_message(CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         print("TG error:", e)
 
 # ================= BINANCE SIGNATURE =================
 def sign(params: dict) -> str:
-    query = "&".join(f"{k}={v}" for k, v in sorted((k, str(v)) for k, v in params.items() if v is not None))
+    query = "&".join([f"{k}={v}" for k, v in sorted((k, str(v)) for k, v in params.items() if v is not None)])
     return hmac.new(BINANCE_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-# ================= BINANCE REQUEST =================
 async def binance(method: str, path: str, params: dict = None):
     url = f"https://fapi.binance.com{path}"
     p = params or {}
@@ -56,21 +53,25 @@ async def binance(method: str, path: str, params: dict = None):
         await tg(f"<b>КРИТИЧКА</b>\n<code>{traceback.format_exc()}</code>")
         return {}
 
-# ================= PRECISION & LEVERAGE CACHE =================
+# ================= SYMBOL INFO (precision + minQty) =================
 async def get_symbol_info(symbol: str):
-    if symbol in SYMBOL_CACHE:
-        return SYMBOL_CACHE[symbol]
+    if symbol in SYMBOL_INFO:
+        return SYMBOL_INFO[symbol]
     
     info = await client.get("https://fapi.binance.com/fapi/v1/exchangeInfo")
     data = info.json()
     for s in data.get("symbols", []):
         if s["symbol"] == symbol:
             precision = s.get("quantityPrecision", 3)
-            min_qty = next((float(f["minQty"]) for f in s.get("filters", []) if f["filterType"] == "LOT_SIZE"), 0.0)
-            SYMBOL_CACHE[symbol] = {"precision": precision, "min_qty": min_qty}
-            # Устанавливаем плечо один раз при первом обращении
-            await binance("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEVERAGE})
-            return SYMBOL_CACHE[symbol]
+            min_qty = 0.0
+            for f in s.get("filters", []):
+                if f["filterType"] == "LOT_SIZE":
+                    min_qty = float(f.get("minQty", 0))
+                    break
+                SYMBOL_INFO[symbol] = {"precision": precision, "min_qty": min_qty}
+                # Устанавливаем плечо один раз
+                await binance("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEVERAGE})
+                return SYMBOL_INFO[symbol]
     raise Exception(f"Символ {symbol} не найден")
 
 # ================= PRICE & QTY =================
@@ -81,7 +82,7 @@ async def get_price(symbol: str) -> float:
 async def calc_qty(symbol: str) -> str:
     info = await get_symbol_info(symbol)
     price = await get_price(symbol)
-    raw_qty = (FIXED_AMOUNT_USD * LEVERAGE) / price
+    raw_qty = (AMOUNT_USD * LEVERAGE) / price
     qty = round(raw_qty, info["precision"])
     if qty < info["min_qty"]:
         qty = info["min_qty"]
@@ -101,13 +102,13 @@ async def open_long(symbol: str):
         if order.get("orderId"):
             price = await get_price(symbol)
             await tg(f"<b>LONG {symbol} ОТКРЫТ</b>\n"
-                     f"${FIXED_AMOUNT_USD} × {LEVERAGE}x\n"
+                     f"${AMOUNT_USD} × {LEVERAGE}x\n"
                      f"Entry: <code>{price:.6f}</code>\n"
                      f"Кол-во: {qty}")
         else:
             await tg(f"<b>ОШИБКА ОТКРЫТИЯ {symbol}</b>\n{order}")
     except Exception as e:
-        await tg(f"<b>КРИТИЧКА ОТКРЫТИЯ</b>\n<code>{traceback.format_exc()}</code>")
+        await tg(f"<b>КРИТИЧКА</b>\n<code>{traceback.format_exc()}</code>")
 
 # ================= CLOSE LONG =================
 async def close_long(symbol: str):
@@ -122,7 +123,11 @@ async def close_long(symbol: str):
             await tg(f"{symbol} LONG уже закрыт")
             return
         
-        qty = f"{abs(amt):.8f}".rstrip("0").rstrip(".")
+        info = await get_symbol_info(symbol)
+        qty = f"{abs(amt):.{info['precision']}f}".rstrip("0").rstrip(".")
+        if float(qty) < info["min_qty"]:
+            qty = str(info["min_qty"])
+        
         await binance("POST", "/fapi/v1/order", {
             "symbol": symbol,
             "side": "SELL",
@@ -140,11 +145,11 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def startup():
-    await tg("<b>TERMINATOR 2026 ONLINE</b>\nГотов к сигналам OZ SCANNER\nHedge Mode • 10$ • 10x")
+    await tg("<b>TERMINATOR 2026 ЗАПУЩЕН</b>\nHedge Mode • Принимает сигналы от OZ SCANNER\nГотов к бою!")
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    return "<h1 style='color:#0f0;background:#000;text-align:center;padding:100px;font-family:monospace'>TERMINATOR 2026<br>ONLINE · HEDGE MODE</h1>"
+    return "<h1 style='color:#0f0;background:#000;text-align:center;padding:100px;font-family:monospace'>TERMINATOR 2026<br>HEDGE MODE · ONLINE</h1>"
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -156,19 +161,20 @@ async def webhook(request: Request):
     except:
         raise HTTPException(400)
 
-    symbol = data.get("symbol", "").upper()
-    if symbol.endswith("USDT"):
-        symbol = symbol.replace("USDT", "") + "USDT"
-    else:
-        symbol += "USDT"
-    
+    raw_symbol = data.get("symbol", "").upper()
     action = data.get("direction", "").upper()
+
+    # Приводим символ к виду XRPUSDT
+    if raw_symbol.endswith("USDT"):
+        symbol = raw_symbol
+    else:
+        symbol = raw_symbol + "USDT"
 
     if action == "LONG":
         asyncio.create_task(open_long(symbol))
     elif action == "CLOSE":
         asyncio.create_task(close_long(symbol))
     else:
-        return {"error": "unknown direction"}
+        return {"error": "unknown action"}
 
     return {"status": "ok"}
