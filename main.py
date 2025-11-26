@@ -1,11 +1,10 @@
-# main.py — TERMINATOR 2026 | Исправленный вариант
+# main.py — TERMINATOR 2026 | Исправленный рабочий вариант
 import os
 import time
 import logging
 import asyncio
 import hmac
 import hashlib
-import urllib.parse
 import math
 from typing import Dict, Any, Optional
 import httpx
@@ -43,7 +42,6 @@ async def tg_send(text: str):
 
 # ====================== ПОДПИСЬ ======================
 def _create_signature(params: Dict[str, Any], secret: str) -> str:
-    # Все значения как строки, отсортировано по ключу
     query_string = '&'.join(f"{k}={str(params[k])}" for k in sorted(params.keys()))
     return hmac.new(secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
 
@@ -53,8 +51,7 @@ async def binance_request(method: str, endpoint: str, params: Optional[Dict[str,
     if signed:
         params["timestamp"] = int(time.time() * 1000)
         params["recvWindow"] = 5000
-        signature = _create_signature(params, BINANCE_API_SECRET)
-        params["signature"] = signature
+        params["signature"] = _create_signature(params, BINANCE_API_SECRET)
     headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
     try:
         if method.upper() == "GET":
@@ -68,7 +65,7 @@ async def binance_request(method: str, endpoint: str, params: Optional[Dict[str,
             err = e.response.json()
             await tg_send(f"<b>BINANCE ERROR</b>\n<code>{err.get('code', '')}: {err.get('msg', str(e))}</code>")
         except:
-            await tg_send(f"<b>BINANCE КРИТИЧКА</b>\n<code>{str(e)[:500]}</code>")
+            await tg_send(f"<b>BINANCE CRITICAL</b>\n<code>{str(e)[:500]}</code>")
         raise
 
 # ====================== КЭШ SYMBOL ======================
@@ -81,8 +78,7 @@ async def get_symbol_data(symbol: str):
     info = await binance_request("GET", "/fapi/v1/exchangeInfo", signed=False)
     for s in info.get("symbols", []):
         if s["symbol"] == symbol:
-            step_size = 0.0
-            min_qty = 0.0
+            step_size = min_qty = 0.0
             precision = s.get("quantityPrecision", 3)
             for f in s.get("filters", []):
                 if f["filterType"] == "LOT_SIZE":
