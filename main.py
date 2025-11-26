@@ -1,19 +1,20 @@
-# main.py — TERMINATOR 2026 | FULLY FIXED (signature, time sync, qty rounding)
+# main.py — TERMINATOR 2026 (обновлённый и исправленный)
 import os
 import time
 import logging
 import asyncio
+import traceback
 import hmac
 import hashlib
 import urllib.parse
-from typing import Dict, Any, Optional, List, Tuple
-from decimal import Decimal, ROUND_DOWN
+from typing import Dict, Any, Optional
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
-from telegram import Bot
 
-# ---------------- logging ----------------
+from telegram import Bot
+from telegram.request import AiohttpSession   # <<< ВАЖНОЕ ИСПРАВЛЕНИЕ
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("oz-bot")
 
@@ -32,341 +33,209 @@ WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET")
 FIXED_AMOUNT_USD = float(os.getenv("FIXED_AMOUNT_USD", "10"))
 LEVERAGE         = int(os.getenv("LEVERAGE", "10"))
 
-# retry / timings
-MAX_RETRIES = 3
-RETRY_BACKOFF = 0.5  # seconds
+# <<< Telegram теперь полностью асинхронный
+bot = Bot(token=TELEGRAM_TOKEN, request=AiohttpSession())
 
-bot = Bot(token=TELEGRAM_TOKEN)
-binance_client = httpx.AsyncClient(timeout=30.0)
+binance_client = httpx.AsyncClient(timeout=60.0)
 
 async def tg_send(text: str):
     try:
-        # bot.send_message may be coroutine depending on lib version; try await, fallback to sync
-        coro = bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
-        if asyncio.iscoroutine(coro):
-            await coro
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
     except Exception as e:
-        logger.exception("Telegram error: %s", e)
+        logger.error(f"Telegram error: {e}")
 
-# ====================== ВРЕМЯ СЕРВЕРА ======================
-BASE = "https://fapi.binance.com"
-SERVER_TIME_OFFSET_MS = 0  # server - local
+# ====================== BINANCE TIME OFFSET ======================
+BINANCE_TIME_OFFSET = 0
 
 async def sync_time():
-    """Sync local time with Binance server time (sets SERVER_TIME_OFFSET_MS)."""
-    global SERVER_TIME_OFFSET_MS
+    global BINANCE_TIME_OFFSET
     try:
-        r = await binance_client.get(f"{BASE}/fapi/v1/time", timeout=10.0)
-        r.raise_for_status()
-        server_time = int(r.json().get("serverTime", int(time.time() * 1000)))
-        local_time = int(time.time() * 1000)
-        SERVER_TIME_OFFSET_MS = server_time - local_time
-        logger.info("Time synced: offset_ms=%s", SERVER_TIME_OFFSET_MS)
-    except Exception as e:
-        logger.warning("Time sync failed: %s", e)
+        r = await binance_client.get("https://fapi.binance.com/fapi/v1/time")
+        server = r.json()["serverTime"]
+        local = int(time.time() * 1000)
+        BINANCE_TIME_OFFSET = server - local
+        logger.info(f"Time synced. Offset = {BINANCE_TIME_OFFSET}")
+    except:
+        pass
 
-def _now_ts() -> int:
-    return int(time.time() * 1000 + SERVER_TIME_OFFSET_MS)
+# ====================== ПОДПИСЬ ======================
+def _sign(params: Dict[str, Any], secret: str) -> str:
+    query = urllib.parse.urlencode(sorted(params.items()))
+    return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-# ====================== ПОДПИСЬ (order-preserving) ======================
-def _normalize_value(v: Any) -> str:
-    if isinstance(v, bool):
-        return str(v).lower()
-    if isinstance(v, (int, float, Decimal)):
-        return str(v)
-    if v is None:
-        return ""
-    return str(v)
-
-def _create_signature_from_ordered(pairs: List[Tuple[str, Any]], secret: str) -> str:
-    """
-    Create signature from ordered list of (k, v).
-    We preserve insertion order (no sorting).
-    """
-    normalized = []
-    for k, v in pairs:
-        if v is None:
-            continue
-        normalized.append((k, _normalize_value(v)))
-    qs = urllib.parse.urlencode(normalized)
-    sig = hmac.new(secret.encode("utf-8"), qs.encode("utf-8"), hashlib.sha256).hexdigest()
-    return sig
-
-# ====================== UNIVERSAL BINANCE REQUEST ======================
 async def binance_request(method: str, endpoint: str, params: Optional[Dict[str, Any]] = None, signed: bool = True) -> Dict[str, Any]:
-    """
-    method: "GET" or "POST"
-    endpoint: e.g. "/fapi/v1/order"
-    params: dict (insertion order preserved)
-    signed: add timestamp & signature
-    """
-    if signed and SERVER_TIME_OFFSET_MS == 0:
-        # try to sync at first signed call
-        await sync_time()
-
+    url = f"https://fapi.binance.com{endpoint}"
     params = params or {}
-    # preserve insertion order - convert to list of pairs
-    items: List[Tuple[str, Any]] = list(params.items())
 
     if signed:
-        # append timestamp at the end to keep deterministic ordering
-        items.append(("timestamp", _now_ts()))
-        # optional recvWindow - helps with small time drifts
-        items.append(("recvWindow", 5000))
+        params["timestamp"] = int(time.time() * 1000 + BINANCE_TIME_OFFSET)
 
-        signature = _create_signature_from_ordered(items, BINANCE_API_SECRET)
-        items.append(("signature", signature))
+        signature = _sign(params, BINANCE_API_SECRET)
+        params["signature"] = signature
 
     headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
-    # content-type for POST form
-    headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-    url = BASE + endpoint
-    last_exc = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            if method.upper() == "GET":
-                resp = await binance_client.get(url, params=items, headers=headers, timeout=30.0)
-            else:
-                # IMPORTANT: send in data (form-encoded) AND keep order by passing list of tuples
-                resp = await binance_client.post(url, data=items, headers=headers, timeout=30.0)
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.HTTPStatusError as e:
-            last_exc = e
-            status = e.response.status_code
-            try:
-                body = e.response.json()
-                code = body.get("code")
-                msg = body.get("msg")
-                await tg_send(f"<b>BINANCE ERROR</b>\n<code>{code}: {msg}</code>")
-            except Exception:
-                await tg_send(f"<b>BINANCE HTTP ERROR {status}</b>\n<code>{str(e)}</code>")
-            # retry on server errors / rate limits
-            if status in (429, 418) or 500 <= status < 600:
-                await asyncio.sleep(RETRY_BACKOFF * attempt)
-                continue
-            raise
-        except (httpx.RequestError, Exception) as e:
-            last_exc = e
-            logger.warning("Request failed attempt %s: %s", attempt, e)
-            await asyncio.sleep(RETRY_BACKOFF * attempt)
-            continue
-    raise last_exc if last_exc else Exception("Unknown error in binance_request")
-
-# ====================== EXCHANGE INFO CACHE & SYMBOL DATA ======================
-SYMBOL_CACHE: Dict[str, Dict[str, Any]] = {}
-EXCHANGE_INFO_TS = 0.0
-EXCHANGE_INFO_TTL = 60 * 30  # 30 minutes
-
-async def _refresh_exchange_info(force: bool = False):
-    global SYMBOL_CACHE, EXCHANGE_INFO_TS
-    now = time.time()
-    if SYMBOL_CACHE and not force and (now - EXCHANGE_INFO_TS) < EXCHANGE_INFO_TTL:
-        return
     try:
-        info = await binance_request("GET", "/fapi/v1/exchangeInfo", signed=False)
-        SYMBOL_CACHE = {}
-        for s in info.get("symbols", []):
-            sym = s["symbol"]
-            # defaults
-            min_qty = Decimal("0")
-            step_size = Decimal("1")
-            qty_prec = s.get("quantityPrecision", None)
-            tick_size = None
-            for f in s.get("filters", []):
-                if f.get("filterType") == "LOT_SIZE":
-                    step_size = Decimal(str(f.get("stepSize", "1")))
-                    min_qty = Decimal(str(f.get("minQty", "0")))
-                if f.get("filterType") == "PRICE_FILTER":
-                    tick_size = Decimal(str(f.get("tickSize", "0.00000001")))
-            SYMBOL_CACHE[sym] = {
-                "min_qty": min_qty,
-                "step_size": step_size,
-                "qty_precision": qty_prec,
-                "tick_size": tick_size,
-                "raw": s
-            }
-        EXCHANGE_INFO_TS = now
-        logger.info("Loaded exchangeInfo for %s symbols", len(SYMBOL_CACHE))
+        if method == "GET":
+            r = await binance_client.get(url, params=params, headers=headers)
+        else:
+            # <<< PARAMS ДОЛЖНЫ ИДТИ В ТЕЛЕ, А НЕ В QUERY !!!
+            r = await binance_client.post(url, data=params, headers=headers)
+
+        r.raise_for_status()
+        return r.json()
+
     except Exception as e:
-        logger.exception("Failed to refresh exchangeInfo: %s", e)
-
-async def get_symbol_data(symbol: str) -> Dict[str, Any]:
-    symbol = symbol.upper()
-    await _refresh_exchange_info()
-    if symbol in SYMBOL_CACHE:
-        # ensure leverage set once (best-effort)
         try:
-            await binance_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": str(LEVERAGE)}, signed=True)
-        except Exception:
-            pass
-        return SYMBOL_CACHE[symbol]
-    # force reload and try again
-    await _refresh_exchange_info(force=True)
-    if symbol in SYMBOL_CACHE:
-        return SYMBOL_CACHE[symbol]
-    raise Exception(f"Symbol not found in exchangeInfo: {symbol}")
+            err = e.response.json()
+            await tg_send(f"<b>BINANCE ERROR</b>\n<code>{err.get('code')} — {err.get('msg')}</code>")
+        except:
+            await tg_send(f"<b>BINANCE КРИТИЧКА</b>\n<code>{str(e)[:400]}</code>")
 
-# ====================== PRICE & QTY CALC ======================
+        raise
+
+# ====================== EXCHANGE INFO CACHE ======================
+SYMBOL_DATA = {}
+
+async def get_symbol_data(symbol: str):
+    if symbol in SYMBOL_DATA:
+        return SYMBOL_DATA[symbol]
+
+    ex = await binance_request("GET", "/fapi/v1/exchangeInfo", signed=False)
+    for s in ex["symbols"]:
+        if s["symbol"] == symbol:
+
+            precision = int(s["quantityPrecision"])
+            min_qty = 0.0
+            step = 0.0
+
+            for f in s["filters"]:
+                if f["filterType"] == "LOT_SIZE":
+                    min_qty = float(f["minQty"])
+                    step = float(f["stepSize"])
+
+            SYMBOL_DATA[symbol] = {
+                "precision": precision,
+                "min_qty": min_qty,
+                "step": step
+            }
+
+            # Установка плеча
+            try:
+                await binance_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEVERAGE})
+            except:
+                pass
+
+            return SYMBOL_DATA[symbol]
+
+    raise Exception(f"Symbol not found: {symbol}")
+
+# ====================== PRICE ======================
 async def get_price(symbol: str) -> float:
-    data = await binance_request("GET", "/fapi/v1/ticker/price", {"symbol": symbol}, signed=False)
-    return float(data["price"])
+    r = await binance_request("GET", "/fapi/v1/ticker/price", {"symbol": symbol}, signed=False)
+    return float(r["price"])
 
-def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
-    if step == 0:
-        return value
-    # floor to multiple of step
-    multiples = (value // step)
-    return (multiples * step).quantize(step, rounding=ROUND_DOWN)
+# ====================== QTY ======================
+def round_step(qty: float, step: float) -> float:
+    return ((qty // step) * step)
 
-async def calc_qty(symbol: str, fixed_amount_usd: Optional[float] = None, leverage: Optional[int] = None) -> str:
-    fa = FIXED_AMOUNT_USD if fixed_amount_usd is None else fixed_amount_usd
-    lv = LEVERAGE if leverage is None else leverage
+async def calc_qty(symbol: str) -> str:
+    d = await get_symbol_data(symbol)
+    price = await get_price(symbol)
 
-    sym = await get_symbol_data(symbol)
-    price = Decimal(str(await get_price(symbol)))
-    if price == 0:
-        raise Exception("Price is zero")
-    raw_usd = Decimal(str(fa)) * Decimal(str(lv))
-    raw_qty = raw_usd / price
+    raw = (FIXED_AMOUNT_USD * LEVERAGE) / price
+    qty = round_step(raw, d["step"])
 
-    step = sym.get("step_size", Decimal("1"))
-    min_qty = sym.get("min_qty", Decimal("0"))
+    if qty < d["min_qty"]:
+        qty = d["min_qty"]
 
-    qty_dec = _floor_to_step(raw_qty, step)
-    if qty_dec < min_qty:
-        qty_dec = min_qty
+    return f"{qty:.8f}".rstrip("0").rstrip(".")
 
-    qp = sym.get("qty_precision")
-    if qp is not None:
-        # format to qty_precision, strip trailing zeros
-        s = f"{qty_dec:.{qp}f}".rstrip("0").rstrip(".")
-        return s
-    else:
-        # fallback
-        return format(qty_dec.normalize(), "f")
-
-# ====================== OPEN / CLOSE LONG ======================
+# ====================== OPEN LONG ======================
 async def open_long(symbol: str):
     try:
-        symbol = symbol.upper()
-        if not symbol.endswith("USDT"):
-            symbol = symbol + "USDT"
-
         qty = await calc_qty(symbol)
-        oid = f"oz-{int(time.time()*1000)}"  # use dash to be safe
-        # small delay to get stable price
-        await asyncio.sleep(0.05)
+        oid = f"oz_{int(time.time()*1000)}"
         entry = await get_price(symbol)
 
         params = {
             "symbol": symbol,
             "side": "BUY",
             "type": "MARKET",
-            "quantity": qty,
-            "newClientOrderId": oid,
-            # keep positionSide if account uses HEDGE, otherwise Binance accepts but may ignore in OWM
             "positionSide": "LONG",
+            "newClientOrderId": oid,
+            "quantity": qty
         }
 
-        start = time.time()
-        resp = await binance_request("POST", "/fapi/v1/order", params=params, signed=True)
-        took = round(time.time() - start, 2)
-
-        if not resp.get("orderId"):
-            # sometimes Binance returns fills without orderId in weird scenarios
-            raise Exception(f"Invalid order response: {resp}")
+        t0 = time.time()
+        r = await binance_request("POST", "/fapi/v1/order", params)
+        dt = round(time.time() - t0, 2)
 
         await tg_send(
-            f"<b>LONG {symbol} ОТКРЫТ</b> за {took}s\n"
+            f"<b>LONG {symbol} ОТКРЫТ</b> за {dt}s\n"
             f"${FIXED_AMOUNT_USD} × {LEVERAGE}x\n"
-            f"Entry: <code>{entry:.8f}</code>\n"
-            f"Кол-во: {qty}\n"
-            f"OrderId: {resp.get('orderId')}"
+            f"Entry: <code>{entry}</code>\n"
+            f"Qty: {qty}"
         )
-        return resp
-    except Exception as e:
-        logger.exception("open_long failed: %s", e)
-        await tg_send(f"<b>ОШИБКА ОТКРЫТИЯ {symbol}</b>\n<code>{str(e)}</code>")
 
+    except Exception as e:
+        await tg_send(f"<b>ОШИБКА ОТКРЫТИЯ</b>\n<code>{str(e)}</code>")
+
+# ====================== CLOSE LONG ======================
 async def close_long(symbol: str):
     try:
-        symbol = symbol.upper()
-        if not symbol.endswith("USDT"):
-            symbol = symbol + "USDT"
-
-        pos = await binance_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol}, signed=True)
-        amt = Decimal("0")
+        pos = await binance_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+        amt = 0.0
         for p in pos:
-            if p.get("symbol") == symbol and p.get("positionSide") == "LONG":
-                amt = Decimal(str(p.get("positionAmt", "0")))
+            if p["symbol"] == symbol and p["positionSide"] == "LONG":
+                amt = float(p["positionAmt"])
                 break
 
-        if abs(float(amt)) < 1e-8:
-            await tg_send(f"{symbol} LONG уже закрыт")
-            return
+        if abs(amt) < 0.0001:
+            return await tg_send(f"{symbol} LONG уже закрыт")
 
-        sym = await get_symbol_data(symbol)
-        step = sym.get("step_size", Decimal("1"))
-        dqty = _floor_to_step(abs(amt), step)
-        qp = sym.get("qty_precision")
-        if qp is not None:
-            qty_str = f"{dqty:.{qp}f}".rstrip("0").rstrip(".")
-        else:
-            qty_str = format(dqty.normalize(), "f")
+        qty = f"{abs(amt):.8f}".rstrip("0").rstrip(".")
 
-        params = {
+        await binance_request("POST", "/fapi/v1/order", {
             "symbol": symbol,
             "side": "SELL",
             "type": "MARKET",
-            "quantity": qty_str,
-            "reduceOnly": "true",
             "positionSide": "LONG",
-        }
+            "reduceOnly": "true",
+            "quantity": qty
+        })
 
-        await binance_request("POST", "/fapi/v1/order", params=params, signed=True)
         await tg_send(f"<b>{symbol} LONG ЗАКРЫТ</b>")
-    except Exception as e:
-        logger.exception("close_long failed: %s", e)
-        await tg_send(f"<b>ОШИБКА ЗАКРЫТИЯ {symbol}</b>\n<code>{str(e)}</code>")
 
-# ====================== FASTAPI / WEBHOOK ======================
+    except Exception as e:
+        await tg_send(f"<b>ОШИБКА ЗАКРЫТИЯ</b>\n<code>{str(e)}</code>")
+
+# ====================== FASTAPI ======================
 app = FastAPI()
 
 @app.on_event("startup")
 async def startup():
-    # sync time and warm cache
-    try:
-        await sync_time()
-        await _refresh_exchange_info()
-    except Exception as e:
-        logger.warning("Startup sync failed: %s", e)
-    await tg_send("<b>TERMINATOR 2026 ЗАПУЩЕН</b>\nИсправлен модуль Binance (signature/time/qty)")
-
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    return "<h1 style='color:#0f0;background:#000;text-align:center;padding:100px;font-family:monospace'>TERMINATOR 2026<br>ТВОЙ РАБОЧИЙ КОД<br>ONLINE</h1>"
+    await sync_time()
+    await tg_send("TERMINATOR 2026 запущен.\nВремя синхронизировано.\nГотов к работе.")
 
 @app.post("/webhook")
 async def webhook(request: Request):
     if request.headers.get("Authorization") != f"Bearer {WEBHOOK_SECRET}":
         raise HTTPException(403)
-    try:
-        data = await request.json()
-    except Exception:
-        raise HTTPException(400)
 
+    data = await request.json()
     raw_symbol = data.get("symbol", "").upper()
-    action = data.get("direction", "").upper()  # LONG / CLOSE
-
+    action = data.get("direction", "").upper()
     symbol = raw_symbol if raw_symbol.endswith("USDT") else raw_symbol + "USDT"
 
     if action == "LONG":
         asyncio.create_task(open_long(symbol))
     elif action == "CLOSE":
         asyncio.create_task(close_long(symbol))
-    else:
-        logger.warning("Unknown action: %s", action)
 
     return {"status": "ok"}
