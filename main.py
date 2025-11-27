@@ -1,4 +1,4 @@
-# main.py — исправленная версия (async-ready, проверенная логика открытия ордера)
+# main.py — Binance Futures LONG only, Fly.io-ready, async, with TP/SL fixes
 import os
 import time
 import logging
@@ -14,7 +14,7 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("oz-bot")
 
-# ========= CONFIG =========
+# ===== CONFIG =====
 required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "BINANCE_API_KEY", "BINANCE_API_SECRET", "WEBHOOK_SECRET"]
 for var in required:
     if not os.getenv(var):
@@ -30,17 +30,18 @@ FIXED_AMOUNT_USD = float(os.getenv("FIXED_AMOUNT_USD", "10"))
 LEVERAGE         = int(os.getenv("LEVERAGE", "10"))
 TP_PERCENT       = float(os.getenv("TP_PERCENT", "0.5"))
 SL_PERCENT       = float(os.getenv("SL_PERCENT", "1.0"))
+RECV_WINDOW_MS   = int(os.getenv("RECV_WINDOW_MS", "5000"))
 
-# Global httpx client (инициализируется в startup)
+# Global httpx client (initialized on startup)
 client: Optional[httpx.AsyncClient] = None
 
-# Cache symbol info
+# Cache symbol info: { "BTCUSDT": {"precision": 3, "min_qty": 0.001} }
 SYMBOL_INFO: Dict[str, Dict[str, Any]] = {}
 
-app = FastAPI()
+app = FastAPI(title="oz-bot", version="1.0")
 
 
-# ====== Telegram sending via httpx (async, надежно) ======
+# ===== Telegram helper (async via httpx) =====
 async def tg_send(text: str):
     global client
     if client is None:
@@ -55,7 +56,6 @@ async def tg_send(text: str):
     }
     try:
         r = await client.post(url, json=payload, timeout=20.0)
-        # non-2xx -> log
         if r.status_code >= 400:
             logger.warning("Telegram send failed: %s %s", r.status_code, await r.text())
     except Exception as e:
@@ -68,12 +68,16 @@ def tg_send_bg(text: str):
         logger.exception("Failed create_task for tg_send: %s", e)
 
 
-# ====== Signature helper (Binance) ======
+# ===== Binance signature helper =====
 def _create_signature(params: Dict[str, Any], secret: str) -> str:
+    """
+    Create HMAC SHA256 signature from sorted urlencoded params.
+    """
     normalized = {}
     for k, v in params.items():
         if v is None:
             continue
+        # booleans must be "true"/"false"
         if isinstance(v, bool):
             normalized[k] = str(v).lower()
         else:
@@ -82,51 +86,54 @@ def _create_signature(params: Dict[str, Any], secret: str) -> str:
     return hmac.new(secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
 
 
-# ====== Binance request wrapper ======
+# ===== Binance request wrapper =====
 async def binance_request(method: str, endpoint: str, params: Optional[Dict[str, Any]] = None, signed: bool = True):
     global client
     if client is None:
         raise RuntimeError("HTTP client not initialized")
     url = f"https://fapi.binance.com{endpoint}"
     params = params.copy() if params else {}
+
     if signed:
+        # Ensure timestamp + recvWindow included BEFORE signature
         params["timestamp"] = int(time.time() * 1000)
-        # signature must be calculated from params without signature
-        signature = _create_signature(params, BINANCE_API_SECRET)
-        params["signature"] = signature
+        params["recvWindow"] = RECV_WINDOW_MS
+        params["signature"] = _create_signature(params, BINANCE_API_SECRET)
 
     headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
     try:
         if method.upper() == "GET":
             r = await client.get(url, params=params, headers=headers, timeout=30.0)
         else:
-            # Binance accepts POST with params in query string for signed requests
+            # POST with params in querystring works for Binance signed endpoints
             r = await client.post(url, params=params, headers=headers, timeout=30.0)
-        # raise for status to catch non-2xx
         r.raise_for_status()
         return r.json()
     except httpx.HTTPStatusError as e:
-        # Try read body safely
         body = None
         try:
             body = r.json()
         except Exception:
-            body = await r.text() if 'r' in locals() else str(e)
+            try:
+                body = await r.text()
+            except Exception:
+                body = str(e)
         tg_send_bg(f"<b>BINANCE ERROR</b>\n<code>{body}</code>")
+        logger.exception("Binance HTTPStatusError: %s", body)
         raise
     except Exception as e:
         tg_send_bg(f"<b>BINANCE EXCEPTION</b>\n<code>{str(e)[:500]}</code>")
+        logger.exception("Binance exception: %s", e)
         raise
 
 
-# ====== Symbol info loading ======
+# ===== Symbol info loading & leverage set =====
 async def load_symbol(symbol: str):
     if symbol in SYMBOL_INFO:
         return SYMBOL_INFO[symbol]
     info = await binance_request("GET", "/fapi/v1/exchangeInfo", signed=False)
     for s in info.get("symbols", []):
         if s.get("symbol") == symbol:
-            # quantityPrecision может быть строкой/числом
             prec = int(s.get("quantityPrecision", 8))
             min_qty = 0.0
             for f in s.get("filters", []):
@@ -134,20 +141,19 @@ async def load_symbol(symbol: str):
                     min_qty = float(f.get("minQty", 0.0))
                     break
             SYMBOL_INFO[symbol] = {"precision": prec, "min_qty": min_qty}
-            # Попробуем выставить плечо (fail-safe)
+            # attempt to set leverage (ignore failures)
             try:
                 await binance_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEVERAGE})
             except Exception:
-                logger.info("Не удалось изменить плечо (возможно нет прав или уже установлено)")
+                logger.info("Unable to set leverage for %s — maybe missing permissions or already set", symbol)
             return SYMBOL_INFO[symbol]
-    raise Exception(f"Символ не найден: {symbol}")
+    raise Exception(f"Symbol not found: {symbol}")
 
 
-# ====== Price and qty calculation ======
+# ===== Price & qty helpers =====
 async def get_price(symbol: str) -> float:
     data = await binance_request("GET", "/fapi/v1/ticker/price", {"symbol": symbol}, signed=False)
     return float(data["price"])
-
 
 async def calc_qty(symbol: str) -> str:
     info = await load_symbol(symbol)
@@ -160,19 +166,19 @@ async def calc_qty(symbol: str) -> str:
     return fmt.rstrip("0").rstrip(".") if "." in fmt else fmt
 
 
-# ====== Trading actions ======
+# ===== Trading actions: LONG only =====
 async def open_long(symbol: str):
     try:
         await load_symbol(symbol)
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.12)  # small safety delay
         qty = await calc_qty(symbol)
         entry = await get_price(symbol)
         oid = f"oz_{int(time.time() * 1000)}"
 
-        tp = round(entry * (1 + TP_PERCENT / 100), 6)
-        sl = round(entry * (1 - SL_PERCENT / 100), 6)
+        tp_price = round(entry * (1 + TP_PERCENT / 100), 6)
+        sl_price = round(entry * (1 - SL_PERCENT / 100), 6)
 
-        # Открываем LONG (MARKET BUY)
+        # MARKET BUY to open LONG
         order = await binance_request("POST", "/fapi/v1/order", {
             "symbol": symbol,
             "side": "BUY",
@@ -186,8 +192,8 @@ async def open_long(symbol: str):
             tg_send_bg(f"<b>ОШИБКА ОТКРЫТИЯ {symbol}</b>\n{order}")
             return {"ok": False, "detail": order}
 
-        # Попытка поставить TP и SL как reduceOnly ордера
-        for price, typ in [(tp, "TAKE_PROFIT_MARKET"), (sl, "STOP_MARKET")]:
+        # Place TP and SL as reduceOnly MARKET orders (if they fail, we log and continue)
+        for price, typ in [(tp_price, "TAKE_PROFIT_MARKET"), (sl_price, "STOP_MARKET")]:
             try:
                 params = {
                     "symbol": symbol,
@@ -197,24 +203,27 @@ async def open_long(symbol: str):
                     "stopPrice": str(price),
                     "reduceOnly": "true",
                     "positionSide": "LONG",
+                    "workingType": "CONTRACT_PRICE",   # use contract price
+                    "priceProtect": "true",           # protect parameter
                     "newClientOrderId": f"{typ[:2].lower()}_{oid}"
                 }
+                # signature + recvWindow handled in binance_request
                 await binance_request("POST", "/fapi/v1/order", params)
             except Exception as e:
-                logger.exception("Не удалось поставить %s для %s: %s", typ, symbol, e)
+                logger.exception("Failed to place %s for %s: %s", typ, symbol, e)
 
         text = (f"<b>LONG {symbol} ОТКРЫТ</b>\n"
                 f"${FIXED_AMOUNT_USD:.2f} × {LEVERAGE}x\n"
                 f"Entry: <code>{entry:.6f}</code>\n"
-                f"TP: <code>{tp:.6f}</code> (+{TP_PERCENT}%)\n"
-                f"SL: <code>{sl:.6f}</code> (-{SL_PERCENT}%)")
+                f"TP: <code>{tp_price:.6f}</code> (+{TP_PERCENT}%)\n"
+                f"SL: <code>{sl_price:.6f}</code> (-{SL_PERCENT}%)\n"
+                f"Qty: <code>{qty}</code>")
         tg_send_bg(text)
-        return {"ok": True, "entry": entry, "tp": tp, "sl": sl, "qty": qty}
+        return {"ok": True, "entry": entry, "tp": tp_price, "sl": sl_price, "qty": qty}
     except Exception as e:
         logger.exception("open_long exception: %s", e)
-        tg_send_bg(f"<b>ОШИБКА {symbol}</b>\n<code>{str(e)}</code>")
+        tg_send_bg(f"<b>ОШИБКА ОТКРЫТИЯ {symbol}</b>\n<code>{str(e)}</code>")
         return {"ok": False, "error": str(e)}
-
 
 async def close_long(symbol: str):
     try:
@@ -246,11 +255,11 @@ async def close_long(symbol: str):
         return {"ok": True}
     except Exception as e:
         logger.exception("close_long exception: %s", e)
-        tg_send_bg(f"<b>ОШИБКА ЗАКРЫТИЯ</b>\n<code>{str(e)}</code>")
+        tg_send_bg(f"<b>ОШИБКА ЗАКРЫТИЯ {symbol}</b>\n<code>{str(e)}</code>")
         return {"ok": False, "error": str(e)}
 
 
-# ====== Webhook verification ======
+# ===== Webhook verification =====
 def verify_webhook_signature(secret: str, body: bytes, signature_header: Optional[str]) -> bool:
     if not signature_header:
         return False
@@ -261,7 +270,7 @@ def verify_webhook_signature(secret: str, body: bytes, signature_header: Optiona
         return False
 
 
-# ====== API / Webhook ======
+# ===== API models & endpoints =====
 class WebhookModel(BaseModel):
     action: str
     symbol: str
@@ -272,12 +281,10 @@ async def startup():
     global client
     client = httpx.AsyncClient(timeout=60.0)
     logger.info("HTTP client initialized")
-    # уведомление о старте
     try:
         tg_send_bg("<b>BOT STARTED</b>")
     except Exception:
         pass
-
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -290,24 +297,27 @@ async def shutdown():
     except Exception:
         pass
 
+# Root for Fly health checks
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "oz-bot"}
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
-
 
 @app.post("/webhook")
 async def webhook(request: Request, background: BackgroundTasks):
     """
     JSON:
       { "action": "open_long" | "close_long", "symbol": "BTCUSDT", "secret": "optional" }
-    Also expects header X-SIGNATURE with HMAC-SHA256(body, WEBHOOK_SECRET) hex.
+    Header:
+      X-SIGNATURE: hex(HMAC_SHA256(body, WEBHOOK_SECRET))
     """
     body = await request.body()
     sig = request.headers.get("X-SIGNATURE") or request.headers.get("X-Signature")
-    # verify header signature first
     ok = verify_webhook_signature(WEBHOOK_SECRET, body, sig)
-    data = None
+
     try:
         data = await request.json()
     except Exception:
@@ -321,7 +331,6 @@ async def webhook(request: Request, background: BackgroundTasks):
     if not ok:
         raise HTTPException(status_code=403, detail="Invalid signature")
 
-    # validate payload
     try:
         payload = WebhookModel(**data)
     except Exception as e:
@@ -331,7 +340,6 @@ async def webhook(request: Request, background: BackgroundTasks):
     symbol = payload.symbol.upper()
 
     if action == "open_long":
-        # сделаем фоновую задачу и вернём ответ пользователю
         background.add_task(open_long, symbol)
         return {"ok": True, "action": "open_long", "symbol": symbol}
     elif action == "close_long":
@@ -341,13 +349,11 @@ async def webhook(request: Request, background: BackgroundTasks):
         raise HTTPException(status_code=400, detail="Unknown action")
 
 
-# ===== Optional manual endpoints for testing =====
+# Manual endpoints for quick testing
 @app.post("/open/{symbol}")
 async def open_manual(symbol: str):
-    res = await open_long(symbol.upper())
-    return res
+    return await open_long(symbol.upper())
 
 @app.post("/close/{symbol}")
 async def close_manual(symbol: str):
-    res = await close_long(symbol.upper())
-    return res
+    return await close_long(symbol.upper())
