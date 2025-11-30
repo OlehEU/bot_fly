@@ -45,7 +45,7 @@ async def tg(text: str):
 async def binance(method: str, path: str, params: Dict | None = None, signed: bool = True):
     """
     Универсальная функция для запросов к API Binance Futures. 
-    Использует ручное формирование URL для надежной подписи.
+    Использует ручное формирование URL для надежной подписи и форматирует булевы значения.
     """
     url = BASE + path
     p = params.copy() if params else {}
@@ -56,8 +56,16 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
         p["timestamp"] = int(time.time() * 1000)
         p["recvWindow"] = 60000
 
+        # --- Форматирование: Преобразование булевых значений в нижний регистр ---
+        def format_value(v):
+            if isinstance(v, bool):
+                # Принудительно используем lowercase 'true'/'false'
+                return str(v).lower()
+            return str(v)
+        # ----------------------------------------------------------------------------
+
         # 1. Сортируем параметры по ключу и собираем строку запроса вручную
-        query_parts = [f"{k}={v}" for k, v in sorted(p.items())]
+        query_parts = [f"{k}={format_value(v)}" for k, v in sorted(p.items())]
         query_string = "&".join(query_parts)
 
         # 2. Генерируем подпись на основе этой строки
@@ -66,13 +74,11 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
         # 3. Добавляем строку прямо в URL
         url = f"{url}?{query_string}&signature={signature}"
         
-        # Обнуляем final_params, так как все параметры уже в URL
         final_params = None
     
     headers = {"X-MBX-APIKEY": API_KEY}
     
     try:
-        # Используем final_params (который None для signed запросов)
         r = await client.request(method, url, params=final_params, headers=headers)
         
         if r.status_code != 200:
@@ -83,6 +89,25 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
     except Exception as e:
         await tg(f"<b>CRITICAL ERROR</b>\n{str(e)[:3800]}")
         return None
+
+# ================ LOAD POSITIONS ====================
+async def load_active_positions():
+    """Загружает открытые LONG позиции с Binance в active set при старте."""
+    global active
+    try:
+        # Используем v2, чтобы получить все данные
+        data = await binance("GET", "/fapi/v2/positionRisk", signed=True)
+        if data:
+            # positionAmt (количество) должно быть > 0
+            open_longs = {
+                p["symbol"] for p in data 
+                if float(p["positionAmt"]) > 0 and p["positionSide"] == "LONG"
+            }
+            active = open_longs
+            await tg(f"<b>Начальная загрузка позиций:</b>\nНайдено {len(active)} открытых LONG-позиций.")
+    except Exception as e:
+        await tg(f"<b>Ошибка при загрузке активных позиций:</b> {e}")
+
 
 # ================ QTY ROUND =======================
 def fix_qty(symbol: str, qty: float) -> str:
@@ -96,8 +121,9 @@ def fix_qty(symbol: str, qty: float) -> str:
 async def open_long(sym: str):
     symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
 
+    # ПРОВЕРКА НА АКТИВНОСТЬ: проверяет set, который заполняется при старте
     if symbol in active:
-        await tg(f"<b>{symbol}</b> — уже открыта")
+        await tg(f"<b>{symbol}</b> — уже открыта (пропуск сигнала)")
         return
 
     # 1. Cross Margin. Игнорируем ошибку, если она не критична (уже установлен CROSS).
@@ -134,10 +160,10 @@ async def close(sym: str):
     symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
     
     if symbol not in active:
-        await tg(f"<b>{symbol}</b> — уже закрыта (не в active)")
+        await tg(f"<b>{symbol}</b> — не найдена в active set")
         return
 
-    # 1. Проверка текущей позиции
+    # 1. Проверка текущей позиции на бирже
     pos_data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     if not pos_data:
         return
@@ -146,8 +172,9 @@ async def close(sym: str):
     qty_str = next((p["positionAmt"] for p in pos_data if p["positionSide"] == "LONG" and float(p["positionAmt"]) > 0), None)
     
     if not qty_str or float(qty_str) <= 0:
+        # Позиция уже закрыта или не найдена
         active.discard(symbol)
-        await tg(f"<b>{symbol}</b> — позиция закрыта на бирже")
+        await tg(f"<b>{symbol}</b> — позиция уже закрыта на бирже")
         return
 
     # 2. Закрытие LONG позиции (Market)
@@ -157,8 +184,7 @@ async def close(sym: str):
         "positionSide": "LONG",
         "type": "MARKET",
         "quantity": qty_str,
-        # ИСПРАВЛЕНИЕ: Передаем Python Boolean True. Это устраняет ошибку -1106.
-        "reduceOnly": True  
+        "reduceOnly": True # Теперь гарантированно преобразуется в 'true' в нижнем регистре
     })
     
     if close_order and close_order.get("orderId"):
@@ -170,6 +196,9 @@ async def close(sym: str):
 # ================= FASTAPI =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # ! ЗДЕСЬ ПРОИСХОДИТ ПРОВЕРКА ПРИ СТАРТЕ !
+    await load_active_positions()
+    
     await tg("<b>OZ BOT 2025 — ONLINE</b>\nCross Mode | Hedge Mode FIXED\nОшибки Binance → полные")
     yield
     await client.aclose()
