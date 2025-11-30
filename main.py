@@ -48,13 +48,12 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
 
     if signed:
         p["timestamp"] = int(time.time() * 1000)
-        p["recvWindow"] = 5000  # 5 секунд для синхронизации времени
+        p["recvWindow"] = 5000  # миллисекунды
         p["signature"] = make_signature(p)
 
     headers = {"X-MBX-APIKEY": API_KEY}
 
     try:
-        # POST идет с params, не json
         r = await client.request(method, url, params=p, headers=headers)
         if r.status_code != 200:
             full_error = r.text
