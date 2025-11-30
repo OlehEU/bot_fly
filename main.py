@@ -39,7 +39,7 @@ async def tg(text: str):
 # ================= SIGNATURE =====================
 def make_signature(params: Dict) -> str:
     # Binance требует raw параметры, без URL-encode
-    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    query = "&".join(f"{k}={str(v)}" for k, v in sorted(params.items()))
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
 # ================= BINANCE API ====================
@@ -56,12 +56,20 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
     try:
         r = await client.request(method, url, params=p, headers=headers)
         if r.status_code != 200:
-            msg = r.json().get("msg", r.text)
-            await tg(f"<b>BINANCE ERROR {r.status_code} {path}</b>\n<code>{msg}</code>")
+            # Полный текст ошибки для Telegram
+            try:
+                full_error = r.text
+            except:
+                full_error = "Unknown error"
+
+            if len(full_error) > 3800:
+                full_error = full_error[:3800] + "...(cut)"
+
+            await tg(f"<b>BINANCE ERROR {r.status_code} {path}</b>\n<code>{full_error}</code>")
             return None
         return r.json()
     except Exception as e:
-        await tg(f"<b>CRITICAL</b>\n{str(e)[:300]}")
+        await tg(f"<b>CRITICAL</b>\n{str(e)[:3800]}")
         return None
 
 # ================ QTY ROUND =======================
@@ -150,7 +158,7 @@ async def close(sym: str):
 # ================= FASTAPI =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await tg("<b>OZ BOT 2025 — ONLINE</b>\nCross Mode | Hedge Mode FIXED")
+    await tg("<b>OZ BOT 2025 — ONLINE</b>\nCross Mode | Hedge Mode FIXED\nОшибки Binance → полные")
     yield
     await client.aclose()
 
