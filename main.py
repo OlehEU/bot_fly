@@ -14,11 +14,9 @@ from contextlib import asynccontextmanager
 required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "BINANCE_API_KEY", "BINANCE_API_SECRET", "WEBHOOK_SECRET"]
 for v in required:
     if not os.getenv(v):
-        # Используем ValueError для более чистого лога
         raise ValueError(f"Нет переменной окружения: {v}")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-# Преобразование в int сразу
 try:
     CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
 except (ValueError, TypeError):
@@ -27,14 +25,12 @@ except (ValueError, TypeError):
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-# AMOUNT теперь 30 по умолчанию
 AMOUNT = float(os.getenv("FIXED_AMOUNT_USD", "30"))
 LEV = int(os.getenv("LEVERAGE", "10"))
 
 bot = Bot(token=TELEGRAM_TOKEN)
 client = httpx.AsyncClient(timeout=20)
 BASE = "https://fapi.binance.com"
-# Сет для отслеживания активных позиций (в памяти)
 active = set()
 
 # ================= TELEGRAM =====================
@@ -43,14 +39,13 @@ async def tg(text: str):
     try:
         await bot.send_message(CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
     except Exception:
-        # Просто игнорируем ошибки отправки, чтобы не останавливать торговлю
         pass
 
 # ================= BINANCE API ====================
 async def binance(method: str, path: str, params: Dict | None = None, signed: bool = True):
     """
-    Универсальная функция для запросов к API Binance Futures.
-    Исправлена логика подписи для избежания ошибки -1022.
+    Универсальная функция для запросов к API Binance Futures. 
+    Использует ручное формирование URL для надежной подписи.
     """
     url = BASE + path
     p = params.copy() if params else {}
@@ -58,7 +53,6 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
     final_params = p
     
     if signed:
-        # Добавляем стандартные параметры для подписанных запросов
         p["timestamp"] = int(time.time() * 1000)
         p["recvWindow"] = 60000
 
@@ -69,11 +63,8 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
         # 2. Генерируем подпись на основе этой строки
         signature = hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
 
-        # 3. Формируем финальную строку запроса с подписью
-        full_query = f"{query_string}&signature={signature}"
-
-        # 4. Добавляем строку прямо в URL
-        url = f"{url}?{full_query}"
+        # 3. Добавляем строку прямо в URL
+        url = f"{url}?{query_string}&signature={signature}"
         
         # Обнуляем final_params, так как все параметры уже в URL
         final_params = None
@@ -86,7 +77,6 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
         
         if r.status_code != 200:
             err = r.text if len(r.text) < 3800 else r.text[:3800] + "..."
-            # Улучшенный лог с указанием URL
             await tg(f"<b>BINANCE ERROR {r.status_code}</b>\nURL: <code>{url}</code>\nPath: {path}\n<code>{err}</code>")
             return None
         return r.json()
@@ -99,9 +89,7 @@ def fix_qty(symbol: str, qty: float) -> str:
     """Округляет количество в зависимости от символа."""
     high_prec = ["DOGEUSDT","SHIBUSDT","PEPEUSDT","1000PEPEUSDT","BONKUSDT","FLOKIUSDT","1000SATSUSDT"]
     if symbol in high_prec:
-        # Для монет с очень низкой ценой (шаг 1 или больше)
         return str(int(qty))
-    # Для большинства других монет (3 знака после запятой)
     return f"{qty:.3f}".rstrip("0").rstrip(".")
 
 # ================ OPEN LONG =======================
@@ -121,13 +109,12 @@ async def open_long(sym: str):
     # 3. Price + Qty
     price_data = await binance("GET", "/fapi/v1/ticker/price", {"symbol": symbol}, signed=False)
     if not price_data or 'price' not in price_data:
-        # Если не получили цену, это критическая ошибка, выходим.
         return
         
     price = float(price_data["price"])
     qty = fix_qty(symbol, AMOUNT * LEV / price)
 
-    # 4. Open LONG
+    # 4. Open LONG (Market)
     order = await binance("POST", "/fapi/v1/order", {
         "symbol": symbol,
         "side": "BUY",
@@ -147,6 +134,7 @@ async def close(sym: str):
     symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
     
     if symbol not in active:
+        await tg(f"<b>{symbol}</b> — уже закрыта (не в active)")
         return
 
     # 1. Проверка текущей позиции
@@ -155,36 +143,35 @@ async def close(sym: str):
         return
     
     # Ищем LONG позицию с количеством > 0
-    qty = next((p["positionAmt"] for p in pos_data if p["positionSide"] == "LONG" and float(p["positionAmt"]) > 0), None)
+    qty_str = next((p["positionAmt"] for p in pos_data if p["positionSide"] == "LONG" and float(p["positionAmt"]) > 0), None)
     
-    if not qty:
-        # Позиция уже закрыта или не найдена
+    if not qty_str or float(qty_str) <= 0:
         active.discard(symbol)
+        await tg(f"<b>{symbol}</b> — позиция закрыта на бирже")
         return
 
-    # 2. Закрытие LONG позиции
+    # 2. Закрытие LONG позиции (Market)
     close_order = await binance("POST", "/fapi/v1/order", {
         "symbol": symbol,
         "side": "SELL",
         "positionSide": "LONG",
         "type": "MARKET",
-        "quantity": qty,
-        "reduceOnly": "true" 
+        "quantity": qty_str,
+        # ИСПРАВЛЕНИЕ: Передаем Python Boolean True. Это устраняет ошибку -1106.
+        "reduceOnly": True  
     })
     
     if close_order and close_order.get("orderId"):
         active.discard(symbol)
-        await tg(f"<b>CLOSE {symbol}</b>\n{qty} шт")
+        await tg(f"<b>CLOSE {symbol} УСПЕШНО</b>\n{qty_str} шт")
     else:
-        await tg(f"<b>Ошибка закрытия {symbol}</b>")
+        await tg(f"<b>CRITICAL ERROR: Не удалось закрыть {symbol}</b>")
 
 # ================= FASTAPI =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Запуск бота и отправка приветствия
     await tg("<b>OZ BOT 2025 — ONLINE</b>\nCross Mode | Hedge Mode FIXED\nОшибки Binance → полные")
     yield
-    # Очистка ресурсов при выключении
     await client.aclose()
 
 app = FastAPI(lifespan=lifespan)
@@ -195,7 +182,6 @@ async def root():
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    # Проверка секрета вебхука для безопасности
     if request.headers.get("X-Webhook-Secret") != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
     
@@ -210,7 +196,6 @@ async def webhook(request: Request):
     if not symbol or not signal:
         raise HTTPException(status_code=400, detail="Missing symbol or signal in payload")
 
-    # Запускаем задачи асинхронно, чтобы не блокировать вебхук
     if signal == "LONG":
         asyncio.create_task(open_long(symbol))
     elif signal == "CLOSE":
