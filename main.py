@@ -18,8 +18,7 @@ LEVERAGE         = int(os.getenv("LEVERAGE", "10"))
 bot = Bot(token=TELEGRAM_TOKEN)
 client = httpx.AsyncClient(timeout=20.0)
 BASE = "https://fapi.binance.com"
-
-active = {}  # symbol -> quantity
+active = {}
 
 def sign(params: dict) -> str:
     query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
@@ -39,8 +38,7 @@ async def api(method: str, path: str, params: dict = None, signed: bool = True):
 async def tg(text: str):
     try:
         await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML")
-    except:
-        pass
+    except: pass
 
 async def get_price(symbol: str) -> float:
     data = await api("GET", "/fapi/v1/ticker/price", {"symbol": symbol}, signed=False)
@@ -51,31 +49,29 @@ async def open_long(symbol: str):
     if symbol in active:
         return
 
+    # Плечо 10x (у тебя Hedge mode — пройдёт)
     try:
         await api("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEVERAGE})
     except: pass
 
     price = await get_price(symbol)
-    
     raw_qty = (FIXED_USDT * LEVERAGE) / price
-    
-    # Особая точность для мем-коинов
-    if symbol in ["DOGEUSDT", "SHIBUSDT", "BONKUSDT", "PEPEUSDT", "1000PEPEUSDT", "FLOKIUSDT"]:
-        qty = int(raw_qty)  # только целое
-    else:
-        qty = round(raw_qty, 3)  # для нормальных монет
 
-    if qty < 1: qty = 1  # минимум 1 монета
+    # Правильная точность для разных монет + quantity как СТРОКА!
+    if symbol in ["DOGEUSDT", "SHIBUSDT", "BONKUSDT", "PEPEUSDT", "1000PEPEUSDT", "FLOKIUSDT"]:
+        qty = str(int(raw_qty))                    # целое число → строка
+    else:
+        qty = str(round(raw_qty, 3))               # 3 знака → строка
 
     await api("POST", "/fapi/v1/order", {
         "symbol": symbol,
         "side": "BUY",
         "type": "MARKET",
-        "quantity": qty
+        "quantity": qty                            # ← ВОТ ГДЕ БЫЛА ОШИБКА! Теперь строка
     })
 
     active[symbol] = qty
-    await tg(f"OPEN LONG ×{LEVERAGE}\n{symbol.replace('USDT','/USDT')}\n${FIXED_USDT} → {int(qty)} монет @{price:.6f}")
+    await tg(f"<b>OPEN LONG ×{LEVERAGE}</b>\n<code>{symbol.replace('USDT','/USDT')}</code>\n${FIXED_USDT} → {qty} монет @{price:.6f}")
 
 # ====================== CLOSE ======================
 async def close_position(symbol: str):
@@ -89,14 +85,14 @@ async def close_position(symbol: str):
         "quantity": qty,
         "reduceOnly": "true"
     })
-    await tg(f"CLOSE {symbol.replace('USDT','/USDT')}\nПозиция закрыта по рынку")
+    await tg(f"<b>CLOSE {symbol.replace('USDT','/USDT')}</b>\nПозиция закрыта по рынку")
 
-# ====================== FASTAPI ======================
+# ====================== API ======================
 app = FastAPI()
 
 @app.get("/")
 async def root():
-    return {"status": "OZ BOT ЖИВ", "positions": len(active)}
+    return {"status": "OZ BOT ЖИВ", "positions": list(active.keys())}
 
 @app.post("/webhook")
 async def webhook(request: Request):
