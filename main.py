@@ -80,7 +80,15 @@ async def get_atr(symbol: str) -> float:
 async def open_long(symbol: str, entry_price: float, reason: str):
     if symbol in active_positions:
         return
-    await api("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEVERAGE})
+
+    # ←←← ЭТО ВСЁ, ЧТО НУЖНО ПРИ ВКЛЮЧЁННОМ HEDGE MODE
+    try:
+        await api("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEVERAGE})
+    except Exception as e:
+        await tg_send(f"⚠️ Не смог установить плечо {LEVERAGE}x для {symbol}\nОшибка: {str(e)[:100]}")
+        return  # если не получилось — просто не открываем позицию (безопасно)
+
+    atr = await get_atr(symbol)
     qty = round((FIXED_AMOUNT_USDT * LEVERAGE) / entry_price, 6)
     qty = max(qty, 0.001)
 
@@ -88,7 +96,6 @@ async def open_long(symbol: str, entry_price: float, reason: str):
         "symbol": symbol, "side": "BUY", "type": "MARKET", "quantity": str(qty)
     })
 
-    atr = await get_atr(symbol)
     tp_price = round(entry_price + TP_MULTIPLIER * atr, 6)
 
     await api("POST", "/fapi/v1/order", {
@@ -97,18 +104,14 @@ async def open_long(symbol: str, entry_price: float, reason: str):
     })
 
     active_positions[symbol] = {
-        "entry": entry_price,
-        "qty": qty,
-        "atr": atr,
+        "entry": entry_price, "qty": qty, "atr": atr,
         "last_trailing_stop": entry_price - 3 * atr,
-        "trailing_active": False,
-        "open_time": time.time(),
-        "reason": reason
+        "trailing_active": False, "open_time": time.time(), "reason": reason
     }
 
-    await tg_send(f"<b>LONG OPENED + ATR TRAILING</b>\n"
+    await tg_send(f"<b>LONG ОТКРЫТ ×{LEVERAGE}</b>\n"
                   f"<code>{symbol.replace('USDT','/USDT')}</code> | {entry_price:.6f}\n"
-                  f"ATR: {atr:.6f} | TP: +{TP_MULTIPLIER}×ATR | Trail: {TRAIL_MULTIPLIER}×ATR\n"
+                  f"ATR: {atr:.6f} | TP +{TP_MULTIPLIER}×ATR | Trail {TRAIL_MULTIPLIER}×ATR\n"
                   f"{reason}")
 
 async def close_position(symbol: str, reason: str):
