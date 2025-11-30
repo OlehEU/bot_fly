@@ -28,17 +28,6 @@ bot = Bot(token=TELEGRAM_TOKEN)
 client = httpx.AsyncClient(timeout=20)
 BASE = "https://fapi.binance.com"
 active = set()
-TIME_OFFSET = 0
-
-# Синхронизация времени с Binance
-async def sync_time():
-    global TIME_OFFSET
-    try:
-        r = await client.get(f"{BASE}/fapi/v1/time")
-        server_time = r.json()["serverTime"]
-        TIME_OFFSET = server_time - int(time.time() * 1000)
-    except:
-        pass
 
 # ================= TELEGRAM =====================
 async def tg(text: str):
@@ -49,7 +38,6 @@ async def tg(text: str):
 
 # ================= SIGNATURE =====================
 def make_signature(params: Dict) -> str:
-    # Исключаем уже имеющуюся подпись (на всякий случай)
     clean = {k: v for k, v in params.items() if k != "signature"}
     query = "&".join(f"{k}={v}" for k, v in sorted(clean.items()))
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
@@ -60,23 +48,23 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
     p = params.copy() if params else {}
 
     if signed:
-        p["timestamp"] = int(time.time() * 1000) + TIME_OFFSET
+        p["timestamp"] = int(time.time() * 1000)
         p["recvWindow"] = 60000
-        # КРИТИЧЕСКИ ВАЖНАЯ ПРАВКА: подпись считается ДО добавления самой подписи!
-        p["signature"] = make_signature(p)
+        
+        # КЛЮЧЕВАЯ ПРАВКА — подпись считается ДО добавления самой подписи!
+        signature = make_signature(p)   # ← вот здесь всё правильно
+        p["signature"] = signature      # ← а только потом добавляем
 
     headers = {"X-MBX-APIKEY": API_KEY}
     try:
         r = await client.request(method, url, params=p, headers=headers)
         if r.status_code != 200:
-            err = r.text
-            if len(err) > 3800:
-                err = err[:3800] + "..."
+            err = r.text if len(r.text) < 3800 else r.text[:3800] + "..."
             await tg(f"<b>BINANCE ERROR {r.status_code} {path}</b>\n<code>{err}</code>")
             return None
         return r.json()
     except Exception as e:
-        await tg(f"<b>CRITICAL</b>\n{str(e)[:3800]}")
+        await tg(f"<b>CRITICAL ERROR</b>\n{str(e)[:3800]}")
         return None
 
 # ================ QTY ROUND =======================
@@ -88,28 +76,28 @@ def fix_qty(symbol: str, qty: float) -> str:
 
 # ================ OPEN LONG =======================
 async def open_long(sym: str):
-    symbol = sym.upper().replace("/", "").replace("USDT","") + "USDT"
+    symbol = sym.upper().replace("/", "") + "USDT" if not sym.upper().endswith("USDT") else sym.upper()
+
     if symbol in active:
-        await tg(f"<b>{symbol}</b> — уже открыт")
+        await tg(f"<b>{symbol}</b> — уже открыта")
         return
 
-    # Cross Margin
-    resp = await binance("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": "CROSS"})
-    if not resp:
+    # 1. Cross Margin
+    if not await binance("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": "CROSS"}):
         await tg(f"<b>Не удалось установить CROSS для {symbol}</b>")
         return
 
-    # Leverage
+    # 2. Leverage
     await binance("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEV})
 
-    # Price
-    data = await binance("GET", "/fapi/v1/ticker/price", {"symbol": symbol}, signed=False)
-    if not data:
+    # 3. Price + Qty
+    price_data = await binance("GET", "/fapi/v1/ticker/price", {"symbol": symbol}, signed=False)
+    if not price_data:
         return
-    price = float(data["price"])
+    price = float(price_data["price"])
     qty = fix_qty(symbol, AMOUNT * LEV / price)
 
-    # Market LONG (Hedge mode)
+    # 4. Open LONG
     order = await binance("POST", "/fapi/v1/order", {
         "symbol": symbol,
         "side": "BUY",
@@ -120,24 +108,21 @@ async def open_long(sym: str):
 
     if order and order.get("orderId"):
         active.add(symbol)
-        await tg(f"<b>LONG ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty} шт ≈ ${AMOUNT} @ {price:.8f}")
+        await tg(f"<b>LONG ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty} шт ≈ ${AMOUNT}\n@ {price:.8f}")
     else:
         await tg(f"<b>Ошибка открытия {symbol}</b>")
 
 # ================= CLOSE ==========================
 async def close(sym: str):
-    symbol = sym.upper().replace("/", "").replace("USDT","") + "USDT"
+    symbol = sym.upper().replace("/", "") + "USDT" if not sym.upper().endswith("USDT") else sym.upper()
     if symbol not in active:
         return
 
     pos = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     if not pos:
         return
-    qty = None
-    for p in pos:
-        if p["positionSide"] == "LONG" and float(p["positionAmt"]) > 0:
-            qty = p["positionAmt"]
-            break
+
+    qty = next((p["positionAmt"] for p in pos if p["positionSide"] == "LONG" and float(p["positionAmt"]) > 0), None)
     if not qty:
         active.discard(symbol)
         return
@@ -151,12 +136,11 @@ async def close(sym: str):
         "reduceOnly": "true"
     })
     active.discard(symbol)
-    await tg(f"<b>CLOSE {symbol}</b>\n{qty} шт по рынку")
+    await tg(f"<b>CLOSE {symbol}</b>\n{qty} шт")
 
 # ================= FASTAPI =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await sync_time()
     await tg("<b>OZ BOT 2025 — ONLINE</b>\nCross Mode | Hedge Mode FIXED\nОшибки Binance → полные")
     yield
     await client.aclose()
@@ -171,6 +155,7 @@ async def root():
 async def webhook(request: Request):
     if request.headers.get("X-Webhook-Secret") != WEBHOOK_SECRET:
         raise HTTPException(403)
+    
     data = await request.json()
     symbol = data.get("symbol", "").upper()
     signal = data.get("signal", "").upper()
