@@ -19,17 +19,30 @@ bot = Bot(token=TELEGRAM_TOKEN)
 client = httpx.AsyncClient(timeout=20.0)
 BASE = "https://fapi.binance.com"
 active = {}
+exchange_info = None  # кэшируем один раз
 
-def sign(params: dict) -> str:
-    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-    return hmac.new(BINANCE_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+async def get_exchange_info():
+    global exchange_info
+    if exchange_info is None:
+        exchange_info = await client.get(f"{BASE}/fapi/v1/exchangeInfo")
+        exchange_info = exchange_info.json()
+    return exchange_info
+
+def get_quantity_precision(symbol: str, qty: float) -> str:
+    info = next((s for s in exchange_info["symbols"] if s["symbol"] == symbol), None)
+    if not info:
+        return f"{qty:.3f}"
+    precision = next(f for f in info["filters"] if f["filterType"] == "LOT_SIZE")["stepSize"]
+    precision = len(precision.rstrip('0').split('.')[-1]) if '.' in precision else 0
+    return f"{qty:.{precision}f}".rstrip('0').rstrip('.') if '.' in f"{qty:.{precision}f}" else f"{int(qty)}"
 
 async def api(method: str, path: str, params: dict = None, signed: bool = True):
     url = BASE + path
     p = params or {}
     if signed:
         p["timestamp"] = int(time.time() * 1000)
-        p["signature"] = sign(p)
+        query = "&".join(f"{k}={v}" for k, v in sorted(p.items()))
+        p["signature"] = hmac.new(BINANCE_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
     headers = {"X-MBX-APIKEY": BINANCE_KEY}
     r = await client.request(method, url, params=p, headers=headers)
     r.raise_for_status()
@@ -47,31 +60,28 @@ async def get_price(symbol: str) -> float:
 # ====================== LONG ======================
 async def open_long(symbol: str):
     if symbol in active:
+        await tg(f"Уже есть LONG по {symbol.replace('USDT','/USDT')}")
         return
 
-    # Плечо 10x (у тебя Hedge mode — пройдёт)
+    await get_exchange_info()  # один раз загрузим
+
     try:
         await api("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEVERAGE})
     except: pass
 
     price = await get_price(symbol)
     raw_qty = (FIXED_USDT * LEVERAGE) / price
-
-    # Правильная точность для разных монет + quantity как СТРОКА!
-    if symbol in ["DOGEUSDT", "SHIBUSDT", "BONKUSDT", "PEPEUSDT", "1000PEPEUSDT", "FLOKIUSDT"]:
-        qty = str(int(raw_qty))                    # целое число → строка
-    else:
-        qty = str(round(raw_qty, 3))               # 3 знака → строка
+    qty_str = get_quantity_precision(symbol, raw_qty)
 
     await api("POST", "/fapi/v1/order", {
         "symbol": symbol,
         "side": "BUY",
         "type": "MARKET",
-        "quantity": qty                            # ← ВОТ ГДЕ БЫЛА ОШИБКА! Теперь строка
+        "quantity": qty_str
     })
 
-    active[symbol] = qty
-    await tg(f"<b>OPEN LONG ×{LEVERAGE}</b>\n<code>{symbol.replace('USDT','/USDT')}</code>\n${FIXED_USDT} → {qty} монет @{price:.6f}")
+    active[symbol] = qty_str
+    await tg(f"<b>LONG ОТКРЫТ ×{LEVERAGE}</b>\n<code>{symbol.replace('USDT','/USDT')}</code>\n${FIXED_USDT} → {qty_str} монет\nЦена: {price:.6f}")
 
 # ====================== CLOSE ======================
 async def close_position(symbol: str):
@@ -85,24 +95,24 @@ async def close_position(symbol: str):
         "quantity": qty,
         "reduceOnly": "true"
     })
-    await tg(f"<b>CLOSE {symbol.replace('USDT','/USDT')}</b>\nПозиция закрыта по рынку")
+    await tg(f"<b>CLOSE {symbol.replace('USDT','/USDT')}</b>\nЗакрыто по рынку")
 
 # ====================== API ======================
 app = FastAPI()
 
 @app.get("/")
 async def root():
-    return {"status": "OZ BOT ЖИВ", "positions": list(active.keys())}
+    return {"status": "OZ BOT 100% РАБОТАЕТ", "positions": list(active.keys())}
 
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
         data = await request.json()
     except:
-        raise HTTPException(400, "Bad JSON")
+        raise HTTPException(400)
 
     if data.get("secret") != WEBHOOK_SECRET:
-        raise HTTPException(403, "Wrong secret")
+        raise HTTPException(403)
 
     sym = data.get("symbol", "").replace("/", "").upper()
     if not sym.endswith("USDT"):
