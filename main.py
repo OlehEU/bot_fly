@@ -1,6 +1,7 @@
 import os
 import time
-import asyncio
+import hashlib
+import hmac
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from telegram import Bot
@@ -11,19 +12,18 @@ TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
 BINANCE_KEY      = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET   = os.getenv("BINANCE_API_SECRET")
 WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET", "supersecret123")
-
-FIXED_USDT = float(os.getenv("FIXED_AMOUNT_USDT", "30"))
-LEVERAGE   = int(os.getenv("LEVERAGE", "10"))  # у тебя 10x
+FIXED_USDT       = float(os.getenv("FIXED_AMOUNT_USDT", "30"))
+LEVERAGE         = int(os.getenv("LEVERAGE", "10"))
 
 bot = Bot(token=TELEGRAM_TOKEN)
 client = httpx.AsyncClient(timeout=20.0)
 BASE = "https://fapi.binance.com"
 
-active = {}  # символ → кол-во в позиции
+active = {}  # symbol -> quantity
 
 def sign(params: dict) -> str:
     query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-    return httpx._utils.timed_hmac_digest(BINANCE_SECRET.encode(), query.encode(), "sha256").hex()
+    return hmac.new(BINANCE_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
 async def api(method: str, path: str, params: dict = None, signed: bool = True):
     url = BASE + path
@@ -38,26 +38,27 @@ async def api(method: str, path: str, params: dict = None, signed: bool = True):
 
 async def tg(text: str):
     try:
-        await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
-    except: pass
+        await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML")
+    except:
+        pass
 
 async def get_price(symbol: str) -> float:
     data = await api("GET", "/fapi/v1/ticker/price", {"symbol": symbol}, signed=False)
     return float(data["price"])
 
-# ====================== ОТКРЫТЬ LONG ======================
+# ====================== LONG ======================
 async def open_long(symbol: str):
     if symbol in active:
         return
 
-    # Плечо 10x (у тебя Hedge mode включён — должно пройти)
+    # Плечо 10x
     try:
         await api("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEVERAGE})
-    except: pass
+    except:
+        pass  # если не получилось — всё равно откроем на дефолтном
 
     price = await get_price(symbol)
     qty = round((FIXED_USDT * LEVERAGE) / price, 6)
-    qty = max(qty, 0.001)
 
     await api("POST", "/fapi/v1/order", {
         "symbol": symbol,
@@ -67,13 +68,12 @@ async def open_long(symbol: str):
     })
 
     active[symbol] = qty
-    await tg(f"<b>OPEN LONG ×{LEVERAGE}</b>\n<code>{symbol.replace('USDT','/USDT')}</code>\nРазмер: ${FIXED_USDT} → {qty} монет")
+    await tg(f"OPEN LONG ×{LEVERAGE}\n{symbol.replace('USDT','/USDT')}\n${FIXED_USDT} → {qty} монет @ {price}")
 
-# ====================== ЗАКРЫТЬ ======================
+# ====================== CLOSE ======================
 async def close_position(symbol: str):
     if symbol not in active:
         return
-
     qty = active.pop(symbol)
     await api("POST", "/fapi/v1/order", {
         "symbol": symbol,
@@ -82,7 +82,7 @@ async def close_position(symbol: str):
         "quantity": qty,
         "reduceOnly": "true"
     })
-    await tg(f"<b>CLOSE {symbol.replace('USDT','/USDT')}</b>\nПозиция закрыта по рынку")
+    await tg(f"CLOSE {symbol.replace('USDT','/USDT')}\nПозиция закрыта по рынку")
 
 # ====================== FASTAPI ======================
 app = FastAPI()
@@ -96,20 +96,20 @@ async def webhook(request: Request):
     try:
         data = await request.json()
     except:
-        raise HTTPException(400)
+        raise HTTPException(400, "Bad JSON")
 
     if data.get("secret") != WEBHOOK_SECRET:
-        raise HTTPException(403)
+        raise HTTPException(403, "Wrong secret")
 
     sym = data.get("symbol", "").replace("/", "").upper()
     if not sym.endswith("USDT"):
         sym += "USDT"
 
-    sig = data.get("signal", "").upper()
+    signal = data.get("signal", "").upper()
 
-    if sig == "LONG":
+    if signal == "LONG":
         await open_long(sym)
-    elif sig == "CLOSE":
+    elif signal == "CLOSE":
         await close_position(sym)
 
-    return {"ok": True}
+    return {"status": "ok"}
