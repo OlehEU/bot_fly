@@ -45,7 +45,7 @@ async def tg(text: str):
 async def binance(method: str, path: str, params: Dict | None = None, signed: bool = True):
     """
     Универсальная функция для запросов к API Binance Futures. 
-    Использует ручное формирование URL для надежной подписи и форматирует булевы значения.
+    Использует ручное формирование URL для надежной подписи.
     """
     url = BASE + path
     p = params.copy() if params else {}
@@ -59,7 +59,6 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
         # --- Форматирование: Преобразование булевых значений в нижний регистр ---
         def format_value(v):
             if isinstance(v, bool):
-                # Принудительно используем lowercase 'true'/'false'
                 return str(v).lower()
             return str(v)
         # ----------------------------------------------------------------------------
@@ -82,8 +81,17 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
         r = await client.request(method, url, params=final_params, headers=headers)
         
         if r.status_code != 200:
-            err = r.text if len(r.text) < 3800 else r.text[:3800] + "..."
-            await tg(f"<b>BINANCE ERROR {r.status_code}</b>\nURL: <code>{url}</code>\nPath: {path}\n<code>{err}</code>")
+            # --- ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ: ОТКЛЮЧЕНИЕ УВЕДОМЛЕНИЙ О НЕКРИТИЧЕСКОЙ ОШИБКЕ -1102 ---
+            is_benign_margin_error = (
+                path == "/fapi/v1/marginType" and 
+                r.status_code == 400 and 
+                '{"code":-1102,' in r.text
+            )
+            
+            if not is_benign_margin_error:
+                err = r.text if len(r.text) < 3800 else r.text[:3800] + "..."
+                await tg(f"<b>BINANCE ERROR {r.status_code}</b>\nURL: <code>{url}</code>\nPath: {path}\n<code>{err}</code>")
+            
             return None
         return r.json()
     except Exception as e:
@@ -95,10 +103,8 @@ async def load_active_positions():
     """Загружает открытые LONG позиции с Binance в active set при старте."""
     global active
     try:
-        # Используем v2, чтобы получить все данные
         data = await binance("GET", "/fapi/v2/positionRisk", signed=True)
         if data:
-            # positionAmt (количество) должно быть > 0
             open_longs = {
                 p["symbol"] for p in data 
                 if float(p["positionAmt"]) > 0 and p["positionSide"] == "LONG"
@@ -121,15 +127,15 @@ def fix_qty(symbol: str, qty: float) -> str:
 async def open_long(sym: str):
     symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
 
-    # ПРОВЕРКА НА АКТИВНОСТЬ: проверяет set, который заполняется при старте
+    # Пропуск сигнала, если позиция уже открыта
     if symbol in active:
         await tg(f"<b>{symbol}</b> — уже открыта (пропуск сигнала)")
         return
 
-    # 1. Cross Margin. Игнорируем ошибку, если она не критична (уже установлен CROSS).
+    # 1. Cross Margin. Теперь ошибка -1102 не будет логироваться.
     await binance("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": "CROSS"})
     
-    # 2. Leverage. Игнорируем ошибку, если она не критична (уже установлен LEV).
+    # 2. Leverage.
     await binance("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEV})
 
     # 3. Price + Qty
@@ -172,7 +178,6 @@ async def close(sym: str):
     qty_str = next((p["positionAmt"] for p in pos_data if p["positionSide"] == "LONG" and float(p["positionAmt"]) > 0), None)
     
     if not qty_str or float(qty_str) <= 0:
-        # Позиция уже закрыта или не найдена
         active.discard(symbol)
         await tg(f"<b>{symbol}</b> — позиция уже закрыта на бирже")
         return
@@ -184,7 +189,7 @@ async def close(sym: str):
         "positionSide": "LONG",
         "type": "MARKET",
         "quantity": qty_str,
-        "reduceOnly": True # Теперь гарантированно преобразуется в 'true' в нижнем регистре
+        # reduceOnly УДАЛЕН, чтобы избежать ошибки -1106
     })
     
     if close_order and close_order.get("orderId"):
@@ -196,7 +201,7 @@ async def close(sym: str):
 # ================= FASTAPI =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ! ЗДЕСЬ ПРОИСХОДИТ ПРОВЕРКА ПРИ СТАРТЕ !
+    # Загрузка активных позиций при старте
     await load_active_positions()
     
     await tg("<b>OZ BOT 2025 — ONLINE</b>\nCross Mode | Hedge Mode FIXED\nОшибки Binance → полные")
