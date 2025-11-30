@@ -1,4 +1,4 @@
-# main.py — OZ TRADING BOT 2026 + ATR TRAILING — РАБОТАЕТ НА FLY.IO
+# main.py — OZ ATR TRADING BOT 2026 — FINAL FIX FOR FLY.IO
 import os
 import time
 import asyncio
@@ -15,17 +15,17 @@ from contextlib import asynccontextmanager
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("oz-atr-bot")
 
-# ====================== КОНФИГ ======================
+# ====================== CONFIG ======================
 required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "BINANCE_API_KEY", "BINANCE_API_SECRET"]
 for var in required:
     if not os.getenv(var):
-        raise EnvironmentError(f"Отсутствует переменная: {var}")
+        raise EnvironmentError(f"Missing env: {var}")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
-WEBHOOK_SECRET = "supersecret123"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "supersecret123")
 
 FIXED_AMOUNT_USDT = float(os.getenv("FIXED_AMOUNT_USDT", "30"))
 LEVERAGE = int(os.getenv("LEVERAGE", "25"))
@@ -37,7 +37,6 @@ AUTO_CLOSE_MINUTES = int(os.getenv("AUTO_CLOSE_MINUTES", "120"))
 bot = Bot(token=TELEGRAM_TOKEN)
 client = httpx.AsyncClient(timeout=30.0)
 BASE_URL = "https://fapi.binance.com"
-
 active_positions: Dict[str, dict] = {}
 
 # ====================== BINANCE API ======================
@@ -68,14 +67,16 @@ async def get_atr(symbol: str) -> float:
         klines = await api("GET", "/fapi/v1/klines", {"symbol": symbol, "interval": "5m", "limit": 15}, signed=False)
         tr_list = []
         for i in range(1, len(klines)):
-            h, l, c_prev = float(klines[i][2]), float(klines[i][3]), float(klines[i-1][4])
+            h = float(klines[i][2])
+            l = float(klines[i][3])
+            c_prev = float(klines[i-1][4])
             tr = max(h - l, abs(h - c_prev), abs(l - c_prev))
             tr_list.append(tr)
-        return sum(tr_list[-14:]) / 14
+        return sum(tr_list[-14:]) / 14 if tr_list else 0.001
     except:
         return 0.001
 
-# ====================== ПОЗИЦИИ ======================
+# ====================== POSITIONS ======================
 async def open_long(symbol: str, entry_price: float, reason: str):
     if symbol in active_positions:
         return
@@ -83,7 +84,9 @@ async def open_long(symbol: str, entry_price: float, reason: str):
     qty = round((FIXED_AMOUNT_USDT * LEVERAGE) / entry_price, 6)
     qty = max(qty, 0.001)
 
-    await api("POST", "/fapi/v1/order", {"symbol": symbol, "side": "BUY", "type": "MARKET", "quantity": str(qty)})
+    await api("POST", "/fapi/v1/order", {
+        "symbol": symbol, "side": "BUY", "type": "MARKET", "quantity": str(qty)
+    })
 
     atr = await get_atr(symbol)
     tp_price = round(entry_price + TP_MULTIPLIER * atr, 6)
@@ -94,20 +97,24 @@ async def open_long(symbol: str, entry_price: float, reason: str):
     })
 
     active_positions[symbol] = {
-        "entry": entry_price, "qty": qty, "atr": atr,
+        "entry": entry_price,
+        "qty": qty,
+        "atr": atr,
         "last_trailing_stop": entry_price - 3 * atr,
-        "trailing_active": False, "open_time": time.time(), "reason": reason
+        "trailing_active": False,
+        "open_time": time.time(),
+        "reason": reason
     }
 
-    await tg_send(f"<b>LONG ОТКРЫТ + ATR</b>\n"
+    await tg_send(f"<b>LONG OPENED + ATR TRAILING</b>\n"
                   f"<code>{symbol.replace('USDT','/USDT')}</code> | {entry_price:.6f}\n"
-                  f"ATR: {atr:.6f} | TP: +{TP_MULTIPLIER}×ATR | Трейлинг: {TRAIL_MULTIPLIER}×ATR\n"
+                  f"ATR: {atr:.6f} | TP: +{TP_MULTIPLIER}×ATR | Trail: {TRAIL_MULTIPLIER}×ATR\n"
                   f"{reason}")
 
 async def close_position(symbol: str, reason: str):
     try:
-        pos = await api("GET", "/fapi/v2/positionRisk")
-        for p in pos:
+        data = await api("GET", "/fapi/v2/positionRisk")
+        for p in data:
             if p["symbol"] == symbol and float(p["positionAmt"]) != 0:
                 qty = abs(float(p["positionAmt"]))
                 await api("POST", "/fapi/v1/order", {
@@ -115,17 +122,19 @@ async def close_position(symbol: str, reason: str):
                     "quantity": f"{qty:.8f}", "reduceOnly": "true"
                 })
                 pnl = float(p.get("unRealizedProfit", 0))
-                await tg_send(f"<b>ЗАКРЫТО</b>\n{symbol.replace('USDT','/USDT')} | {reason}\nPnL: <code>{pnl:+.4f}$</code>")
+                await tg_send(f"<b>POSITION CLOSED</b>\n{symbol.replace('USDT','/USDT')} | {reason}\nPnL: <code>{pnl:+.4f}$</code>")
                 active_positions.pop(symbol, None)
+                return
     except: pass
 
-# ====================== ТРЕЙЛИНГ ======================
+# ====================== ATR TRAILING LOOP ======================
 async def atr_trailing_loop():
     while True:
         await asyncio.sleep(9)
         for symbol, data in list(active_positions.items()):
             try:
-                price_data = await api("GET", "/f"/fapi/v1/ticker/price", {"symbol": symbol}, signed=False)
+                # ИСПРАВЛЕНО! Было "/f"/fapi — теперь нормальная строка
+                price_data = await api("GET", "/fapi/v1/ticker/price", {"symbol": symbol}, signed=False)
                 price = float(price_data["price"])
                 atr = await get_atr(symbol)
                 data["atr"] = atr
@@ -134,7 +143,7 @@ async def atr_trailing_loop():
 
                 if not data["trailing_active"] and profit_atr >= ACTIVATION_ATR:
                     data["trailing_active"] = True
-                    await tg_send(f"ATR ТРЕЙЛИНГ ВКЛЮЧЁН\n{symbol.replace('USDT','/USDT')} (+{profit_atr:.2f}×ATR)")
+                    await tg_send(f"ATR TRAILING ACTIVATED\n{symbol.replace('USDT','/USDT')} (+{profit_atr:.2f}×ATR)")
 
                 if data["trailing_active"]:
                     new_stop = price - TRAIL_MULTIPLIER * atr
@@ -142,27 +151,29 @@ async def atr_trailing_loop():
                         await api("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
                         await api("POST", "/fapi/v1/order", {
                             "symbol": symbol, "side": "SELL", "type": "STOP_MARKET",
-                            "quantity": str(data["qty"]), "stopPrice": f"{new_stop:.6f}",
+                            "quantity": str(data["qty"]),
+                            "stopPrice": f"{new_stop:.6f}",
                             "reduceOnly": "true"
                         })
                         data["last_trailing_stop"] = new_stop
 
                 if time.time() - data["open_time"] > AUTO_CLOSE_MINUTES * 60:
-                    await close_position(symbol, "Автозакрытие")
-            except Exception as e:
-                logger.error(f"Trailing error: {e}")
+                    await close_position(symbol, "Auto-close by time")
 
-# ====================== ТГ ======================
+            except Exception as e:
+                logger.error(f"Trailing error {symbol}: {e}")
+
+# ====================== TG ======================
 async def tg_send(text: str):
     try:
         await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
-        logger.error(f"TG error: {e}")
+        logger.error(f"TG send error: {e}")
 
 # ====================== FASTAPI ======================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await tg_send("OZ ATR BOT 2026 — ЗАПУЩЕН НА FLY.IO!\nATR-трейлинг активирован")
+    await tg_send("OZ ATR BOT 2026 — SUCCESSFULLY STARTED ON FLY.IO!\nDynamic ATR trailing activated")
     asyncio.create_task(atr_trailing_loop())
     yield
     await client.aclose()
@@ -171,7 +182,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return HTMLResponse(f"<h1 style='color:lime'>OZ ATR BOT 2026 — ЖИВ</h1><p>Позиций: {len(active_positions)}</p>")
+    return HTMLResponse(f"<h1 style='color:#0f0'>OZ ATR BOT 2026 — ALIVE</h1><p>Positions: {len(active_positions)}</p>")
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -181,12 +192,12 @@ async def webhook(request: Request):
         raise HTTPException(400, "Bad JSON")
 
     if data.get("secret") != WEBHOOK_SECRET:
-        raise HTTPException(403, "Forbidden")
+        raise HTTPException(403, "Wrong secret")
 
-    symbol = data.get("symbol", "").replace("/", "")
+    symbol = data.get("symbol", "").replace("/", "").upper() + "USDT"
     signal = data.get("signal", "").upper()
     price = float(data.get("price", 0))
-    reason = data.get("reason", "Сканер")
+    reason = data.get("reason", "Scanner signal")
     tf = data.get("timeframe", "")
 
     if signal == "LONG":
