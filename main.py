@@ -18,7 +18,7 @@ LEVERAGE         = int(os.getenv("LEVERAGE", "10"))
 bot = Bot(token=TELEGRAM_TOKEN)
 client = httpx.AsyncClient(timeout=20.0)
 BASE = "https://fapi.binance.com"
-active = set()  # просто множество символов
+active = set()
 
 def sign(params: dict) -> str:
     query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
@@ -34,14 +34,15 @@ async def api(method: str, path: str, params: dict = None, signed: bool = True):
     r = await client.request(method, url, params=p, headers=headers)
     if r.status_code >= 400:
         err = r.json()
-        await tg(f"<b>Binance error</b>\n<code>{err.get('msg','Unknown error')}</code>")
+        await tg(f"<b>BINANCE ОШИБКА</b>\n<code>{err.get('msg', r.text)}</code>")
         return None
     return r.json()
 
 async def tg(text: str):
     try:
         await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML")
-    except: pass
+    except:
+        pass
 
 async def get_price(symbol: str) -> float:
     data = await api("GET", "/fapi/v1/ticker/price", {"symbol": symbol}, signed=False)
@@ -56,22 +57,21 @@ async def open_long(symbol: str):
     if price == 0:
         return
 
-    # 1. Принудительно ставим Cross margin + нужное плечо
+    # Принудительно Cross + плечо
     await api("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": "CROSS"})
     await api("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEVERAGE})
 
     raw_qty = (FIXED_USDT * LEVERAGE) / price
 
-    # 2. Правильная точность количества
-    if symbol in ["DOGEUSDT","SHIBUSDT","PEPEUSDT","1000PEPEUSDT","BONKUSDT","FLOKIUSDT","XRPUSDT","ADAUSDT"]:
-        qty = str(int(raw_qty))                     # целые монеты
+    # Точная обрезка количества
+    if symbol in ["DOGEUSDT","SHIBUSDT","PEPEUSDT","1000PEPEUSDT","BONKUSDT","FLOKIUSDT","XRPUSDT","ADAUSDT","SOLUSDT","1000SATSUSDT"]:
+        qty = str(int(raw_qty))
     else:
-        qty = f"{raw_qty:.3f}".rstrip("0").rstrip(".")  # обычные
+        qty = f"{raw_qty:.3f}".rstrip("0").rstrip(".")
 
     if float(qty) < 0.001:
         qty = "0.001"
 
-    # 3. Открываем
     result = await api("POST", "/fapi/v1/order", {
         "symbol": symbol,
         "side": "BUY",
@@ -81,12 +81,13 @@ async def open_long(symbol: str):
 
     if result:
         active.add(symbol)
-        await tg(f"<b>LONG ОТКРЫТ ×{LEVERAGE} (Cross)</b>\n<code>{symbol.replace('USDT','/USDT')}</code>\n{qty} монет\n≈ {price:.6f}")
+        await tg(f"<b>LONG ОТКРЫТ ×{LEVERAGE} (Cross)</b>\n<code>{symbol.replace('USDT','/USDT')}</code>\n{qty} монет @{price:.6f}")
 
 async def close_position(symbol: str):
     if symbol not in active:
         return
-    # Находим количество из открытых позиций (на случай если упало)
+
+    # Берём актуальное количество из позиции
     pos = await api("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     qty = None
     if pos:
@@ -94,6 +95,7 @@ async def close_position(symbol: str):
             if p["symbol"] == symbol and float(p["positionAmt"]) > 0:
                 qty = p["positionAmt"]
                 break
+
     if not qty:
         active.discard(symbol)
         return
@@ -101,10 +103,11 @@ async def close_position(symbol: str):
     await api("POST", "/fapi/v1/order", {
         "symbol": symbol,
         "side": "SELL",
-        "type": "type": "MARKET",
+        "type": "MARKET",
         "quantity": qty,
         "reduceOnly": "true"
     })
+
     active.discard(symbol)
     await tg(f"<b>CLOSE</b> {symbol.replace('USDT','/USDT')}")
 
@@ -113,7 +116,7 @@ app = FastAPI()
 
 @app.get("/")
 async def root():
-    return {"status": "БОТ ЖИВ И В CROSS", "active": list(active)}
+    return {"status": "РАБОТАЕТ В CROSS", "active": list(active)}
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -133,7 +136,7 @@ async def webhook(request: Request):
 
     if signal == "LONG":
         await open_long(sym)
-    elif signal == "CLOSE" or signal == "CLOSE_ALL":
+    elif signal in ["CLOSE", "CLOSE_ALL"]:
         await close_position(sym)
 
     return {"ok": True}
