@@ -1,359 +1,221 @@
-# main.py — Binance Futures LONG only, Fly.io-ready, async, with TP/SL fixes
+# main.py — OZ TRADING BOT 2026 + ATR TRAILING (абсолютный топ)
 import os
 import time
 import logging
-import asyncio
 import hmac
 import hashlib
-import urllib.parse
-from typing import Dict, Any, Optional
+from typing import Dict, Optional
 import httpx
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
-from pydantic import BaseModel
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse
+from telegram import Bot
+from contextlib import asynccontextmanager
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("oz-bot")
+logger = logging.getLogger("oz-atr-bot")
 
-# ===== CONFIG =====
-required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "BINANCE_API_KEY", "BINANCE_API_SECRET", "WEBHOOK_SECRET"]
+# ====================== КОНФИГ ======================
+required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "BINANCE_API_KEY", "BINANCE_API_SECRET"]
 for var in required:
     if not os.getenv(var):
-        raise EnvironmentError(f"Нет переменной: {var}")
+        raise EnvironmentError(f"Отсутствует переменная: {var}")
 
-TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID   = int(os.getenv("TELEGRAM_CHAT_ID"))
-BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
-WEBHOOK_SECRET     = os.getenv("WEBHOOK_SECRET")
+WEBHOOK_SECRET = "supersecret123"
 
-FIXED_AMOUNT_USD = float(os.getenv("FIXED_AMOUNT_USD", "10"))
-LEVERAGE         = int(os.getenv("LEVERAGE", "10"))
-TP_PERCENT       = float(os.getenv("TP_PERCENT", "0.5"))
-SL_PERCENT       = float(os.getenv("SL_PERCENT", "1.0"))
-RECV_WINDOW_MS   = int(os.getenv("RECV_WINDOW_MS", "5000"))
+# === НАСТРОЙКИ ===
+FIXED_AMOUNT_USDT = float(os.getenv("FIXED_AMOUNT_USDT", "30"))
+LEVERAGE = int(os.getenv("LEVERAGE", "25"))
+TP_MULTIPLIER = float(os.getenv("TP_MULTIPLIER", "3.0"))        # TP = entry + 3.0 × ATR
+ACTIVATION_ATR = float(os.getenv("ACTIVATION_ATR", "1.2"))      # Включаем трейлинг при +1.2× ATR
+TRAIL_MULTIPLIER = float(os.getenv("TRAIL_MULTIPLIER", "1.8"))  # Стоп = current_price - 1.8× ATR
+AUTO_CLOSE_MINUTES = int(os.getenv("AUTO_CLOSE_MINUTES", "120"))
 
-# Global httpx client (initialized on startup)
-client: Optional[httpx.AsyncClient] = None
+bot = Bot(token=TELEGRAM_TOKEN)
+client = httpx.AsyncClient(timeout=30.0)
+BASE_URL = "https://fapi.binance.com"
 
-# Cache symbol info: { "BTCUSDT": {"precision": 3, "min_qty": 0.001} }
-SYMBOL_INFO: Dict[str, Dict[str, Any]] = {}
+active_positions: Dict[str, dict] = {}  # symbol → данные
 
-app = FastAPI(title="oz-bot", version="1.0")
+# ====================== BINANCE API ======================
+def sign(params: Dict) -> str:
+    query = "&".join(f"{k}={v}" for k, v in sorted((k, v) for k, v in params.items() if v is not None))
+    return hmac.new(BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-
-# ===== Telegram helper (async via httpx) =====
-async def tg_send(text: str):
-    global client
-    if client is None:
-        logger.error("HTTP client not initialized, cannot send TG message")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    try:
-        r = await client.post(url, json=payload, timeout=20.0)
-        if r.status_code >= 400:
-            logger.warning("Telegram send failed: %s %s", r.status_code, await r.text())
-    except Exception as e:
-        logger.exception("TG send exception: %s", e)
-
-def tg_send_bg(text: str):
-    try:
-        asyncio.create_task(tg_send(text))
-    except Exception as e:
-        logger.exception("Failed create_task for tg_send: %s", e)
-
-
-# ===== Binance signature helper =====
-def _create_signature(params: Dict[str, Any], secret: str) -> str:
-    """
-    Create HMAC SHA256 signature from sorted urlencoded params.
-    """
-    normalized = {}
-    for k, v in params.items():
-        if v is None:
-            continue
-        # booleans must be "true"/"false"
-        if isinstance(v, bool):
-            normalized[k] = str(v).lower()
-        else:
-            normalized[k] = str(v)
-    query_string = urllib.parse.urlencode(sorted(normalized.items()))
-    return hmac.new(secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
-
-
-# ===== Binance request wrapper =====
-async def binance_request(method: str, endpoint: str, params: Optional[Dict[str, Any]] = None, signed: bool = True):
-    global client
-    if client is None:
-        raise RuntimeError("HTTP client not initialized")
-    url = f"https://fapi.binance.com{endpoint}"
-    params = params.copy() if params else {}
-
+async def api(method: str, endpoint: str, params: Optional[Dict] = None, signed: bool = True):
+    url = f"{BASE_URL}{endpoint}"
+    p = params or {}
     if signed:
-        # Ensure timestamp + recvWindow included BEFORE signature
-        params["timestamp"] = int(time.time() * 1000)
-        params["recvWindow"] = RECV_WINDOW_MS
-        params["signature"] = _create_signature(params, BINANCE_API_SECRET)
-
+        p["timestamp"] = int(time.time() * 1000)
+        p["signature"] = sign(p)
     headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
     try:
-        if method.upper() == "GET":
-            r = await client.get(url, params=params, headers=headers, timeout=30.0)
-        else:
-            # POST with params in querystring works for Binance signed endpoints
-            r = await client.post(url, params=params, headers=headers, timeout=30.0)
+        r = await client.request(method, url, params=p, headers=headers)
         r.raise_for_status()
         return r.json()
-    except httpx.HTTPStatusError as e:
-        body = None
-        try:
-            body = r.json()
-        except Exception:
-            try:
-                body = await r.text()
-            except Exception:
-                body = str(e)
-        tg_send_bg(f"<b>BINANCE ERROR</b>\n<code>{body}</code>")
-        logger.exception("Binance HTTPStatusError: %s", body)
-        raise
     except Exception as e:
-        tg_send_bg(f"<b>BINANCE EXCEPTION</b>\n<code>{str(e)[:500]}</code>")
-        logger.exception("Binance exception: %s", e)
-        raise
+        msg = str(e)
+        try: msg = e.response.json().get("msg", msg)
+        except: pass
+        raise Exception(msg)
 
-
-# ===== Symbol info loading & leverage set =====
-async def load_symbol(symbol: str):
-    if symbol in SYMBOL_INFO:
-        return SYMBOL_INFO[symbol]
-    info = await binance_request("GET", "/fapi/v1/exchangeInfo", signed=False)
-    for s in info.get("symbols", []):
-        if s.get("symbol") == symbol:
-            prec = int(s.get("quantityPrecision", 8))
-            min_qty = 0.0
-            for f in s.get("filters", []):
-                if f.get("filterType") == "LOT_SIZE":
-                    min_qty = float(f.get("minQty", 0.0))
-                    break
-            SYMBOL_INFO[symbol] = {"precision": prec, "min_qty": min_qty}
-            # attempt to set leverage (ignore failures)
-            try:
-                await binance_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEVERAGE})
-            except Exception:
-                logger.info("Unable to set leverage for %s — maybe missing permissions or already set", symbol)
-            return SYMBOL_INFO[symbol]
-    raise Exception(f"Symbol not found: {symbol}")
-
-
-# ===== Price & qty helpers =====
-async def get_price(symbol: str) -> float:
-    data = await binance_request("GET", "/fapi/v1/ticker/price", {"symbol": symbol}, signed=False)
-    return float(data["price"])
-
-async def calc_qty(symbol: str) -> str:
-    info = await load_symbol(symbol)
-    price = await get_price(symbol)
-    raw = (FIXED_AMOUNT_USD * LEVERAGE) / price
-    qty = round(raw, info["precision"])
-    if qty < info["min_qty"]:
-        qty = info["min_qty"]
-    fmt = f"{{:.{info['precision']}f}}".format(qty)
-    return fmt.rstrip("0").rstrip(".") if "." in fmt else fmt
-
-
-# ===== Trading actions: LONG only =====
-async def open_long(symbol: str):
+# ====================== ATR ======================
+async def get_atr(symbol: str, timeframe: str = "5m", period: int = 14) -> float:
     try:
-        await load_symbol(symbol)
-        await asyncio.sleep(0.12)  # small safety delay
-        qty = await calc_qty(symbol)
-        entry = await get_price(symbol)
-        oid = f"oz_{int(time.time() * 1000)}"
+        klines = await api("GET", "/fapi/v1/klines", {"symbol": symbol, "interval": timeframe, "limit": period+1}, signed=False)
+        highs = [float(k[2]) for k in klines]
+        lows = [float(k[3]) for k in klines]
+        closes = [float(k[4]) for k in klines]
+        tr_list = []
+        for i in range(1, len(klines)):
+            tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+            tr_list.append(tr)
+        return sum(tr_list[-period:]) / period if tr_list else 0.001
+    except:
+        return 0.001  # fallback
 
-        tp_price = round(entry * (1 + TP_PERCENT / 100), 6)
-        sl_price = round(entry * (1 - SL_PERCENT / 100), 6)
+# ====================== ПОЗИЦИИ ======================
+async def open_long(symbol: str, entry_price: float, reason: str):
+    if symbol in active_positions:
+        return
 
-        # MARKET BUY to open LONG
-        order = await binance_request("POST", "/fapi/v1/order", {
-            "symbol": symbol,
-            "side": "BUY",
-            "type": "MARKET",
-            "quantity": qty,
-            "newClientOrderId": oid,
-            "positionSide": "LONG"
-        })
+    await api("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEVERAGE})
+    qty = round((FIXED_AMOUNT_USDT * LEVERAGE) / entry_price, 6)
+    qty = max(qty, 0.001)
 
-        if not order.get("orderId"):
-            tg_send_bg(f"<b>ОШИБКА ОТКРЫТИЯ {symbol}</b>\n{order}")
-            return {"ok": False, "detail": order}
+    await api("POST", "/fapi/v1/order", {
+        "symbol": symbol, "side": "BUY", "type": "MARKET", "quantity": str(qty)
+    })
 
-        # Place TP and SL as reduceOnly MARKET orders (if they fail, we log and continue)
-        for price, typ in [(tp_price, "TAKE_PROFIT_MARKET"), (sl_price, "STOP_MARKET")]:
+    atr = await get_atr(symbol)
+    tp_price = round(entry_price + TP_MULTIPLIER * atr, 6)
+
+    await api("POST", "/fapi/v1/order", {
+        "symbol": symbol, "side": "SELL", "type": "TAKE_PROFIT_MARKET",
+        "quantity": str(qty), "stopPrice": str(tp_price), "reduceOnly": "true"
+    })
+
+    active_positions[symbol] = {
+        "entry": entry_price,
+        "qty": qty,
+        "atr": atr,
+        "last_trailing_stop": entry_price - 2 * atr,  # начальный стоп далеко
+        "trailing_active": False,
+        "open_time": time.time(),
+        "reason": reason
+    }
+
+    await tg_send(f"<b>LONG ОТКРЫТ + ATR-ТРЕЙЛИНГ</b>\n"
+                  f"<code>{symbol.replace('USDT','/USDT')}</code>\n"
+                  f"Цена: <code>{entry_price:.6f}</code> | ATR: <code>{atr:.6f}</code>\n"
+                  f"TP: +{TP_MULTIPLIER}×ATR | Трейлинг: {TRAIL_MULTIPLIER}×ATR\n"
+                  f"{reason}")
+
+async def close_position(symbol: str, reason: str):
+    pos = await api("GET", "/fapi/v2/positionRisk")
+    for p in pos:
+        if p["symbol"] == symbol and float(p["positionAmt"]) != 0:
+            qty = abs(float(p["positionAmt"]))
+            await api("POST", "/fapi/v1/order", {
+                "symbol": symbol, "side": "SELL", "type": "MARKET",
+                "quantity": f"{qty:.8f}", "reduceOnly": "true"
+            })
+            pnl = float(p.get("unRealizedProfit", 0))
+            await tg_send(f"<b>ПОЗИЦИЯ ЗАКРЫТА</b>\n"
+                          f"{symbol.replace('USDT','/USDT')} | {reason}\n"
+                          f"PnL: <code>{pnl:+.4f} USDT</code>")
+            active_positions.pop(symbol, None)
+            return
+
+# ====================== ATR ТРЕЙЛИНГ ======================
+async def atr_trailing_loop():
+    while True:
+        await asyncio.sleep(9)
+        now = time.time()
+        for symbol, data in list(active_positions.items()):
             try:
-                params = {
-                    "symbol": symbol,
-                    "side": "SELL",
-                    "type": typ,
-                    "quantity": qty,
-                    "stopPrice": str(price),
-                    "reduceOnly": "true",
-                    "positionSide": "LONG",
-                    "workingType": "CONTRACT_PRICE",   # use contract price
-                    "priceProtect": "true",           # protect parameter
-                    "newClientOrderId": f"{typ[:2].lower()}_{oid}"
-                }
-                # signature + recvWindow handled in binance_request
-                await binance_request("POST", "/fapi/v1/order", params)
+                price_data = await api("GET", "/fapi/v1/ticker/price", {"symbol": symbol}, signed=False)
+                current_price = float(price_data["price"])
+                atr = await get_atr(symbol)  # обновляем ATR каждые 9 сек
+                data["atr"] = atr
+
+                profit_in_atr = (current_price - data["entry"]) / atr
+
+                # Активация трейлинга
+                if not data["trailing_active"] and profit_in_atr >= ACTIVATION_ATR:
+                    data["trailing_active"] = True
+                    await tg_send(f"ATR-ТРЕЙЛИНГ АКТИВИРОВАН\n"
+                                  f"{symbol.replace('USDT','/USDT')}\n"
+                                  f"Цена: {current_price:.6f} (+{profit_in_atr:.2f}×ATR)")
+
+                if data["trailing_active"]:
+                    new_stop = current_price - TRAIL_MULTIPLIER * atr
+                    if new_stop > data["last_trailing_stop"] + atr * 0.1:  # двигаем минимум на 0.1×ATR
+                        await api("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
+                        await api("POST", "/fapi/v1/order", {
+                            "symbol": symbol,
+                            "side": "SELL",
+                            "type": "STOP_MARKET",
+                            "quantity": str(data["qty"]),
+                            "stopPrice": f"{new_stop:.6f}",
+                            "reduceOnly": "true"
+                        })
+                        data["last_trailing_stop"] = new_stop
+                        await tg_send(f"Трейлинг обновлён\n"
+                                      f"{symbol.replace('USDT','/USDT')}\n"
+                                      f"Стоп: <code>{new_stop:.6f}</code> (-{TRAIL_MULTIPLIER}×ATR)")
+
+                if now - data["open_time"] > AUTO_CLOSE_MINUTES * 60:
+                    await close_position(symbol, "Авто-закрытие по времени")
+
             except Exception as e:
-                logger.exception("Failed to place %s for %s: %s", typ, symbol, e)
+                logger.error(f"ATR trailing error {symbol}: {e}")
 
-        text = (f"<b>LONG {symbol} ОТКРЫТ</b>\n"
-                f"${FIXED_AMOUNT_USD:.2f} × {LEVERAGE}x\n"
-                f"Entry: <code>{entry:.6f}</code>\n"
-                f"TP: <code>{tp_price:.6f}</code> (+{TP_PERCENT}%)\n"
-                f"SL: <code>{sl_price:.6f}</code> (-{SL_PERCENT}%)\n"
-                f"Qty: <code>{qty}</code>")
-        tg_send_bg(text)
-        return {"ok": True, "entry": entry, "tp": tp_price, "sl": sl_price, "qty": qty}
+# ====================== СООБЩЕНИЯ ======================
+async def tg_send(text: str):
+    try:
+        await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
-        logger.exception("open_long exception: %s", e)
-        tg_send_bg(f"<b>ОШИБКА ОТКРЫТИЯ {symbol}</b>\n<code>{str(e)}</code>")
-        return {"ok": False, "error": str(e)}
+        logger.error(f"TG error: {e}")
 
-async def close_long(symbol: str):
-    try:
-        pos = await binance_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-        amt = 0.0
-        if isinstance(pos, list):
-            for p in pos:
-                if p.get("positionSide") == "LONG" and p.get("symbol") == symbol:
-                    amt = float(p.get("positionAmt", 0))
-                    break
-        else:
-            if pos.get("positionSide") == "LONG" and pos.get("symbol") == symbol:
-                amt = float(pos.get("positionAmt", 0))
+# ====================== FASTAPI ======================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await tg_send("OZ TRADING BOT 2026 + ATR-ТРЕЙЛИНГ — ЗАПУЩЕН!\n"
+                  "Самый умный трейлинг в мире активирован.")
+    asyncio.create_task(atr_trailing_loop())
+    yield
+    await client.aclose()
 
-        if abs(amt) < 1e-8:
-            tg_send_bg(f"{symbol} уже закрыт")
-            return {"ok": True, "detail": "already closed"}
+app = FastAPI(lifespan=lifespan)
 
-        qty = f"{abs(amt):.8f}".rstrip("0").rstrip(".")
-        await binance_request("POST", "/fapi/v1/order", {
-            "symbol": symbol,
-            "side": "SELL",
-            "type": "MARKET",
-            "quantity": qty,
-            "reduceOnly": "true",
-            "positionSide": "LONG"
-        })
-        tg_send_bg(f"<b>{symbol} ЗАКРЫТ</b>")
-        return {"ok": True}
-    except Exception as e:
-        logger.exception("close_long exception: %s", e)
-        tg_send_bg(f"<b>ОШИБКА ЗАКРЫТИЯ {symbol}</b>\n<code>{str(e)}</code>")
-        return {"ok": False, "error": str(e)}
-
-
-# ===== Webhook verification =====
-def verify_webhook_signature(secret: str, body: bytes, signature_header: Optional[str]) -> bool:
-    if not signature_header:
-        return False
-    try:
-        expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(expected, signature_header)
-    except Exception:
-        return False
-
-
-# ===== API models & endpoints =====
-class WebhookModel(BaseModel):
-    action: str
-    symbol: str
-    secret: Optional[str] = None
-
-@app.on_event("startup")
-async def startup():
-    global client
-    client = httpx.AsyncClient(timeout=60.0)
-    logger.info("HTTP client initialized")
-    try:
-        tg_send_bg("<b>BOT STARTED</b>")
-    except Exception:
-        pass
-
-@app.on_event("shutdown")
-async def shutdown():
-    global client
-    if client:
-        await client.aclose()
-        logger.info("HTTP client closed")
-    try:
-        tg_send_bg("<b>BOT STOPPED</b>")
-    except Exception:
-        pass
-
-# Root for Fly health checks
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "oz-bot"}
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
+    return HTMLResponse(f"<h1 style='color:#0f0'>OZ BOT + ATR TRAILING 2026 — ONLINE</h1>"
+                        f"<p>Позиций: {len(active_positions)}</p>")
 
 @app.post("/webhook")
-async def webhook(request: Request, background: BackgroundTasks):
-    """
-    JSON:
-      { "action": "open_long" | "close_long", "symbol": "BTCUSDT", "secret": "optional" }
-    Header:
-      X-SIGNATURE: hex(HMAC_SHA256(body, WEBHOOK_SECRET))
-    """
-    body = await request.body()
-    sig = request.headers.get("X-SIGNATURE") or request.headers.get("X-Signature")
-    ok = verify_webhook_signature(WEBHOOK_SECRET, body, sig)
-
+async def webhook(request: Request):
     try:
         data = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+    except:
+        raise HTTPException(400, "Bad JSON")
 
-    # fallback if header missing: allow secret in JSON (less secure)
-    if not ok:
-        if data.get("secret") and data.get("secret") == WEBHOOK_SECRET:
-            ok = True
+    if data.get("secret") != WEBHOOK_SECRET:
+        raise HTTPException(403, "Wrong secret")
 
-    if not ok:
-        raise HTTPException(status_code=403, detail="Invalid signature")
+    symbol = data.get("symbol", "").replace("/", "")
+    signal = data.get("signal", "").upper()
+    price = float(data.get("price", 0))
+    reason = data.get("reason", "Сигнал от сканера")
+    tf = data.get("timeframe", "")
 
-    try:
-        payload = WebhookModel(**data)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid payload: {e}")
+    if signal == "LONG":
+        await open_long(symbol, price, f"{reason} [{tf}]")
+    elif signal == "CLOSE":
+        await close_position(symbol, f"{reason} [{tf}]")
 
-    action = payload.action.lower()
-    symbol = payload.symbol.upper()
-
-    if action == "open_long":
-        background.add_task(open_long, symbol)
-        return {"ok": True, "action": "open_long", "symbol": symbol}
-    elif action == "close_long":
-        background.add_task(close_long, symbol)
-        return {"ok": True, "action": "close_long", "symbol": symbol}
-    else:
-        raise HTTPException(status_code=400, detail="Unknown action")
-
-
-# Manual endpoints for quick testing
-@app.post("/open/{symbol}")
-async def open_manual(symbol: str):
-    return await open_long(symbol.upper())
-
-@app.post("/close/{symbol}")
-async def close_manual(symbol: str):
-    return await close_long(symbol.upper())
+    return {"status": "ok"}
