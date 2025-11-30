@@ -194,13 +194,18 @@ async def webhook(request: Request):
     if data.get("secret") != WEBHOOK_SECRET:
         raise HTTPException(403, "Wrong secret")
 
-    symbol = data.get("symbol", "").replace("/", "").upper() + "USDT"
+    # ←←← ИСПРАВЛЕННЫЙ БЛОК (работает и с DOGE, и с DOGEUSDT)
+    symbol = data.get("symbol", "").replace("/", "").replace("usdt", "").upper()
+    if not symbol.endswith("USDT"):
+        symbol += "USDT"
+    # ←←← конец исправления
+
     signal = data.get("signal", "").upper()
-    price = float(data.get("price", 0))
-    reason = data.get("reason", "Scanner signal")
+    price = float(data.get("price", 0)) if "price" in data else 0
+    reason = data.get("reason", "Ручной сигнал")
     tf = data.get("timeframe", "")
 
-    if signal == "LONG":
+    if signal == "LONG" and price > 0:
         await open_long(symbol, price, f"{reason} [{tf}]")
     elif signal == "CLOSE":
         await close_position(symbol, f"{reason} [{tf}]")
