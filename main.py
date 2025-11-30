@@ -5,6 +5,7 @@ import hmac
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from telegram import Bot
+from decimal import Decimal, ROUND_DOWN
 
 # ====================== CONFIG ======================
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
@@ -19,22 +20,25 @@ bot = Bot(token=TELEGRAM_TOKEN)
 client = httpx.AsyncClient(timeout=20.0)
 BASE = "https://fapi.binance.com"
 active = {}
-exchange_info = None  # кэшируем один раз
+exchange_info = None
 
 async def get_exchange_info():
     global exchange_info
     if exchange_info is None:
-        exchange_info = await client.get(f"{BASE}/fapi/v1/exchangeInfo")
-        exchange_info = exchange_info.json()
+        r = await client.get(f"{BASE}/fapi/v1/exchangeInfo")
+        exchange_info = r.json()
     return exchange_info
 
-def get_quantity_precision(symbol: str, qty: float) -> str:
-    info = next((s for s in exchange_info["symbols"] if s["symbol"] == symbol), None)
-    if not info:
-        return f"{qty:.3f}"
-    precision = next(f for f in info["filters"] if f["filterType"] == "LOT_SIZE")["stepSize"]
-    precision = len(precision.rstrip('0').split('.')[-1]) if '.' in precision else 0
-    return f"{qty:.{precision}f}".rstrip('0').rstrip('.') if '.' in f"{qty:.{precision}f}" else f"{int(qty)}"
+def truncate_quantity(symbol: str, quantity: float) -> str:
+    info = next(s for s in exchange_info["symbols"] if s["symbol"] == symbol)
+    lot_filter = next(f for f in info["filters"] if f["filterType"] == "LOT_SIZE")
+    step = Decimal(lot_filter["stepSize"])
+    min_qty = Decimal(lot_filter["minQty"])
+    qty = Decimal(quantity)
+    qty = (qty // step) * step
+    qty = max(qty, min_qty)
+    qty = qty.quantize(Decimal("1."), rounding=ROUND_DOWN) if '.' in lot_filter["stepSize"] else qty.to_integral_value()
+    return str(qty)
 
 async def api(method: str, path: str, params: dict = None, signed: bool = True):
     url = BASE + path
@@ -60,28 +64,29 @@ async def get_price(symbol: str) -> float:
 # ====================== LONG ======================
 async def open_long(symbol: str):
     if symbol in active:
-        await tg(f"Уже есть LONG по {symbol.replace('USDT','/USDT')}")
+        await tg(f"<b>Уже открыт LONG</b> {symbol.replace('USDT','/USDT')}")
         return
 
-    await get_exchange_info()  # один раз загрузим
+    await get_exchange_info()
 
     try:
         await api("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEVERAGE})
-    except: pass
+    except Exception as e:
+        await tg(f"Плечо не поставилось: {str(e)[:50]}")
 
     price = await get_price(symbol)
     raw_qty = (FIXED_USDT * LEVERAGE) / price
-    qty_str = get_quantity_precision(symbol, raw_qty)
+    qty = truncate_quantity(symbol, raw_qty)
 
     await api("POST", "/fapi/v1/order", {
         "symbol": symbol,
         "side": "BUY",
         "type": "MARKET",
-        "quantity": qty_str
+        "quantity": qty
     })
 
-    active[symbol] = qty_str
-    await tg(f"<b>LONG ОТКРЫТ ×{LEVERAGE}</b>\n<code>{symbol.replace('USDT','/USDT')}</code>\n${FIXED_USDT} → {qty_str} монет\nЦена: {price:.6f}")
+    active[symbol] = qty
+    await tg(f"<b>LONG ОТКРЫТ ×{LEVERAGE}</b>\n<code>{symbol.replace('USDT','/USDT')}</code>\n${FIXED_USDT} → {qty} монет\n≈ {price:.6f}")
 
 # ====================== CLOSE ======================
 async def close_position(symbol: str):
@@ -102,21 +107,19 @@ app = FastAPI()
 
 @app.get("/")
 async def root():
-    return {"status": "OZ BOT 100% РАБОТАЕТ", "positions": list(active.keys())}
+    return {"status": "БОТ РАБОТАЕТ", "active": list(active.keys())}
 
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
         data = await request.json()
     except:
-        raise HTTPException(400)
+        raise HTTPException(400, "Bad JSON")
 
     if data.get("secret") != WEBHOOK_SECRET:
-        raise HTTPException(403)
+        raise HTTPException(403, "Wrong secret")
 
-    sym = data.get("symbol", "").replace("/", "").upper()
-    if not sym.endswith("USDT"):
-        sym += "USDT"
+    sym = data.get("symbol", "").replace("/", "").upper() + "USDT" if not data.get("symbol", "").upper().endswith("USDT") else data.get("symbol", "").upper()
 
     signal = data.get("signal", "").upper()
 
