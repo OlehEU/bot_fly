@@ -10,7 +10,7 @@ from fastapi.responses import HTMLResponse
 from telegram import Bot
 from contextlib import asynccontextmanager
 
-# ==================== КОНФИГ ====================
+# ==================== CONFIG ====================
 required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "BINANCE_API_KEY", "BINANCE_API_SECRET", "WEBHOOK_SECRET"]
 for v in required:
     if not os.getenv(v):
@@ -48,18 +48,16 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
 
     if signed:
         p["timestamp"] = int(time.time() * 1000)
+        p["recvWindow"] = 5000  # 5 секунд для синхронизации времени
         p["signature"] = make_signature(p)
 
     headers = {"X-MBX-APIKEY": API_KEY}
 
     try:
-        # ВАЖНО: POST должен идти с params, а не json
+        # POST идет с params, не json
         r = await client.request(method, url, params=p, headers=headers)
         if r.status_code != 200:
-            try:
-                full_error = r.text
-            except:
-                full_error = "Unknown error"
+            full_error = r.text
             if len(full_error) > 3800:
                 full_error = full_error[:3800] + "...(cut)"
             await tg(f"<b>BINANCE ERROR {r.status_code} {path}</b>\n<code>{full_error}</code>")
@@ -86,20 +84,21 @@ async def open_long(sym: str):
         return
 
     # marginType
-    await binance("POST", "/fapi/v1/marginType", {
-        "symbol": symbol,
-        "marginType": "CROSS"
-    })
+    resp_margin = await binance("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": "CROSS"})
+    if not resp_margin:
+        await tg(f"<b>Не удалось выставить marginType для {symbol}</b>")
+        return
 
     # leverage
-    await binance("POST", "/fapi/v1/leverage", {
-        "symbol": symbol,
-        "leverage": LEV
-    })
+    resp_lev = await binance("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEV})
+    if not resp_lev:
+        await tg(f"<b>Не удалось выставить leverage для {symbol}</b>")
+        return
 
     # price
     data = await binance("GET", "/fapi/v1/ticker/price", {"symbol": symbol}, signed=False)
-    if not data:
+    if not data or "price" not in data:
+        await tg(f"<b>Не удалось получить цену {symbol}</b>")
         return
     price = float(data["price"])
 
@@ -122,6 +121,8 @@ async def open_long(sym: str):
             f"<code>{symbol}</code>\n"
             f"{qty} шт @ {price:.6f}"
         )
+    else:
+        await tg(f"<b>Не удалось открыть LONG {symbol}</b>")
 
 # ================= CLOSE ==========================
 async def close(sym: str):
@@ -130,14 +131,17 @@ async def close(sym: str):
         symbol += "USDT"
 
     if symbol not in active:
+        await tg(f"<b>Нет открытой позиции для {symbol}</b>")
         return
 
     pos = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     if not pos:
+        await tg(f"<b>Не удалось получить позицию {symbol}</b>")
         return
 
     qty = next((p["positionAmt"] for p in pos if p["symbol"] == symbol and float(p["positionAmt"]) > 0), None)
     if not qty:
+        await tg(f"<b>Нет количества позиции {symbol}</b>")
         return
 
     await binance("POST", "/fapi/v1/order", {
