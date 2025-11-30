@@ -31,7 +31,7 @@ LEV = int(os.getenv("LEVERAGE", "10"))
 bot = Bot(token=TELEGRAM_TOKEN)
 client = httpx.AsyncClient(timeout=20)
 BASE = "https://fapi.binance.com"
-active = set()
+active = set() # Множество для отслеживания активных LONG-позиций, открытых ботом
 
 # ================= TELEGRAM =====================
 async def tg(text: str):
@@ -81,7 +81,7 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
         r = await client.request(method, url, params=final_params, headers=headers)
         
         if r.status_code != 200:
-            # --- ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ: ОТКЛЮЧЕНИЕ УВЕДОМЛЕНИЙ О НЕКРИТИЧЕСКОЙ ОШИБКЕ -1102 ---
+            # --- ИСПРАВЛЕНИЕ: ОТКЛЮЧЕНИЕ УВЕДОМЛЕНИЙ О НЕКРИТИЧЕСКОЙ ОШИБКЕ -1102 ---
             is_benign_margin_error = (
                 path == "/fapi/v1/marginType" and 
                 r.status_code == 400 and 
@@ -105,6 +105,7 @@ async def load_active_positions():
     try:
         data = await binance("GET", "/fapi/v2/positionRisk", signed=True)
         if data:
+            # Загружаем только LONG позиции с положительным количеством
             open_longs = {
                 p["symbol"] for p in data 
                 if float(p["positionAmt"]) > 0 and p["positionSide"] == "LONG"
@@ -127,7 +128,7 @@ def fix_qty(symbol: str, qty: float) -> str:
 async def open_long(sym: str):
     symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
 
-    # Пропуск сигнала, если позиция уже открыта
+    # ИСПРАВЛЕНИЕ: Пропуск, если позиция УЖЕ ОТКРЫТА и ОТСЛЕЖИВАЕТСЯ
     if symbol in active:
         await tg(f"<b>{symbol}</b> — уже открыта (пропуск сигнала)")
         return
@@ -165,19 +166,21 @@ async def open_long(sym: str):
 async def close(sym: str):
     symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
     
-    if symbol not in active:
-        await tg(f"<b>{symbol}</b> — не найдена в active set")
-        return
-
+    # ИСПРАВЛЕНИЕ: УДАЛЕНА ПРОВЕРКА "if symbol not in active". 
+    # Теперь бот ВСЕГДА пытается закрыть позицию на бирже, 
+    # даже если она не отслеживается внутренним active set.
+    
     # 1. Проверка текущей позиции на бирже
     pos_data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     if not pos_data:
+        # Если API не ответил, бот не может ничего сделать
         return
     
     # Ищем LONG позицию с количеством > 0
     qty_str = next((p["positionAmt"] for p in pos_data if p["positionSide"] == "LONG" and float(p["positionAmt"]) > 0), None)
     
     if not qty_str or float(qty_str) <= 0:
+        # Позиции нет — удаляем из внутреннего списка и уведомляем
         active.discard(symbol)
         await tg(f"<b>{symbol}</b> — позиция уже закрыта на бирже")
         return
@@ -189,7 +192,6 @@ async def close(sym: str):
         "positionSide": "LONG",
         "type": "MARKET",
         "quantity": qty_str,
-        # reduceOnly УДАЛЕН, чтобы избежать ошибки -1106
     })
     
     if close_order and close_order.get("orderId"):
@@ -216,6 +218,7 @@ async def root():
 
 @app.post("/webhook")
 async def webhook(request: Request):
+    # ПРОВЕРКА СЕКРЕТА ИЗ ЗАГОЛОВКА
     if request.headers.get("X-Webhook-Secret") != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
     
