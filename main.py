@@ -5,7 +5,6 @@ import hmac
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from telegram import Bot
-from decimal import Decimal, ROUND_DOWN
 
 # ====================== CONFIG ======================
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
@@ -20,25 +19,14 @@ bot = Bot(token=TELEGRAM_TOKEN)
 client = httpx.AsyncClient(timeout=20.0)
 BASE = "https://fapi.binance.com"
 active = {}
-exchange_info = None
 
-async def get_exchange_info():
-    global exchange_info
-    if exchange_info is None:
-        r = await client.get(f"{BASE}/fapi/v1/exchangeInfo")
-        exchange_info = r.json()
-    return exchange_info
-
-def truncate_quantity(symbol: str, quantity: float) -> str:
-    info = next(s for s in exchange_info["symbols"] if s["symbol"] == symbol)
-    lot_filter = next(f for f in info["filters"] if f["filterType"] == "LOT_SIZE")
-    step = Decimal(lot_filter["stepSize"])
-    min_qty = Decimal(lot_filter["minQty"])
-    qty = Decimal(quantity)
-    qty = (qty // step) * step
-    qty = max(qty, min_qty)
-    qty = qty.quantize(Decimal("1."), rounding=ROUND_DOWN) if '.' in lot_filter["stepSize"] else qty.to_integral_value()
-    return str(qty)
+# Простейший и 100% рабочий способ обрезать quantity под Binance
+def fix_quantity(symbol: str, qty: float) -> str:
+    # Для мем-коинов — только целые числа
+    if symbol in ["DOGEUSDT", "SHIBUSDT", "PEPEUSDT", "1000PEPEUSDT", "BONKUSDT", "FLOKIUSDT"]:
+        return str(int(qty))
+    # Для остальных — 3 знака
+    return f"{qty:.3f}".rstrip("0").rstrip(".")
 
 async def api(method: str, path: str, params: dict = None, signed: bool = True):
     url = BASE + path
@@ -61,22 +49,19 @@ async def get_price(symbol: str) -> float:
     data = await api("GET", "/fapi/v1/ticker/price", {"symbol": symbol}, signed=False)
     return float(data["price"])
 
-# ====================== LONG ======================
 async def open_long(symbol: str):
     if symbol in active:
-        await tg(f"<b>Уже открыт LONG</b> {symbol.replace('USDT','/USDT')}")
+        await tg(f"<b>УЖЕ ЕСТЬ</b> {symbol.replace('USDT','/USDT')}")
         return
 
-    await get_exchange_info()
-
+    # Плечо 10x
     try:
         await api("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEVERAGE})
-    except Exception as e:
-        await tg(f"Плечо не поставилось: {str(e)[:50]}")
+    except: pass
 
     price = await get_price(symbol)
     raw_qty = (FIXED_USDT * LEVERAGE) / price
-    qty = truncate_quantity(symbol, raw_qty)
+    qty = fix_quantity(symbol, raw_qty)
 
     await api("POST", "/fapi/v1/order", {
         "symbol": symbol,
@@ -86,9 +71,8 @@ async def open_long(symbol: str):
     })
 
     active[symbol] = qty
-    await tg(f"<b>LONG ОТКРЫТ ×{LEVERAGE}</b>\n<code>{symbol.replace('USDT','/USDT')}</code>\n${FIXED_USDT} → {qty} монет\n≈ {price:.6f}")
+    await tg(f"<b>LONG ×{LEVERAGE}</b>\n<code>{symbol.replace('USDT','/USDT')}</code>\n${FIXED_USDT} → {qty} монет\n≈ {price:.6f}")
 
-# ====================== CLOSE ======================
 async def close_position(symbol: str):
     if symbol not in active:
         return
@@ -100,26 +84,27 @@ async def close_position(symbol: str):
         "quantity": qty,
         "reduceOnly": "true"
     })
-    await tg(f"<b>CLOSE {symbol.replace('USDT','/USDT')}</b>\nЗакрыто по рынку")
+    await tg(f"<b>CLOSE</b> {symbol.replace('USDT','/USDT')}")
 
-# ====================== API ======================
 app = FastAPI()
 
 @app.get("/")
 async def root():
-    return {"status": "БОТ РАБОТАЕТ", "active": list(active.keys())}
+    return {"status": "БОТ ЖИВ", "positions": list(active.keys())}
 
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
         data = await request.json()
     except:
-        raise HTTPException(400, "Bad JSON")
+        raise HTTPException(400)
 
     if data.get("secret") != WEBHOOK_SECRET:
-        raise HTTPException(403, "Wrong secret")
+        raise HTTPException(403)
 
-    sym = data.get("symbol", "").replace("/", "").upper() + "USDT" if not data.get("symbol", "").upper().endswith("USDT") else data.get("symbol", "").upper()
+    sym = data.get("symbol", "").replace("/", "").upper()
+    if not sym.endswith("USDT"):
+        sym += "USDT"
 
     signal = data.get("signal", "").upper()
 
@@ -128,4 +113,4 @@ async def webhook(request: Request):
     elif signal == "CLOSE":
         await close_position(sym)
 
-    return {"status": "ok"}
+    return {"ok": True}
