@@ -2,7 +2,6 @@ import os
 import time
 import hmac
 import hashlib
-import urllib.parse
 from typing import Dict
 import httpx
 import asyncio
@@ -30,7 +29,6 @@ client = httpx.AsyncClient(timeout=20)
 BASE = "https://fapi.binance.com"
 active = set()
 
-
 # ================= TELEGRAM =====================
 async def tg(text: str):
     try:
@@ -38,12 +36,11 @@ async def tg(text: str):
     except:
         pass
 
-
 # ================= SIGNATURE =====================
 def make_signature(params: Dict) -> str:
-    query = "&".join(f"{k}={urllib.parse.quote_plus(str(v))}" for k in sorted(params))
+    # Binance требует raw параметры, без URL-encode
+    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
-
 
 # ================= BINANCE API ====================
 async def binance(method: str, path: str, params: Dict | None = None, signed: bool = True):
@@ -67,14 +64,11 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
         await tg(f"<b>CRITICAL</b>\n{str(e)[:300]}")
         return None
 
-
 # ================ QTY ROUND =======================
 def fix_qty(symbol: str, qty: float) -> str:
-    # Для монет с 0.1 tickSize Binance требует INT qty
     if symbol in ["DOGEUSDT", "SHIBUSDT", "PEPEUSDT", "1000PEPEUSDT", "BONKUSDT", "FLOKIUSDT"]:
         return str(int(qty))
     return f"{qty:.3f}".rstrip("0").rstrip(".")
-
 
 # ================ OPEN LONG =======================
 async def open_long(sym: str):
@@ -86,7 +80,7 @@ async def open_long(sym: str):
         await tg(f"<b>{symbol} уже открыт</b>")
         return
 
-    # marginType – ДОЛЖНО быть "cross" (нижний регистр)
+    # marginType
     await binance("POST", "/fapi/v1/marginType", {
         "symbol": symbol,
         "marginType": "cross"
@@ -107,7 +101,7 @@ async def open_long(sym: str):
     raw_qty = AMOUNT * LEV / price
     qty = fix_qty(symbol, raw_qty)
 
-    # === ОЧЕНЬ ВАЖНО: Hedge Mode → positionSide=LONG ===
+    # Hedge Mode → positionSide=LONG
     order = await binance("POST", "/fapi/v1/order", {
         "symbol": symbol,
         "side": "BUY",
@@ -123,7 +117,6 @@ async def open_long(sym: str):
             f"<code>{symbol}</code>\n"
             f"{qty} шт @ {price:.6f}"
         )
-
 
 # ================= CLOSE ==========================
 async def close(sym: str):
@@ -154,22 +147,18 @@ async def close(sym: str):
     active.discard(symbol)
     await tg(f"<b>CLOSE</b> {symbol}")
 
-
 # ================= FASTAPI =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await tg("<b>OZ BOT 2025 — ONLINE</b>\nCross Mode\nHedge Mode FIXED")
+    await tg("<b>OZ BOT 2025 — ONLINE</b>\nCross Mode | Hedge Mode FIXED")
     yield
     await client.aclose()
 
-
 app = FastAPI(lifespan=lifespan)
-
 
 @app.get("/")
 async def root():
     return HTMLResponse("<h1>OZ BOT — ONLINE</h1>")
-
 
 @app.post("/webhook")
 async def webhook(request: Request):
