@@ -51,14 +51,21 @@ async def open_long(symbol: str):
     if symbol in active:
         return
 
-    # Плечо 10x
     try:
         await api("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEVERAGE})
-    except:
-        pass  # если не получилось — всё равно откроем на дефолтном
+    except: pass
 
     price = await get_price(symbol)
-    qty = round((FIXED_USDT * LEVERAGE) / price, 6)
+    
+    raw_qty = (FIXED_USDT * LEVERAGE) / price
+    
+    # Особая точность для мем-коинов
+    if symbol in ["DOGEUSDT", "SHIBUSDT", "BONKUSDT", "PEPEUSDT", "1000PEPEUSDT", "FLOKIUSDT"]:
+        qty = int(raw_qty)  # только целое
+    else:
+        qty = round(raw_qty, 3)  # для нормальных монет
+
+    if qty < 1: qty = 1  # минимум 1 монета
 
     await api("POST", "/fapi/v1/order", {
         "symbol": symbol,
@@ -68,7 +75,7 @@ async def open_long(symbol: str):
     })
 
     active[symbol] = qty
-    await tg(f"OPEN LONG ×{LEVERAGE}\n{symbol.replace('USDT','/USDT')}\n${FIXED_USDT} → {qty} монет @ {price}")
+    await tg(f"OPEN LONG ×{LEVERAGE}\n{symbol.replace('USDT','/USDT')}\n${FIXED_USDT} → {int(qty)} монет @{price:.6f}")
 
 # ====================== CLOSE ======================
 async def close_position(symbol: str):
