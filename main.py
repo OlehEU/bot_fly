@@ -134,7 +134,7 @@ async def open_long(sym: str):
         await tg(f"<b>{symbol}</b> — уже открыта (пропуск сигнала)")
         return
 
-    # 1. Установка Cross Margin
+    # 1. Установка Cross Margin. 
     await binance("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": "CROSS"})
     
     # 2. Установка плеча
@@ -162,6 +162,7 @@ async def open_long(sym: str):
         active.add(symbol)
         
         # 5. Размещение TRAILING_STOP_MARKET ордера для TSL/TTP
+        # ИСПРАВЛЕНО: УДАЛЕН параметр "reduceOnly": True, вызывающий ошибку -1106
         trailing_order = await binance("POST", "/fapi/v1/order", {
             "symbol": symbol, 
             "side": "SELL", # Закрывает LONG позицию
@@ -169,14 +170,14 @@ async def open_long(sym: str):
             "type": "TRAILING_STOP_MARKET",
             "quantity": qty_str, # Объем позиции
             "callbackRate": TRAILING_RATE, # Процент отката
-            "reduceOnly": True, # Только для закрытия позиции
+            # "reduceOnly": True, <--- ЭТО БЫЛО УДАЛЕНО
         })
 
         if trailing_order and trailing_order.get("orderId"):
             await tg(f"<b>LONG ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT}\n@ {price:.8f}\n\n✅ TRAILING STOP ({TRAILING_RATE}%) УСТАНОВЛЕН")
         else:
              # Если трейлинг-стоп не установился, все равно уведомляем об открытии позиции
-             await tg(f"<b>LONG ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT}\n@ {price:.8f}\n\n⚠️ ОШИБКА УСТАНОВКИ TRAILING STOP")
+             await tg(f"<b>LONG ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT}\n@ {price:.8f}\n\n⚠️ ОШИБКА УСТАНОВКИ TRAILING STOP (СМОТРИТЕ ЛОГ)")
 
     else:
         await tg(f"<b>Ошибка открытия {symbol}</b>")
