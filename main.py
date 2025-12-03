@@ -129,8 +129,9 @@ def fix_qty(symbol: str, qty: float) -> str:
     
     ИСПРАВЛЕНИЕ: Добавлена явная обработка для SOLUSDT, требующей 2 знака после запятой.
     """
-    # Монеты, требующие нулевой точности (целые числа: мемкоины, 1000X токены и т.д.)
-    zero_prec = ["DOGEUSDT","SHIBUSDT","PEPEUSDT","1000PEPEUSDT","BONKUSDT","FLOKIUSDT","1000SATSUSDT"]
+    # Монеты, требующие нулевой точности (целые числа: мемкоины, 1000X токены и т.д.).
+    # Если возникает ошибка "Precision is over the maximum defined", добавьте сюда новый символ.
+    zero_prec = ["DOGEUSDT","SHIBUSDT","PEPEUSDT","1000PEPEUSDT","BONKUSDT","FLOKIUSDT","1000SATSUSDT", "FARTCOINUSDT"]
     # Монеты, требующие точности 2 знака после запятой (SOL, ADA, MATIC, DOT, ATOM и т.д.)
     two_prec = ["SOLUSDT", "ADAUSDT", "TRXUSDT", "MATICUSDT", "DOTUSDT", "ATOMUSDT"]
     
