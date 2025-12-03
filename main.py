@@ -1,3 +1,6 @@
+# =========================================================================================
+# OZ TRADING BOT 2025 v1.0 | Бот для исполнения сигналов Сканера на Binance Futures
+# =========================================================================================
 import os
 import time
 import hmac
@@ -31,18 +34,20 @@ LEV = int(os.getenv("LEVERAGE", "10")) # Плечо
 # Процент отката для Trailing Stop. Установите, например, 0.5 для 0.5%
 TRAILING_RATE = float(os.getenv("TRAILING_RATE", "0.5")) 
 
+# Инициализация Telegram и HTTP клиента
 bot = Bot(token=TELEGRAM_TOKEN)
 client = httpx.AsyncClient(timeout=20)
 BASE = "https://fapi.binance.com"
-active = set() # Множество для отслеживания активных LONG-позиций, открытых ботом
+# Множество для отслеживания активных LONG-позиций, открытых ботом
+active = set() 
 
 # ================= TELEGRAM УВЕДОМЛЕНИЯ =====================
 async def tg(text: str):
     """Отправляет сообщение в Telegram, используя HTML форматирование."""
     try:
         await bot.send_message(CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[ERROR] Telegram send failed: {e}")
 
 # ================= BINANCE API ЗАПРОСЫ ====================
 async def binance(method: str, path: str, params: Dict | None = None, signed: bool = True):
@@ -75,7 +80,7 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
         # 3. Добавляем строку прямо в URL
         url = f"{url}?{query_string}&signature={signature}"
         
-        final_params = None
+        final_params = None # Передаем параметры через URL, а не через params=...
     
     headers = {"X-MBX-APIKEY": API_KEY}
     
@@ -107,6 +112,7 @@ async def load_active_positions():
     try:
         data = await binance("GET", "/fapi/v2/positionRisk", signed=True)
         if data:
+            # Фильтруем только LONG позиции с количеством > 0
             open_longs = {
                 p["symbol"] for p in data 
                 if float(p["positionAmt"]) > 0 and p["positionSide"] == "LONG"
@@ -119,15 +125,29 @@ async def load_active_positions():
 
 # ================ ОКРУГЛЕНИЕ КОЛИЧЕСТВА =======================
 def fix_qty(symbol: str, qty: float) -> str:
-    """Округляет количество в зависимости от символа, учитывая точность Binance."""
-    high_prec = ["DOGEUSDT","SHIBUSDT","PEPEUSDT","1000PEPEUSDT","BONKUSDT","FLOKIUSDT","1000SATSUSDT"]
-    if symbol in high_prec:
+    """Округляет количество в зависимости от символа, учитывая точность Binance.
+    
+    ИСПРАВЛЕНИЕ: Добавлена явная обработка для SOLUSDT, требующей 2 знака после запятой.
+    """
+    # Монеты, требующие нулевой точности (целые числа: мемкоины, 1000X токены и т.д.)
+    zero_prec = ["DOGEUSDT","SHIBUSDT","PEPEUSDT","1000PEPEUSDT","BONKUSDT","FLOKIUSDT","1000SATSUSDT"]
+    # Монеты, требующие точности 2 знака после запятой (SOL, ADA, MATIC, DOT, ATOM и т.д.)
+    two_prec = ["SOLUSDT", "ADAUSDT", "TRXUSDT", "MATICUSDT", "DOTUSDT", "ATOMUSDT"]
+    
+    if symbol in zero_prec:
+        # Используем int() для целого числа
         return str(int(qty))
-    # Для большинства пар достаточно 3 знака после запятой
+    
+    if symbol in two_prec:
+        # 2 знака после запятой
+        return f"{qty:.2f}".rstrip("0").rstrip(".")
+
+    # Для остальных пар (ETH, BNB, XRP) оставляем 3 знака по умолчанию
     return f"{qty:.3f}".rstrip("0").rstrip(".")
 
 # ================ ОТКРЫТИЕ LONG =======================
 async def open_long(sym: str):
+    # Преобразуем входящий символ (например, DOGE/USDT) в формат Binance (DOGEUSDT)
     symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
 
     if symbol in active:
@@ -143,9 +163,11 @@ async def open_long(sym: str):
     # 3. Расчет количества
     price_data = await binance("GET", "/fapi/v1/ticker/price", {"symbol": symbol}, signed=False)
     if not price_data or 'price' not in price_data:
+        await tg(f"<b>Ошибка:</b> Не удалось получить цену для {symbol}")
         return
         
     price = float(price_data["price"])
+    # Расчет количества: (AMOUNT * LEVERAGE) / PRICE
     qty_f = AMOUNT * LEV / price
     qty_str = fix_qty(symbol, qty_f)
 
@@ -153,7 +175,7 @@ async def open_long(sym: str):
     order = await binance("POST", "/fapi/v1/order", {
         "symbol": symbol,
         "side": "BUY",
-        "positionSide": "LONG",
+        "positionSide": "LONG", # LONG позиция
         "type": "MARKET",
         "quantity": qty_str
     })
@@ -161,8 +183,7 @@ async def open_long(sym: str):
     if order and order.get("orderId"):
         active.add(symbol)
         
-        # 5. Размещение TRAILING_STOP_MARKET ордера для TSL/TTP
-        # ИСПРАВЛЕНО: УДАЛЕН параметр "reduceOnly": True, вызывающий ошибку -1106
+        # 5. Размещение TRAILING_STOP_MARKET ордера
         trailing_order = await binance("POST", "/fapi/v1/order", {
             "symbol": symbol, 
             "side": "SELL", # Закрывает LONG позицию
@@ -170,7 +191,8 @@ async def open_long(sym: str):
             "type": "TRAILING_STOP_MARKET",
             "quantity": qty_str, # Объем позиции
             "callbackRate": TRAILING_RATE, # Процент отката
-            # "reduceOnly": True, <--- ЭТО БЫЛО УДАЛЕНО
+            # Примечание: "reduceOnly" удален, чтобы избежать ошибки -1106,
+            # так как позиция открывается в режиме Hedge Mode.
         })
 
         if trailing_order and trailing_order.get("orderId"):
@@ -184,6 +206,7 @@ async def open_long(sym: str):
 
 # ================= ЗАКРЫТИЕ ПОЗИЦИИ ==========================
 async def close(sym: str):
+    # Преобразуем входящий символ (например, DOGE/USDT) в формат Binance (DOGEUSDT)
     symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
     
     # 1. Отмена всех активных ордеров (включая Trailing Stop) для данного символа
@@ -192,6 +215,7 @@ async def close(sym: str):
     # 2. Проверка текущей позиции на бирже
     pos_data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     if not pos_data:
+        await tg(f"<b>{symbol}</b> — Не удалось получить данные о позиции.")
         return
     
     # Ищем LONG позицию с количеством > 0
@@ -226,7 +250,7 @@ async def lifespan(app: FastAPI):
     
     await tg("<b>OZ BOT 2025 — ONLINE</b>\nCross Mode | Hedge Mode FIXED\nTrailing Stop (TSL/TTP) АКТИВИРОВАН")
     yield
-    await client.aclose()
+    await client.aclose() # Закрываем HTTP клиент при завершении работы
 
 app = FastAPI(lifespan=lifespan)
 
@@ -236,7 +260,7 @@ async def root():
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    # Проверка секрета вебхука
+    # Проверка секрета вебхука (критически важно для безопасности)
     if request.headers.get("X-Webhook-Secret") != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
     
