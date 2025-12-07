@@ -131,7 +131,8 @@ async def load_active_positions():
 # ================ ОКРУГЛЕНИЕ КОЛИЧЕСТВА =======================
 def fix_qty(symbol: str, qty: float) -> str:
     """Округляет количество в зависимости от символа, учитывая точность Binance."""
-    zero_prec = ["DOGEUSDT","SHIBUSDT","PEPEUSDT","1000PEPEUSDT","BONKUSDT","FLOKIUSDT","1000SATSUSDT", "FARTCOINUSDT", "XRPUSDT"]
+    # ОБНОВЛЕНО: Добавлен NEARUSDT
+    zero_prec = ["DOGEUSDT","SHIBUSDT","PEPEUSDT","1000PEPEUSDT","BONKUSDT","FLOKIUSDT","1000SATSUSDT", "FARTCOINUSDT", "XRPUSDT", "NEARUSDT"]
     two_prec = ["SOLUSDT", "ADAUSDT", "TRXUSDT", "MATICUSDT", "DOTUSDT", "ATOMUSDT", "BNBUSDT"]
     
     if symbol in zero_prec:
