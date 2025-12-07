@@ -1,11 +1,12 @@
 # =========================================================================================
-# OZ TRADING BOT 2025 v1.0 | Бот для исполнения сигналов Сканера на Binance Futures
+# OZ TRADING BOT 2025 v1.1 | Бот для исполнения сигналов Сканера на Binance Futures
+# ВЕРСИЯ С ПОЛНОЙ ПОДДЕРЖКОЙ LONG/SHORT И 4 ТИПОВ СИГНАЛОВ
 # =========================================================================================
 import os
 import time
 import hmac
 import hashlib
-from typing import Dict
+from typing import Dict, Set
 import httpx
 import asyncio
 from fastapi import FastAPI, Request, HTTPException
@@ -18,6 +19,7 @@ from contextlib import asynccontextmanager
 required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "BINANCE_API_KEY", "BINANCE_API_SECRET", "WEBHOOK_SECRET"]
 for v in required:
     if not os.getenv(v):
+        # В случае отсутствия переменной, прерываем выполнение
         raise ValueError(f"Нет переменной окружения: {v}")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -31,15 +33,16 @@ API_SECRET = os.getenv("BINANCE_API_SECRET")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 AMOUNT = float(os.getenv("FIXED_AMOUNT_USD", "30")) # Объем сделки в USD
 LEV = int(os.getenv("LEVERAGE", "10")) # Плечо
-# Процент отката для Trailing Stop. Установите, например, 0.5 для 0.5%
-TRAILING_RATE = float(os.getenv("TRAILING_RATE", "0.5")) 
+TRAILING_RATE = float(os.getenv("TRAILING_RATE", "0.5")) # Процент отката для Trailing Stop
 
 # Инициализация Telegram и HTTP клиента
 bot = Bot(token=TELEGRAM_TOKEN)
 client = httpx.AsyncClient(timeout=20)
 BASE = "https://fapi.binance.com"
-# Множество для отслеживания активных LONG-позиций, открытых ботом
-active = set() 
+
+# Множества для отслеживания активных позиций (для пропуска повторных сигналов)
+active_longs: Set[str] = set() # Активные LONG-позиции
+active_shorts: Set[str] = set() # Активные SHORT-позиции
 
 # ================= TELEGRAM УВЕДОМЛЕНИЯ =====================
 async def tg(text: str):
@@ -52,7 +55,7 @@ async def tg(text: str):
 # ================= BINANCE API ЗАПРОСЫ ====================
 async def binance(method: str, path: str, params: Dict | None = None, signed: bool = True):
     """
-    Универсальная функция для запросов к API Binance Futures. 
+    Универсальная функция для запросов к API Binance Futures.
     Автоматически добавляет подпись (signature) и временную метку (timestamp).
     """
     url = BASE + path
@@ -64,23 +67,19 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
         p["timestamp"] = int(time.time() * 1000)
         p["recvWindow"] = 60000
 
-        # Функция для корректного форматирования булевых значений
         def format_value(v):
             if isinstance(v, bool):
                 return str(v).lower()
             return str(v)
 
-        # 1. Сортируем параметры по ключу и собираем строку запроса вручную
         query_parts = [f"{k}={format_value(v)}" for k, v in sorted(p.items())]
         query_string = "&".join(query_parts)
 
-        # 2. Генерируем подпись
         signature = hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
 
-        # 3. Добавляем строку прямо в URL
         url = f"{url}?{query_string}&signature={signature}"
         
-        final_params = None # Передаем параметры через URL, а не через params=...
+        final_params = None
     
     headers = {"X-MBX-APIKEY": API_KEY}
     
@@ -88,7 +87,6 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
         r = await client.request(method, url, params=final_params, headers=headers)
         
         if r.status_code != 200:
-            # Игнорируем некритическую ошибку -1102 (уже установленный marginType)
             is_benign_margin_error = (
                 path == "/fapi/v1/marginType" and 
                 r.status_code == 400 and 
@@ -97,7 +95,7 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
             
             if not is_benign_margin_error:
                 err = r.text if len(r.text) < 3800 else r.text[:3800] + "..."
-                await tg(f"<b>BINANCE ERROR {r.status_code}</b>\nURL: <code>{url}</code>\nPath: {path}\n<code>{err}</code>")
+                await tg(f"<b>BINANCE ERROR {r.status_code}</b>\nPath: {path}\n<code>{err}</code>")
             
             return None
         return r.json()
@@ -107,72 +105,78 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
 
 # ================ ЗАГРУЗКА АКТИВНЫХ ПОЗИЦИЙ ====================
 async def load_active_positions():
-    """Загружает открытые LONG позиции с Binance в active set при старте."""
-    global active
+    """Загружает открытые LONG и SHORT позиции с Binance в соответствующие множества при старте."""
+    global active_longs, active_shorts
     try:
         data = await binance("GET", "/fapi/v2/positionRisk", signed=True)
         if data:
-            # Фильтруем только LONG позиции с количеством > 0
-            open_longs = {
-                p["symbol"] for p in data 
-                if float(p["positionAmt"]) > 0 and p["positionSide"] == "LONG"
-            }
-            active = open_longs
-            await tg(f"<b>Начальная загрузка позиций:</b>\nНайдено {len(active)} открытых LONG-позиций.")
+            open_longs_temp = set()
+            open_shorts_temp = set()
+            
+            for p in data:
+                amt = float(p["positionAmt"])
+                if amt > 0 and p["positionSide"] == "LONG":
+                    open_longs_temp.add(p["symbol"])
+                elif amt < 0 and p["positionSide"] == "SHORT":
+                    open_shorts_temp.add(p["symbol"])
+
+            active_longs = open_longs_temp
+            active_shorts = open_shorts_temp
+            
+            await tg(f"<b>Начальная загрузка позиций:</b>\nНайдено {len(active_longs)} LONG и {len(active_shorts)} SHORT позиций.")
     except Exception as e:
         await tg(f"<b>Ошибка при загрузке активных позиций:</b> {e}")
 
 
 # ================ ОКРУГЛЕНИЕ КОЛИЧЕСТВА =======================
 def fix_qty(symbol: str, qty: float) -> str:
-    """Округляет количество в зависимости от символа, учитывая точность Binance.
-    
-    ИСПРАВЛЕНИЕ: XRPUSDT перемещен в zero_prec, так как требует целого числа.
-    """
-    # Монеты, требующие нулевой точности (целые числа: мемкоины, 1000X токены, XRP и т.д.).
-    # Если возникает ошибка "Precision is over the maximum defined", добавьте сюда новый символ.
+    """Округляет количество в зависимости от символа, учитывая точность Binance."""
     zero_prec = ["DOGEUSDT","SHIBUSDT","PEPEUSDT","1000PEPEUSDT","BONKUSDT","FLOKIUSDT","1000SATSUSDT", "FARTCOINUSDT", "XRPUSDT"]
-    # Монеты, требующие точности 2 знака после запятой (SOL, ADA, MATIC, DOT, ATOM, BNB и т.д.)
     two_prec = ["SOLUSDT", "ADAUSDT", "TRXUSDT", "MATICUSDT", "DOTUSDT", "ATOMUSDT", "BNBUSDT"]
     
     if symbol in zero_prec:
-        # Используем int() для целого числа
         return str(int(qty))
     
     if symbol in two_prec:
-        # 2 знака после запятой
         return f"{qty:.2f}".rstrip("0").rstrip(".")
 
     # Для остальных пар (ETH, BCH) оставляем 3 знака по умолчанию
     return f"{qty:.3f}".rstrip("0").rstrip(".")
 
-# ================ ОТКРЫТИЕ LONG =======================
-async def open_long(sym: str):
-    # Преобразуем входящий символ (например, DOGE/USDT) в формат Binance (DOGEUSDT)
+# ================ ФУНКЦИИ ОТКРЫТИЯ =======================
+
+async def get_symbol_and_qty(sym: str) -> tuple[str, str, float] | None:
+    """Вспомогательная функция для получения символа, цены и рассчитанного количества."""
     symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
-
-    if symbol in active:
-        await tg(f"<b>{symbol}</b> — уже открыта (пропуск сигнала)")
-        return
-
-    # 1. Установка Cross Margin. 
-    await binance("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": "CROSS"})
     
-    # 2. Установка плеча
+    # 1. Установка Cross Margin и плеча
+    await binance("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": "CROSS"})
     await binance("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEV})
 
-    # 3. Расчет количества
+    # 2. Получение цены
     price_data = await binance("GET", "/fapi/v1/ticker/price", {"symbol": symbol}, signed=False)
     if not price_data or 'price' not in price_data:
         await tg(f"<b>Ошибка:</b> Не удалось получить цену для {symbol}")
-        return
+        return None
         
     price = float(price_data["price"])
-    # Расчет количества: (AMOUNT * LEVERAGE) / PRICE
     qty_f = AMOUNT * LEV / price
     qty_str = fix_qty(symbol, qty_f)
+    
+    return symbol, qty_str, price
 
-    # 4. Открытие LONG позиции (Market)
+async def open_long(sym: str):
+    # Преобразуем входящий символ (например, DOGE/USDT) в формат Binance (DOGEUSDT)
+    result = await get_symbol_and_qty(sym)
+    if not result: return
+
+    symbol, qty_str, price = result
+    
+    if symbol in active_longs:
+        await tg(f"<b>{symbol}</b> — LONG уже открыта (пропуск сигнала)")
+        return
+
+    # 3. Открытие LONG позиции (Market)
     order = await binance("POST", "/fapi/v1/order", {
         "symbol": symbol,
         "side": "BUY",
@@ -182,35 +186,74 @@ async def open_long(sym: str):
     })
 
     if order and order.get("orderId"):
-        active.add(symbol)
+        active_longs.add(symbol)
         
-        # 5. Размещение TRAILING_STOP_MARKET ордера
+        # 4. Размещение TRAILING_STOP_MARKET ордера (SELL для закрытия LONG)
         trailing_order = await binance("POST", "/fapi/v1/order", {
             "symbol": symbol, 
-            "side": "SELL", # Закрывает LONG позицию
+            "side": "SELL",
             "positionSide": "LONG",
             "type": "TRAILING_STOP_MARKET",
-            "quantity": qty_str, # Объем позиции
-            "callbackRate": TRAILING_RATE, # Процент отката
-            # Примечание: "reduceOnly" удален, чтобы избежать ошибки -1106,
-            # так как позиция открывается в режиме Hedge Mode.
+            "quantity": qty_str,
+            "callbackRate": TRAILING_RATE,
         })
 
         if trailing_order and trailing_order.get("orderId"):
             await tg(f"<b>LONG ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\n✅ TRAILING STOP ({TRAILING_RATE}%) УСТАНОВЛЕН")
         else:
-             # Если трейлинг-стоп не установился, все равно уведомляем об открытии позиции
-             await tg(f"<b>LONG ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\n⚠️ ОШИБКА УСТАНОВКИ TRAILING STOP (СМОТРИТЕ ЛОГ)")
+            await tg(f"<b>LONG ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\n⚠️ ОШИБКА УСТАНОВКИ TRAILING STOP (СМОТРИТЕ ЛОГ)")
+    else:
+        await tg(f"<b>Ошибка открытия LONG {symbol}</b>")
+
+# НОВАЯ ФУНКЦИЯ ДЛЯ ОТКРЫТИЯ SHORT
+async def open_short(sym: str):
+    # Преобразуем входящий символ (например, DOGE/USDT) в формат Binance (DOGEUSDT)
+    result = await get_symbol_and_qty(sym)
+    if not result: return
+
+    symbol, qty_str, price = result
+    
+    if symbol in active_shorts:
+        await tg(f"<b>{symbol}</b> — SHORT уже открыта (пропуск сигнала)")
+        return
+
+    # 3. Открытие SHORT позиции (Market)
+    order = await binance("POST", "/fapi/v1/order", {
+        "symbol": symbol,
+        "side": "SELL", # Продаем (открываем SHORT)
+        "positionSide": "SHORT", # SHORT позиция
+        "type": "MARKET",
+        "quantity": qty_str
+    })
+
+    if order and order.get("orderId"):
+        active_shorts.add(symbol)
+        
+        # 4. Размещение TRAILING_STOP_MARKET ордера (BUY для закрытия SHORT)
+        trailing_order = await binance("POST", "/fapi/v1/order", {
+            "symbol": symbol, 
+            "side": "BUY", # Покупаем (закрываем SHORT позицию)
+            "positionSide": "SHORT",
+            "type": "TRAILING_STOP_MARKET",
+            "quantity": qty_str,
+            "callbackRate": TRAILING_RATE,
+        })
+
+        if trailing_order and trailing_order.get("orderId"):
+            await tg(f"<b>SHORT ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\n✅ TRAILING STOP ({TRAILING_RATE}%) УСТАНОВЛЕН")
+        else:
+            await tg(f"<b>SHORT ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\n⚠️ ОШИБКА УСТАНОВКИ TRAILING STOP (СМОТРИТЕ ЛОГ)")
 
     else:
-        await tg(f"<b>Ошибка открытия {symbol}</b>")
+        await tg(f"<b>Ошибка открытия SHORT {symbol}</b>")
 
-# ================= ЗАКРЫТИЕ ПОЗИЦИИ ==========================
-async def close(sym: str):
-    # Преобразуем входящий символ (например, DOGE/USDT) в формат Binance (DOGEUSDT)
+
+# ================= ФУНКЦИИ ЗАКРЫТИЯ ==========================
+async def close_position(sym: str, position_side: str, active_set: Set[str]):
+    """Универсальная функция для закрытия LONG или SHORT позиции."""
     symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
     
-    # 1. Отмена всех активных ордеров (включая Trailing Stop) для данного символа
+    # 1. Отмена всех активных ордеров (включая Trailing Stop)
     await binance("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
     
     # 2. Проверка текущей позиции на бирже
@@ -219,29 +262,43 @@ async def close(sym: str):
         await tg(f"<b>{symbol}</b> — Не удалось получить данные о позиции.")
         return
     
-    # Ищем LONG позицию с количеством > 0
-    qty_str = next((p["positionAmt"] for p in pos_data if p["positionSide"] == "LONG" and float(p["positionAmt"]) > 0), None)
+    # Ищем позицию с указанным position_side
+    qty_str = next((p["positionAmt"] for p in pos_data if p["positionSide"] == position_side and abs(float(p["positionAmt"])) > 0), None)
     
-    if not qty_str or float(qty_str) <= 0:
+    if not qty_str or float(qty_str) == 0:
         # Если позиции нет, очищаем внутренний список и уведомляем
-        active.discard(symbol)
-        await tg(f"<b>{symbol}</b> — позиция уже закрыта на бирже")
+        active_set.discard(symbol)
+        await tg(f"<b>{position_side} {symbol}</b> — позиция уже закрыта на бирже")
         return
 
-    # 3. Закрытие LONG позиции (Market)
+    # Определяем сторону ордера для закрытия
+    # Для LONG (positionSide=LONG, positionAmt > 0) закрывающий ордер: SELL
+    # Для SHORT (positionSide=SHORT, positionAmt < 0) закрывающий ордер: BUY
+    close_side = "SELL" if position_side == "LONG" else "BUY"
+    
+    # Количество для закрытия должно быть положительным
+    qty_to_close = fix_qty(symbol, abs(float(qty_str)))
+
+    # 3. Закрытие позиции (Market)
     close_order = await binance("POST", "/fapi/v1/order", {
-        "symbol": symbol, # Важно: символ-специфичное закрытие
-        "side": "SELL",
-        "positionSide": "LONG",
+        "symbol": symbol,
+        "side": close_side,
+        "positionSide": position_side,
         "type": "MARKET",
-        "quantity": qty_str,
+        "quantity": qty_to_close,
     })
     
     if close_order and close_order.get("orderId"):
-        active.discard(symbol)
-        await tg(f"<b>CLOSE {symbol} УСПЕШНО</b>\n{qty_str} шт")
+        active_set.discard(symbol)
+        await tg(f"<b>CLOSE {position_side} {symbol} УСПЕШНО</b>\n{qty_to_close} шт")
     else:
-        await tg(f"<b>CRITICAL ERROR: Не удалось закрыть {symbol}</b>")
+        await tg(f"<b>CRITICAL ERROR: Не удалось закрыть {position_side} {symbol}</b>")
+
+async def close_long(sym: str):
+    await close_position(sym, "LONG", active_longs)
+
+async def close_short(sym: str):
+    await close_position(sym, "SHORT", active_shorts)
 
 # ================= FASTAPI ПРИЛОЖЕНИЕ =========================
 @asynccontextmanager
@@ -249,7 +306,7 @@ async def lifespan(app: FastAPI):
     # Загрузка активных позиций при старте
     await load_active_positions()
     
-    await tg("<b>OZ BOT 2025 — ONLINE</b>\nCross Mode | Hedge Mode FIXED\nTrailing Stop (TSL/TTP) АКТИВИРОВАН")
+    await tg("<b>OZ BOT 2025 — ONLINE (v1.1)</b>\nПОЛНАЯ ПОДДЕРЖКА LONG/SHORT АКТИВИРОВАНА.")
     yield
     await client.aclose() # Закрываем HTTP клиент при завершении работы
 
@@ -257,7 +314,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE</h1>")
+    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.1)</h1>")
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -271,15 +328,28 @@ async def webhook(request: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
     symbol = data.get("symbol", "").upper()
-    signal = data.get("signal", "").upper()
+    signal = data.get("signal", "").upper() # Здесь мы принимаем сигнал от сканера
 
     if not symbol or not signal:
         raise HTTPException(status_code=400, detail="Missing symbol or signal in payload")
 
-    # Запуск торговых операций в фоновом режиме
+    # ================== ИСПРАВЛЕННАЯ ЛОГИКА ОБРАБОТКИ СИГНАЛОВ ==================
     if signal == "LONG":
         asyncio.create_task(open_long(symbol))
-    elif signal == "CLOSE":
-        asyncio.create_task(close(symbol))
+    elif signal == "CLOSE_LONG": # Обрабатывает сигнал закрытия LONG от сканера
+        asyncio.create_task(close_long(symbol))
+    elif signal == "SHORT": # Обрабатывает сигнал открытия SHORT
+        asyncio.create_task(open_short(symbol))
+    elif signal == "CLOSE_SHORT": # Обрабатывает сигнал закрытия SHORT
+        asyncio.create_task(close_short(symbol))
+    else:
+        # Неизвестный сигнал
+        print(f"[WARNING] Получен неизвестный сигнал: {signal} для {symbol}")
+        return {"ok": False, "message": f"Unknown signal: {signal}"}
+    # ============================================================================
 
     return {"ok": True}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
