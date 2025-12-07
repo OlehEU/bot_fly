@@ -127,14 +127,13 @@ async def load_active_positions():
 def fix_qty(symbol: str, qty: float) -> str:
     """Округляет количество в зависимости от символа, учитывая точность Binance.
     
-    ИСПРАВЛЕНИЕ: Добавлена явная обработка для BNBUSDT, требующей 2 знака после запятой.
+    ИСПРАВЛЕНИЕ: XRPUSDT перемещен в zero_prec, так как требует целого числа.
     """
-    # Монеты, требующие нулевой точности (целые числа: мемкоины, 1000X токены и т.д.).
+    # Монеты, требующие нулевой точности (целые числа: мемкоины, 1000X токены, XRP и т.д.).
     # Если возникает ошибка "Precision is over the maximum defined", добавьте сюда новый символ.
-    zero_prec = ["DOGEUSDT","SHIBUSDT","PEPEUSDT","1000PEPEUSDT","BONKUSDT","FLOKIUSDT","1000SATSUSDT", "FARTCOINUSDT"]
-    # Монеты, требующие точности 2 знака после запятой (SOL, ADA, MATIC, DOT, ATOM, BNB, XRP и т.д.)
-    # ДОБАВЛЕН XRPUSDT
-    two_prec = ["SOLUSDT", "ADAUSDT", "TRXUSDT", "MATICUSDT", "DOTUSDT", "ATOMUSDT", "BNBUSDT", "XRPUSDT"]
+    zero_prec = ["DOGEUSDT","SHIBUSDT","PEPEUSDT","1000PEPEUSDT","BONKUSDT","FLOKIUSDT","1000SATSUSDT", "FARTCOINUSDT", "XRPUSDT"]
+    # Монеты, требующие точности 2 знака после запятой (SOL, ADA, MATIC, DOT, ATOM, BNB и т.д.)
+    two_prec = ["SOLUSDT", "ADAUSDT", "TRXUSDT", "MATICUSDT", "DOTUSDT", "ATOMUSDT", "BNBUSDT"]
     
     if symbol in zero_prec:
         # Используем int() для целого числа
