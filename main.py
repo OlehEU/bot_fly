@@ -132,8 +132,9 @@ def fix_qty(symbol: str, qty: float) -> str:
     # Монеты, требующие нулевой точности (целые числа: мемкоины, 1000X токены и т.д.).
     # Если возникает ошибка "Precision is over the maximum defined", добавьте сюда новый символ.
     zero_prec = ["DOGEUSDT","SHIBUSDT","PEPEUSDT","1000PEPEUSDT","BONKUSDT","FLOKIUSDT","1000SATSUSDT", "FARTCOINUSDT"]
-    # Монеты, требующие точности 2 знака после запятой (SOL, ADA, MATIC, DOT, ATOM, BNB и т.д.)
-    two_prec = ["SOLUSDT", "ADAUSDT", "TRXUSDT", "MATICUSDT", "DOTUSDT", "ATOMUSDT", "BNBUSDT"]
+    # Монеты, требующие точности 2 знака после запятой (SOL, ADA, MATIC, DOT, ATOM, BNB, XRP и т.д.)
+    # ДОБАВЛЕН XRPUSDT
+    two_prec = ["SOLUSDT", "ADAUSDT", "TRXUSDT", "MATICUSDT", "DOTUSDT", "ATOMUSDT", "BNBUSDT", "XRPUSDT"]
     
     if symbol in zero_prec:
         # Используем int() для целого числа
@@ -143,7 +144,7 @@ def fix_qty(symbol: str, qty: float) -> str:
         # 2 знака после запятой
         return f"{qty:.2f}".rstrip("0").rstrip(".")
 
-    # Для остальных пар (ETH, XRP) оставляем 3 знака по умолчанию
+    # Для остальных пар (ETH, BCH) оставляем 3 знака по умолчанию
     return f"{qty:.3f}".rstrip("0").rstrip(".")
 
 # ================ ОТКРЫТИЕ LONG =======================
