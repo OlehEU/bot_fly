@@ -130,18 +130,30 @@ async def load_active_positions():
 
 # ================ ОКРУГЛЕНИЕ КОЛИЧЕСТВА =======================
 def fix_qty(symbol: str, qty: float) -> str:
-    """Округляет количество в зависимости от символа, учитывая точность Binance."""
-    # ОБНОВЛЕНО: Добавлен NEARUSDT
-    zero_prec = ["DOGEUSDT","SHIBUSDT","PEPEUSDT","1000PEPEUSDT","BONKUSDT","FLOKIUSDT","1000SATSUSDT", "FARTCOINUSDT", "XRPUSDT", "NEARUSDT"]
-    two_prec = ["SOLUSDT", "ADAUSDT", "TRXUSDT", "MATICUSDT", "DOTUSDT", "ATOMUSDT", "BNBUSDT"]
+    """
+    Округляет количество в зависимости от символа, учитывая точность Binance.
+    Обновлено: Списки содержат только монеты, предоставленные пользователем.
+    """
+    # Список пар, где количество должно быть ЦЕЛЫМ числом (0 знаков)
+    zero_prec = [
+        "DOGEUSDT", "1000SHIBUSDT", "1000PEPEUSDT", "1000BONKUSDT", 
+        "1000FLOKIUSDT", "1000SATSUSDT", "FARTCOINUSDT", "XRPUSDT", 
+        "NEARUSDT", "BTTUSDT"
+    ]
+    # Список пар, где количество округляется до 2-х знаков
+    two_prec = [
+        "SOLUSDT", "ADAUSDT", "TRXUSDT", "MATICUSDT", "DOTUSDT", 
+        "ATOMUSDT", "BNBUSDT", "LINKUSDT", "AVAXUSDT"
+    ]
     
-    if symbol in zero_prec:
+    if symbol.upper() in zero_prec:
+        # Для этих пар количество должно быть целым числом
         return str(int(qty))
     
-    if symbol in two_prec:
+    if symbol.upper() in two_prec:
         return f"{qty:.2f}".rstrip("0").rstrip(".")
 
-    # Для остальных пар (ETH, BCH) оставляем 3 знака по умолчанию
+    # Для остальных пар (ETHUSDT, MASKUSDT, PIPPINUSDT) оставляем 3 знака по умолчанию. 
     return f"{qty:.3f}".rstrip("0").rstrip(".")
 
 # ================ ФУНКЦИИ ОТКРЫТИЯ =======================
