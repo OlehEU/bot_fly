@@ -1,5 +1,5 @@
 # =========================================================================================
-# OZ TRADING BOT 2025 v1.1.4 | БЕЗОПАСНОЕ ЛОГИРОВАНИЕ ОШИБОК BINANCE
+# OZ TRADING BOT 2025 v1.1.5 | КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: СИНХРОНИЗАЦИЯ ПОЗИЦИЙ
 # =========================================================================================
 import os
 import time
@@ -116,21 +116,24 @@ async def load_active_positions():
     global active_longs, active_shorts
     try:
         data = await binance("GET", "/fapi/v2/positionRisk", signed=True)
-        if data:
+        if data and isinstance(data, list):
             open_longs_temp = set()
             open_shorts_temp = set()
             
             for p in data:
-                amt = float(p["positionAmt"])
-                if amt > 0 and p["positionSide"] == "LONG":
+                amt = float(p.get("positionAmt", 0))
+                if amt > 0 and p.get("positionSide") == "LONG":
                     open_longs_temp.add(p["symbol"])
-                elif amt < 0 and p["positionSide"] == "SHORT":
+                elif amt < 0 and p.get("positionSide") == "SHORT":
                     open_shorts_temp.add(p["symbol"])
 
             active_longs = open_longs_temp
             active_shorts = open_shorts_temp
             
             await tg(f"<b>Начальная загрузка позиций:</b>\nНайдено {len(active_longs)} LONG и {len(active_shorts)} SHORT позиций.")
+        elif data:
+            # Лог, если binance вернула не список, а текст ошибки (например, HTML)
+             await tg(f"<b>Ошибка при загрузке активных позиций:</b> Некорректный ответ Binance:\n<pre>{str(data)[:1500]}</pre>")
     except Exception as e:
         await tg(f"<b>Ошибка при загрузке активных позиций:</b> {e}")
 
@@ -139,18 +142,17 @@ async def load_active_positions():
 def fix_qty(symbol: str, qty: float) -> str:
     """
     Округляет количество в зависимости от символа, учитывая точность Binance.
-    ИСПРАВЛЕНО: AVAXUSDT и NEARUSDT перенесены в группу по умолчанию (3 знака).
     """
     # Список пар, где количество должно быть ЦЕЛЫМ числом (0 знаков)
     zero_prec = [
         "DOGEUSDT", "1000SHIBUSDT", "1000PEPEUSDT", "1000BONKUSDT", 
         "1000FLOKIUSDT", "1000SATSUSDT", "FARTCOINUSDT", "XRPUSDT", 
-        "BTTUSDT" # NEARUSDT УДАЛЕН ИЗ ЭТОГО СПИСКА
+        "BTTUSDT"
     ]
     # Список пар, где количество округляется до 2-х знаков
     two_prec = [
         "SOLUSDT", "ADAUSDT", "TRXUSDT", "MATICUSDT", "DOTUSDT", 
-        "ATOMUSDT", "BNBUSDT", "LINKUSDT" # AVAXUSDT УДАЛЕН ИЗ ЭТОГО СПИСКА
+        "ATOMUSDT", "BNBUSDT", "LINKUSDT"
     ]
     
     if symbol.upper() in zero_prec:
@@ -160,7 +162,7 @@ def fix_qty(symbol: str, qty: float) -> str:
     if symbol.upper() in two_prec:
         return f"{qty:.2f}".rstrip("0").rstrip(".")
 
-    # Для остальных пар (ETHUSDT, MASKUSDT, PIPPINUSDT, AVAXUSDT, NEARUSDT) оставляем 3 знака по умолчанию. 
+    # Для остальных пар (включая AVAXUSDT, NEARUSDT) оставляем 3 знака по умолчанию. 
     return f"{qty:.3f}".rstrip("0").rstrip(".")
 
 # ================ ФУНКЦИИ ОТКРЫТИЯ =======================
@@ -186,15 +188,33 @@ async def get_symbol_and_qty(sym: str) -> tuple[str, str, float] | None:
     return symbol, qty_str, price
 
 async def open_long(sym: str):
-    # Преобразуем входящий символ (например, DOGE/USDT) в формат Binance (DOGEUSDT)
     result = await get_symbol_and_qty(sym)
     if not result: return
 
     symbol, qty_str, price = result
     
-    if symbol in active_longs:
-        await tg(f"<b>{symbol}</b> — LONG уже открыта (пропуск сигнала)")
+    # === ИСПРАВЛЕНИЕ V1.1.5: СИНХРОНИЗАЦИЯ С БИРЖЕЙ ПЕРЕД ОТКРЫТИЕМ ===
+    pos_data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+    is_open_on_exchange = False
+    
+    if pos_data and isinstance(pos_data, list):
+        # Ищем активную LONG позицию (positionAmt > 0)
+        existing_long = next((p for p in pos_data if p.get("positionSide") == "LONG" and float(p.get("positionAmt", 0)) > 0), None)
+        
+        if existing_long:
+            is_open_on_exchange = True
+            
+    if is_open_on_exchange:
+        # 1. СИНХРОНИЗАЦИЯ: Добавляем в set и пропускаем, если позиция уже открыта на бирже.
+        active_longs.add(symbol) 
+        # Используем данные с биржи, если они есть, для точного лога
+        amt_str = existing_long.get('positionAmt', 'N/A') if existing_long else 'N/A'
+        await tg(f"<b>{symbol}</b> — LONG уже открыта на бирже ({amt_str} шт). Пропуск сигнала.")
         return
+
+    # 2. СИНХРОНИЗАЦИЯ: Удаляем из set, если позиция закрыта на бирже (исправляем баг).
+    active_longs.discard(symbol) 
+    # =================================================================
 
     # 3. Открытие LONG позиции (Market)
     order = await binance("POST", "/fapi/v1/order", {
@@ -209,7 +229,6 @@ async def open_long(sym: str):
         active_longs.add(symbol)
         
         # 4. Размещение TRAILING_STOP_MARKET ордера (SELL для закрытия LONG)
-        # ИСПРАВЛЕНИЕ v1.1.1: Используем /fapi/v1/order/algo для Trailing Stop
         trailing_order = await binance("POST", "/fapi/v1/order/algo", { 
             "symbol": symbol, 
             "side": "SELL",
@@ -222,14 +241,12 @@ async def open_long(sym: str):
         if trailing_order and (isinstance(trailing_order, dict) and trailing_order.get("orderId")):
             await tg(f"<b>LONG ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\n✅ TRAILING STOP ({TRAILING_RATE}%) УСТАНОВЛЕН")
         else:
-            # ИСПРАВЛЕНИЕ v1.1.4: Безопасное логирование ответа Binance
+            # Безопасное логирование ответа Binance
             log_detail = str(trailing_order) if trailing_order else "Пустой или None ответ от Binance"
             
-            # Проверяем, не является ли ответ HTML-мусором (начинается с <)
-            if log_detail.strip().startswith("<"):
+            if isinstance(log_detail, str) and log_detail.strip().startswith("<"):
                  log_text = f"ОТВЕТ В ФОРМАТЕ HTML. Обрезан лог: {log_detail[:100]}..."
             else:
-                 # Если это JSON-ответ или чистый текст ошибки, отправляем полный лог
                  log_text = log_detail
             
             await tg(f"<b>LONG ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\n⚠️ ОШИБКА УСТАНОВКИ TRAILING STOP (СМОТРИТЕ ЛОГ)\n<pre>{log_text}</pre>")
@@ -238,15 +255,33 @@ async def open_long(sym: str):
 
 # НОВАЯ ФУНКЦИЯ ДЛЯ ОТКРЫТИЯ SHORT
 async def open_short(sym: str):
-    # Преобразуем входящий символ (например, DOGE/USDT) в формат Binance (DOGEUSDT)
     result = await get_symbol_and_qty(sym)
     if not result: return
 
     symbol, qty_str, price = result
     
-    if symbol in active_shorts:
-        await tg(f"<b>{symbol}</b> — SHORT уже открыта (пропуск сигнала)")
+    # === ИСПРАВЛЕНИЕ V1.1.5: СИНХРОНИЗАЦИЯ С БИРЖЕЙ ПЕРЕД ОТКРЫТИЕМ ===
+    pos_data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+    is_open_on_exchange = False
+    
+    if pos_data and isinstance(pos_data, list):
+        # Ищем активную SHORT позицию (positionAmt < 0)
+        existing_short = next((p for p in pos_data if p.get("positionSide") == "SHORT" and float(p.get("positionAmt", 0)) < 0), None)
+        
+        if existing_short:
+            is_open_on_exchange = True
+
+    if is_open_on_exchange:
+        # 1. СИНХРОНИЗАЦИЯ: Добавляем в set и пропускаем, если позиция уже открыта на бирже.
+        active_shorts.add(symbol) 
+        # Используем данные с биржи, если они есть, для точного лога
+        amt_str = existing_short.get('positionAmt', 'N/A') if existing_short else 'N/A'
+        await tg(f"<b>{symbol}</b> — SHORT уже открыта на бирже ({amt_str} шт). Пропуск сигнала.")
         return
+
+    # 2. СИНХРОНИЗАЦИЯ: Удаляем из set, если позиция закрыта на бирже (исправляем баг).
+    active_shorts.discard(symbol) 
+    # =================================================================
 
     # 3. Открытие SHORT позиции (Market)
     order = await binance("POST", "/fapi/v1/order", {
@@ -261,7 +296,6 @@ async def open_short(sym: str):
         active_shorts.add(symbol)
         
         # 4. Размещение TRAILING_STOP_MARKET ордера (BUY для закрытия SHORT)
-        # ИСПРАВЛЕНИЕ v1.1.1: Используем /fapi/v1/order/algo для Trailing Stop
         trailing_order = await binance("POST", "/fapi/v1/order/algo", { 
             "symbol": symbol, 
             "side": "BUY", # Покупаем (закрываем SHORT позицию)
@@ -274,14 +308,12 @@ async def open_short(sym: str):
         if trailing_order and (isinstance(trailing_order, dict) and trailing_order.get("orderId")):
             await tg(f"<b>SHORT ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\n✅ TRAILING STOP ({TRAILING_RATE}%) УСТАНОВЛЕН")
         else:
-            # ИСПРАВЛЕНИЕ v1.1.4: Безопасное логирование ответа Binance
+            # Безопасное логирование ответа Binance
             log_detail = str(trailing_order) if trailing_order else "Пустой или None ответ от Binance"
             
-            # Проверяем, не является ли ответ HTML-мусором (начинается с <)
-            if log_detail.strip().startswith("<"):
+            if isinstance(log_detail, str) and log_detail.strip().startswith("<"):
                  log_text = f"ОТВЕТ В ФОРМАТЕ HTML. Обрезан лог: {log_detail[:100]}..."
             else:
-                 # Если это JSON-ответ или чистый текст ошибки, отправляем полный лог
                  log_text = log_detail
 
             await tg(f"<b>SHORT ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\n⚠️ ОШИБКА УСТАНОВКИ TRAILING STOP (СМОТРИТЕ ЛОГ)\n<pre>{log_text}</pre>")
@@ -314,8 +346,6 @@ async def close_position(sym: str, position_side: str, active_set: Set[str]):
         return
 
     # Определяем сторону ордера для закрытия
-    # Для LONG (positionSide=LONG, positionAmt > 0) закрывающий ордер: SELL
-    # Для SHORT (positionSide=SHORT, positionAmt < 0) закрывающий ордер: BUY
     close_side = "SELL" if position_side == "LONG" else "BUY"
     
     # Количество для закрытия должно быть положительным
@@ -348,7 +378,7 @@ async def lifespan(app: FastAPI):
     # Загрузка активных позиций при старте
     await load_active_positions()
     
-    await tg("<b>OZ BOT 2025 — ONLINE (v1.1.4)</b>\nИсправлена точность NEARUSDT и ошибка парсинга логов.")
+    await tg("<b>OZ BOT 2025 — ONLINE (v1.1.5)</b>\nИсправлена критическая ошибка: синхронизация позиций с биржей.")
     yield
     await client.aclose() # Закрываем HTTP клиент при завершении работы
 
@@ -356,7 +386,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.1.4)</h1>")
+    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.1.5)</h1>")
 
 @app.post("/webhook")
 async def webhook(request: Request):
