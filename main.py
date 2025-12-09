@@ -1,5 +1,5 @@
 # =========================================================================================
-# OZ TRADING BOT 2025 v1.1.8 | ДИНАМИЧЕСКАЯ ТОЧНОСТЬ И СИНХРОНИЗАЦИЯ
+# OZ TRADING BOT 2025 v1.2.0 | ИСПРАВЛЕНИЕ: ДОБАВЛЕНИЕ activationPrice ДЛЯ TRAILING STOP
 # =========================================================================================
 import os
 import time
@@ -18,7 +18,6 @@ from contextlib import asynccontextmanager
 required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "BINANCE_API_KEY", "BINANCE_API_SECRET", "WEBHOOK_SECRET"]
 for v in required:
     if not os.getenv(v):
-        # В случае отсутствия переменной, прерываем выполнение
         raise ValueError(f"Нет переменной окружения: {v}")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -36,7 +35,7 @@ TRAILING_RATE = float(os.getenv("TRAILING_RATE", "0.5")) # Процент отк
 
 # Инициализация Telegram и HTTP клиента
 bot = Bot(token=TELEGRAM_TOKEN)
-client = httpx.AsyncClient(timeout=20)
+client = httpx.AsyncClient(timeout=30) # Таймаут увеличен до 30 секунд
 BASE = "https://fapi.binance.com"
 
 # ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
@@ -199,7 +198,7 @@ async def get_symbol_and_qty(sym: str) -> tuple[str, str, float] | None:
     qty_f = AMOUNT * LEV / price
     qty_str = fix_qty(symbol, qty_f)
     
-    return symbol, qty_str, price
+    return symbol, qty_str, price 
 
 async def open_long(sym: str):
     result = await get_symbol_and_qty(sym)
@@ -207,7 +206,7 @@ async def open_long(sym: str):
 
     symbol, qty_str, price = result
     
-    # === СИНХРОНИЗАЦИЯ С БИРЖЕЙ ПЕРЕД ОТКРЫТИЕМ (v1.1.5) ===
+    # === СИНХРОНИЗАЦИЯ С БИРЖЕЙ ПЕРЕД ОТКРЫТИЕМ ===
     pos_data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     is_open_on_exchange = False
     existing_long = None
@@ -238,9 +237,13 @@ async def open_long(sym: str):
     if order and order.get("orderId"):
         active_longs.add(symbol)
         
-        # --- ДЕТАЛЬНЫЙ ЛОГ ДЛЯ TRAILING STOP (v1.1.8) ---
-        await tg(f"<b>LONG ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\nПопытка установить Trailing Stop. QTY: <code>{qty_str}</code>")
-        # --- КОНЕЦ ДЕТАЛЬНОГО ЛОГА ---
+        # --- ПАРАМЕТРЫ ДЛЯ TRAILING STOP (v1.2.0) ---
+        rate_str = str(TRAILING_RATE) 
+        # Цена активации - текущая рыночная цена
+        activation_price_str = f"{price:.8f}".rstrip("0").rstrip(".") 
+        
+        await tg(f"<b>LONG ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\nПопытка установить Trailing Stop. QTY: <code>{qty_str}</code>, RATE: <code>{rate_str}</code>, Activation: <code>{activation_price_str}</code>")
+        # --- КОНЕЦ ЛОГА ---
 
         # 4. Размещение TRAILING_STOP_MARKET ордера (SELL для закрытия LONG)
         trailing_order = await binance("POST", "/fapi/v1/order/algo", { 
@@ -249,7 +252,8 @@ async def open_long(sym: str):
             "positionSide": "LONG",
             "type": "TRAILING_STOP_MARKET",
             "quantity": qty_str,
-            "callbackRate": TRAILING_RATE,
+            "callbackRate": rate_str,
+            "activationPrice": activation_price_str, # <--- ДОБАВЛЕНО
         })
 
         if trailing_order and (isinstance(trailing_order, dict) and trailing_order.get("orderId")):
@@ -273,7 +277,7 @@ async def open_short(sym: str):
 
     symbol, qty_str, price = result
     
-    # === СИНХРОНИЗАЦИЯ С БИРЖЕЙ ПЕРЕД ОТКРЫТИЕМ (v1.1.5) ===
+    # === СИНХРОНИЗАЦИЯ С БИРЖЕЙ ПЕРЕД ОТКРЫТИЕМ ===
     pos_data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     is_open_on_exchange = False
     existing_short = None
@@ -304,9 +308,12 @@ async def open_short(sym: str):
     if order and order.get("orderId"):
         active_shorts.add(symbol)
         
-        # --- ДЕТАЛЬНЫЙ ЛОГ ДЛЯ TRAILING STOP (v1.1.8) ---
-        await tg(f"<b>SHORT ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\nПопытка установить Trailing Stop. QTY: <code>{qty_str}</code>")
-        # --- КОНЕЦ ДЕТАЛЬНОГО ЛОГА ---
+        # --- ПАРАМЕТРЫ ДЛЯ TRAILING STOP (v1.2.0) ---
+        rate_str = str(TRAILING_RATE)
+        activation_price_str = f"{price:.8f}".rstrip("0").rstrip(".") 
+
+        await tg(f"<b>SHORT ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\nПопытка установить Trailing Stop. QTY: <code>{qty_str}</code>, RATE: <code>{rate_str}</code>, Activation: <code>{activation_price_str}</code>")
+        # --- КОНЕЦ ЛОГА ---
 
         # 4. Размещение TRAILING_STOP_MARKET ордера (BUY для закрытия SHORT)
         trailing_order = await binance("POST", "/fapi/v1/order/algo", { 
@@ -315,7 +322,8 @@ async def open_short(sym: str):
             "positionSide": "SHORT",
             "type": "TRAILING_STOP_MARKET",
             "quantity": qty_str,
-            "callbackRate": TRAILING_RATE,
+            "callbackRate": rate_str,
+            "activationPrice": activation_price_str, # <--- ДОБАВЛЕНО
         })
 
         if trailing_order and (isinstance(trailing_order, dict) and trailing_order.get("orderId")):
@@ -392,7 +400,7 @@ async def lifespan(app: FastAPI):
     # 2. Загрузка активных позиций
     await load_active_positions()
     
-    await tg("<b>OZ BOT 2025 — ONLINE (v1.1.8)</b>\nВнедрены динамическая точность и синхронизация позиций.")
+    await tg("<b>OZ BOT 2025 — ONLINE (v1.2.0)</b>\nДобавлено явное указание activationPrice для Trailing Stop.")
     yield
     await client.aclose() 
 
@@ -400,7 +408,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.1.8)</h1>")
+    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.2.0)</h1>")
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -437,4 +445,5 @@ async def webhook(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
+    # Важно: Host=0.0.0.0 для работы в контейнере (Fly.io)
     uvicorn.run(app, host="0.0.0.0", port=8000)
