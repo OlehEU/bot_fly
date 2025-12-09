@@ -1,5 +1,5 @@
 # =========================================================================================
-# OZ TRADING BOT 2025 v1.1.5 | КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: СИНХРОНИЗАЦИЯ ПОЗИЦИЙ
+# OZ TRADING BOT 2025 v1.1.7 | КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: ДИНАМИЧЕСКАЯ ТОЧНОСТЬ
 # =========================================================================================
 import os
 import time
@@ -38,6 +38,9 @@ TRAILING_RATE = float(os.getenv("TRAILING_RATE", "0.5")) # Процент отк
 bot = Bot(token=TELEGRAM_TOKEN)
 client = httpx.AsyncClient(timeout=20)
 BASE = "https://fapi.binance.com"
+
+# НОВАЯ ГЛОБАЛЬНАЯ ПЕРЕМЕННАЯ: Словарь для хранения точности количества по символам
+symbol_precision: Dict[str, int] = {} 
 
 # Множества для отслеживания активных позиций (для пропуска повторных сигналов)
 active_longs: Set[str] = set() # Активные LONG-позиции
@@ -109,6 +112,42 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
         await tg(f"<b>CRITICAL ERROR</b>\n{str(e)[:3800]}")
         return None
 
+# ================ ЗАГРУЗКА ИНФОРМАЦИИ О БИРЖЕ (ДЛЯ ТОЧНОСТИ) ====================
+def calculate_precision_from_stepsize(step_size: str) -> int:
+    """Вычисляет необходимое количество знаков после запятой из stepSize."""
+    # Удаляем незначащие нули и проверяем, есть ли точка.
+    s = step_size.rstrip('0')
+    if '.' not in s:
+        return 0
+    # Возвращаем количество знаков после точки
+    return len(s.split('.')[-1])
+
+async def load_exchange_info():
+    """Загружает точность (precision) для всех символов с Binance."""
+    global symbol_precision
+    try:
+        data = await binance("GET", "/fapi/v1/exchangeInfo", signed=False)
+        
+        if not data or not isinstance(data, dict) or 'symbols' not in data:
+            await tg("<b>Ошибка:</b> Не удалось загрузить информацию о бинарных символах.")
+            return
+
+        for symbol_info in data['symbols']:
+            sym = symbol_info['symbol']
+            
+            # Ищем фильтр LOT_SIZE для определения точности количества
+            lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
+            
+            if lot_size_filter:
+                step_size = lot_size_filter['stepSize']
+                precision = calculate_precision_from_stepsize(step_size)
+                symbol_precision[sym] = precision
+        
+        await tg(f"<b>Загружена информация о бинарных символах:</b> Точность определена для {len(symbol_precision)} пар.")
+
+    except Exception as e:
+        await tg(f"<b>Критическая ошибка при загрузке exchangeInfo:</b> {e}")
+
 
 # ================ ЗАГРУЗКА АКТИВНЫХ ПОЗИЦИЙ ====================
 async def load_active_positions():
@@ -141,29 +180,16 @@ async def load_active_positions():
 # ================ ОКРУГЛЕНИЕ КОЛИЧЕСТВА =======================
 def fix_qty(symbol: str, qty: float) -> str:
     """
-    Округляет количество в зависимости от символа, учитывая точность Binance.
+    Округляет количество в зависимости от динамически загруженной точности Binance.
     """
-    # Список пар, где количество должно быть ЦЕЛЫМ числом (0 знаков)
-    zero_prec = [
-        "DOGEUSDT", "1000SHIBUSDT", "1000PEPEUSDT", "1000BONKUSDT", 
-        "1000FLOKIUSDT", "1000SATSUSDT", "FARTCOINUSDT", "XRPUSDT", 
-        "BTTUSDT"
-    ]
-    # Список пар, где количество округляется до 2-х знаков
-    two_prec = [
-        "SOLUSDT", "ADAUSDT", "TRXUSDT", "MATICUSDT", "DOTUSDT", 
-        "ATOMUSDT", "BNBUSDT", "LINKUSDT"
-    ]
-    
-    if symbol.upper() in zero_prec:
-        # Для этих пар количество должно быть целым числом
+    # Получаем точность из глобального словаря. Если нет (новая или необычная пара), используем 3 по умолчанию.
+    precision = symbol_precision.get(symbol.upper(), 3)
+
+    if precision == 0:
         return str(int(qty))
     
-    if symbol.upper() in two_prec:
-        return f"{qty:.2f}".rstrip("0").rstrip(".")
-
-    # Для остальных пар (включая AVAXUSDT, NEARUSDT) оставляем 3 знака по умолчанию. 
-    return f"{qty:.3f}".rstrip("0").rstrip(".")
+    # Форматирование: f"{qty:.{precision}f}"
+    return f"{qty:.{precision}f}".rstrip("0").rstrip(".")
 
 # ================ ФУНКЦИИ ОТКРЫТИЯ =======================
 
@@ -193,9 +219,10 @@ async def open_long(sym: str):
 
     symbol, qty_str, price = result
     
-    # === ИСПРАВЛЕНИЕ V1.1.5: СИНХРОНИЗАЦИЯ С БИРЖЕЙ ПЕРЕД ОТКРЫТИЕМ ===
+    # === СИНХРОНИЗАЦИЯ С БИРЖЕЙ ПЕРЕД ОТКРЫТИЕМ ===
     pos_data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     is_open_on_exchange = False
+    existing_long = None
     
     if pos_data and isinstance(pos_data, list):
         # Ищем активную LONG позицию (positionAmt > 0)
@@ -207,7 +234,6 @@ async def open_long(sym: str):
     if is_open_on_exchange:
         # 1. СИНХРОНИЗАЦИЯ: Добавляем в set и пропускаем, если позиция уже открыта на бирже.
         active_longs.add(symbol) 
-        # Используем данные с биржи, если они есть, для точного лога
         amt_str = existing_long.get('positionAmt', 'N/A') if existing_long else 'N/A'
         await tg(f"<b>{symbol}</b> — LONG уже открыта на бирже ({amt_str} шт). Пропуск сигнала.")
         return
@@ -260,9 +286,10 @@ async def open_short(sym: str):
 
     symbol, qty_str, price = result
     
-    # === ИСПРАВЛЕНИЕ V1.1.5: СИНХРОНИЗАЦИЯ С БИРЖЕЙ ПЕРЕД ОТКРЫТИЕМ ===
+    # === СИНХРОНИЗАЦИЯ С БИРЖЕЙ ПЕРЕД ОТКРЫТИЕМ ===
     pos_data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     is_open_on_exchange = False
+    existing_short = None
     
     if pos_data and isinstance(pos_data, list):
         # Ищем активную SHORT позицию (positionAmt < 0)
@@ -274,7 +301,6 @@ async def open_short(sym: str):
     if is_open_on_exchange:
         # 1. СИНХРОНИЗАЦИЯ: Добавляем в set и пропускаем, если позиция уже открыта на бирже.
         active_shorts.add(symbol) 
-        # Используем данные с биржи, если они есть, для точного лога
         amt_str = existing_short.get('positionAmt', 'N/A') if existing_short else 'N/A'
         await tg(f"<b>{symbol}</b> — SHORT уже открыта на бирже ({amt_str} шт). Пропуск сигнала.")
         return
@@ -375,10 +401,13 @@ async def close_short(sym: str):
 # ================= FASTAPI ПРИЛОЖЕНИЕ =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Загрузка активных позиций при старте
+    # 1. Загрузка информации о бинарных символах (Точность) - НОВОЕ!
+    await load_exchange_info()
+    
+    # 2. Загрузка активных позиций
     await load_active_positions()
     
-    await tg("<b>OZ BOT 2025 — ONLINE (v1.1.5)</b>\nИсправлена критическая ошибка: синхронизация позиций с биржей.")
+    await tg("<b>OZ BOT 2025 — ONLINE (v1.1.7)</b>\nВнедрена динамическая загрузка точности (Precision) с Binance!")
     yield
     await client.aclose() # Закрываем HTTP клиент при завершении работы
 
@@ -386,7 +415,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.1.5)</h1>")
+    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.1.7)</h1>")
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -405,7 +434,7 @@ async def webhook(request: Request):
     if not symbol or not signal:
         raise HTTPException(status_code=400, detail="Missing symbol or signal in payload")
 
-    # ================== ИСПРАВЛЕННАЯ ЛОГИКА ОБРАБОТКИ СИГНАЛОВ ==================
+    # ================== ЛОГИКА ОБРАБОТКИ СИГНАЛОВ ==================
     if signal == "LONG":
         asyncio.create_task(open_long(symbol))
     elif signal == "CLOSE_LONG": # Обрабатывает сигнал закрытия LONG от сканера
