@@ -1,5 +1,5 @@
 # =========================================================================================
-# OZ TRADING BOT 2025 v1.2.0 | ИСПРАВЛЕНИЕ: ДОБАВЛЕНИЕ activationPrice ДЛЯ TRAILING STOP
+# OZ TRADING BOT 2025 v1.2.1 | ИСПРАВЛЕНИЕ: ПРИНУДИТЕЛЬНАЯ ТОЧНОСТЬ callbackRate
 # =========================================================================================
 import os
 import time
@@ -35,21 +35,28 @@ TRAILING_RATE = float(os.getenv("TRAILING_RATE", "0.5")) # Процент отк
 
 # Инициализация Telegram и HTTP клиента
 bot = Bot(token=TELEGRAM_TOKEN)
-client = httpx.AsyncClient(timeout=30) # Таймаут увеличен до 30 секунд
+client = httpx.AsyncClient(timeout=30) # Таймаут 30 секунд
 BASE = "https://fapi.binance.com"
 
 # ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
-symbol_precision: Dict[str, int] = {} # Словарь для хранения динамической точности количества
-active_longs: Set[str] = set() # Активные LONG-позиции
-active_shorts: Set[str] = set() # Активные SHORT-позиции
+symbol_precision: Dict[str, int] = {} 
+active_longs: Set[str] = set() 
+active_shorts: Set[str] = set() 
 
 # ================= TELEGRAM УВЕДОМЛЕНИЯ =====================
 async def tg(text: str):
-    """Отправляет сообщение в Telegram, используя HTML форматирование."""
+    """Отправляет сообщение в Telegram, используя HTML форматирование. 
+       Если сообщение содержит ошибку HTML, оно будет отправлено без форматирования."""
     try:
         await bot.send_message(CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
-        print(f"[ERROR] Telegram send failed: {e}")
+        # В случае ошибки парсинга (например, если Binance вернул HTML), отправляем как есть.
+        print(f"[ERROR] Telegram send failed (HTML parse error). Sending as plain text: {e}")
+        try:
+             # Попытка отправить как plain text
+             await bot.send_message(CHAT_ID, text, disable_web_page_preview=True)
+        except Exception as plain_e:
+             print(f"[CRITICAL ERROR] Telegram send failed even as plain text: {plain_e}")
 
 # ================= BINANCE API ЗАПРОСЫ ====================
 async def binance(method: str, path: str, params: Dict | None = None, signed: bool = True):
@@ -100,6 +107,7 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
         try:
             return r.json()
         except Exception:
+            # Если статус 200, но это не JSON (например, HTML-страница ошибки Binance)
             return r.text
             
     except Exception as e:
@@ -237,8 +245,9 @@ async def open_long(sym: str):
     if order and order.get("orderId"):
         active_longs.add(symbol)
         
-        # --- ПАРАМЕТРЫ ДЛЯ TRAILING STOP (v1.2.0) ---
-        rate_str = str(TRAILING_RATE) 
+        # --- ПАРАМЕТРЫ ДЛЯ TRAILING STOP (v1.2.1) ---
+        # Форматируем rate с двумя знаками после запятой (0.5 -> 0.50)
+        rate_str = f"{TRAILING_RATE:.2f}" 
         # Цена активации - текущая рыночная цена
         activation_price_str = f"{price:.8f}".rstrip("0").rstrip(".") 
         
@@ -252,8 +261,8 @@ async def open_long(sym: str):
             "positionSide": "LONG",
             "type": "TRAILING_STOP_MARKET",
             "quantity": qty_str,
-            "callbackRate": rate_str,
-            "activationPrice": activation_price_str, # <--- ДОБАВЛЕНО
+            "callbackRate": rate_str, # <--- ИСПРАВЛЕНО ФОРМАТИРОВАНИЕ
+            "activationPrice": activation_price_str, 
         })
 
         if trailing_order and (isinstance(trailing_order, dict) and trailing_order.get("orderId")):
@@ -308,8 +317,9 @@ async def open_short(sym: str):
     if order and order.get("orderId"):
         active_shorts.add(symbol)
         
-        # --- ПАРАМЕТРЫ ДЛЯ TRAILING STOP (v1.2.0) ---
-        rate_str = str(TRAILING_RATE)
+        # --- ПАРАМЕТРЫ ДЛЯ TRAILING STOP (v1.2.1) ---
+        # Форматируем rate с двумя знаками после запятой (0.5 -> 0.50)
+        rate_str = f"{TRAILING_RATE:.2f}"
         activation_price_str = f"{price:.8f}".rstrip("0").rstrip(".") 
 
         await tg(f"<b>SHORT ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\nПопытка установить Trailing Stop. QTY: <code>{qty_str}</code>, RATE: <code>{rate_str}</code>, Activation: <code>{activation_price_str}</code>")
@@ -322,8 +332,8 @@ async def open_short(sym: str):
             "positionSide": "SHORT",
             "type": "TRAILING_STOP_MARKET",
             "quantity": qty_str,
-            "callbackRate": rate_str,
-            "activationPrice": activation_price_str, # <--- ДОБАВЛЕНО
+            "callbackRate": rate_str, # <--- ИСПРАВЛЕНО ФОРМАТИРОВАНИЕ
+            "activationPrice": activation_price_str, 
         })
 
         if trailing_order and (isinstance(trailing_order, dict) and trailing_order.get("orderId")):
@@ -394,13 +404,10 @@ async def close_short(sym: str):
 # ================= FASTAPI ПРИЛОЖЕНИЕ =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Загрузка информации о бинарных символах (Точность)
     await load_exchange_info()
-    
-    # 2. Загрузка активных позиций
     await load_active_positions()
     
-    await tg("<b>OZ BOT 2025 — ONLINE (v1.2.0)</b>\nДобавлено явное указание activationPrice для Trailing Stop.")
+    await tg("<b>OZ BOT 2025 — ONLINE (v1.2.1)</b>\nИсправлено форматирование callbackRate для Trailing Stop и улучшена обработка ошибок Telegram.")
     yield
     await client.aclose() 
 
@@ -408,11 +415,10 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.2.0)</h1>")
+    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.2.1)</h1>")
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    # Проверка секрета вебхука (критически важно для безопасности)
     if request.headers.get("X-Webhook-Secret") != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
     
