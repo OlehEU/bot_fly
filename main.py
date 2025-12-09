@@ -1,5 +1,5 @@
 # =========================================================================================
-# OZ TRADING BOT 2025 v1.1.2 | ИСПРАВЛЕНА ТОЧНОСТЬ ДЛЯ AVAXUSDT
+# OZ TRADING BOT 2025 v1.1.4 | БЕЗОПАСНОЕ ЛОГИРОВАНИЕ ОШИБОК BINANCE
 # =========================================================================================
 import os
 import time
@@ -93,14 +93,22 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
             )
             
             if not is_benign_margin_error:
+                # Отправляем полный текст ошибки (до 3800 символов)
                 err = r.text if len(r.text) < 3800 else r.text[:3800] + "..."
                 await tg(f"<b>BINANCE ERROR {r.status_code}</b>\nPath: {path}\n<code>{err}</code>")
             
             return None
-        return r.json()
+        
+        # Попытка вернуть JSON. Если не JSON (например, HTML с кодом 200), вернем текст для дальнейшего логирования.
+        try:
+            return r.json()
+        except Exception:
+            return r.text
+            
     except Exception as e:
         await tg(f"<b>CRITICAL ERROR</b>\n{str(e)[:3800]}")
         return None
+
 
 # ================ ЗАГРУЗКА АКТИВНЫХ ПОЗИЦИЙ ====================
 async def load_active_positions():
@@ -131,18 +139,18 @@ async def load_active_positions():
 def fix_qty(symbol: str, qty: float) -> str:
     """
     Округляет количество в зависимости от символа, учитывая точность Binance.
-    ИСПРАВЛЕНО: AVAXUSDT перенесен в группу по умолчанию (3 знака) для устранения ошибки -1111.
+    ИСПРАВЛЕНО: AVAXUSDT и NEARUSDT перенесены в группу по умолчанию (3 знака).
     """
     # Список пар, где количество должно быть ЦЕЛЫМ числом (0 знаков)
     zero_prec = [
         "DOGEUSDT", "1000SHIBUSDT", "1000PEPEUSDT", "1000BONKUSDT", 
         "1000FLOKIUSDT", "1000SATSUSDT", "FARTCOINUSDT", "XRPUSDT", 
-        "NEARUSDT", "BTTUSDT"
+        "BTTUSDT" # NEARUSDT УДАЛЕН ИЗ ЭТОГО СПИСКА
     ]
     # Список пар, где количество округляется до 2-х знаков
     two_prec = [
         "SOLUSDT", "ADAUSDT", "TRXUSDT", "MATICUSDT", "DOTUSDT", 
-        "ATOMUSDT", "BNBUSDT", "LINKUSDT" # <--- AVAXUSDT УДАЛЕН ИЗ ЭТОГО СПИСКА
+        "ATOMUSDT", "BNBUSDT", "LINKUSDT" # AVAXUSDT УДАЛЕН ИЗ ЭТОГО СПИСКА
     ]
     
     if symbol.upper() in zero_prec:
@@ -152,7 +160,7 @@ def fix_qty(symbol: str, qty: float) -> str:
     if symbol.upper() in two_prec:
         return f"{qty:.2f}".rstrip("0").rstrip(".")
 
-    # Для остальных пар (ETHUSDT, MASKUSDT, PIPPINUSDT, AVAXUSDT) оставляем 3 знака по умолчанию. 
+    # Для остальных пар (ETHUSDT, MASKUSDT, PIPPINUSDT, AVAXUSDT, NEARUSDT) оставляем 3 знака по умолчанию. 
     return f"{qty:.3f}".rstrip("0").rstrip(".")
 
 # ================ ФУНКЦИИ ОТКРЫТИЯ =======================
@@ -211,10 +219,20 @@ async def open_long(sym: str):
             "callbackRate": TRAILING_RATE,
         })
 
-        if trailing_order and trailing_order.get("orderId"):
+        if trailing_order and (isinstance(trailing_order, dict) and trailing_order.get("orderId")):
             await tg(f"<b>LONG ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\n✅ TRAILING STOP ({TRAILING_RATE}%) УСТАНОВЛЕН")
         else:
-            await tg(f"<b>LONG ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\n⚠️ ОШИБКА УСТАНОВКИ TRAILING STOP (СМОТРИТЕ ЛОГ)")
+            # ИСПРАВЛЕНИЕ v1.1.4: Безопасное логирование ответа Binance
+            log_detail = str(trailing_order) if trailing_order else "Пустой или None ответ от Binance"
+            
+            # Проверяем, не является ли ответ HTML-мусором (начинается с <)
+            if log_detail.strip().startswith("<"):
+                 log_text = f"ОТВЕТ В ФОРМАТЕ HTML. Обрезан лог: {log_detail[:100]}..."
+            else:
+                 # Если это JSON-ответ или чистый текст ошибки, отправляем полный лог
+                 log_text = log_detail
+            
+            await tg(f"<b>LONG ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\n⚠️ ОШИБКА УСТАНОВКИ TRAILING STOP (СМОТРИТЕ ЛОГ)\n<pre>{log_text}</pre>")
     else:
         await tg(f"<b>Ошибка открытия LONG {symbol}</b>")
 
@@ -253,10 +271,20 @@ async def open_short(sym: str):
             "callbackRate": TRAILING_RATE,
         })
 
-        if trailing_order and trailing_order.get("orderId"):
+        if trailing_order and (isinstance(trailing_order, dict) and trailing_order.get("orderId")):
             await tg(f"<b>SHORT ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\n✅ TRAILING STOP ({TRAILING_RATE}%) УСТАНОВЛЕН")
         else:
-            await tg(f"<b>SHORT ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\n⚠️ ОШИБКА УСТАНОВКИ TRAILING STOP (СМОТРИТЕ ЛОГ)")
+            # ИСПРАВЛЕНИЕ v1.1.4: Безопасное логирование ответа Binance
+            log_detail = str(trailing_order) if trailing_order else "Пустой или None ответ от Binance"
+            
+            # Проверяем, не является ли ответ HTML-мусором (начинается с <)
+            if log_detail.strip().startswith("<"):
+                 log_text = f"ОТВЕТ В ФОРМАТЕ HTML. Обрезан лог: {log_detail[:100]}..."
+            else:
+                 # Если это JSON-ответ или чистый текст ошибки, отправляем полный лог
+                 log_text = log_detail
+
+            await tg(f"<b>SHORT ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\n⚠️ ОШИБКА УСТАНОВКИ TRAILING STOP (СМОТРИТЕ ЛОГ)\n<pre>{log_text}</pre>")
 
     else:
         await tg(f"<b>Ошибка открытия SHORT {symbol}</b>")
@@ -320,7 +348,7 @@ async def lifespan(app: FastAPI):
     # Загрузка активных позиций при старте
     await load_active_positions()
     
-    await tg("<b>OZ BOT 2025 — ONLINE (v1.1.2)</b>\nИсправлена точность AVAXUSDT.")
+    await tg("<b>OZ BOT 2025 — ONLINE (v1.1.4)</b>\nИсправлена точность NEARUSDT и ошибка парсинга логов.")
     yield
     await client.aclose() # Закрываем HTTP клиент при завершении работы
 
@@ -328,7 +356,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.1.2)</h1>")
+    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.1.4)</h1>")
 
 @app.post("/webhook")
 async def webhook(request: Request):
