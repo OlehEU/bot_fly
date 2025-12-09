@@ -1,5 +1,5 @@
 # =========================================================================================
-# OZ TRADING BOT 2025 v1.2.2 | КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: ИЗМЕНЕНИЕ API ENDPOINT ДЛЯ TRAILING STOP
+# OZ TRADING BOT 2025 v1.2.4 | ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ: /fapi/v1/algoOrder + algoType=CONDITIONAL
 # =========================================================================================
 import os
 import time
@@ -14,6 +14,7 @@ from telegram import Bot
 from contextlib import asynccontextmanager
 
 # ==================== КОНФИГУРАЦИЯ ====================
+# Проверка наличия всех необходимых переменных окружения
 required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "BINANCE_API_KEY", "BINANCE_API_SECRET", "WEBHOOK_SECRET"]
 for v in required:
     if not os.getenv(v):
@@ -51,8 +52,7 @@ async def tg(text: str):
     except Exception as e:
         print(f"[ERROR] Telegram send failed (HTML parse error). Sending as plain text: {e}")
         try:
-             # Попытка отправить как plain text
-             # Заменяем HTML-теги на пустые строки для очистки текста
+             # Очистка текста от HTML-тегов для отправки как plain text
              clean_text = text.replace('<b>', '').replace('</b>', '').replace('<code>', '').replace('</code>', '').replace('<pre>', '\n').replace('</pre>', '\n').replace('&nbsp;', ' ')
              await bot.send_message(CHAT_ID, clean_text, disable_web_page_preview=True)
         except Exception as plain_e:
@@ -92,16 +92,11 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
         r = await client.request(method, url, params=final_params, headers=headers)
         
         if r.status_code != 200:
-            is_benign_margin_error = (
-                path == "/fapi/v1/marginType" and 
-                r.status_code == 400 and 
-                '{"code":-1102,' in r.text
-            )
+            err_text = r.text if len(r.text) < 3800 else r.text[:3800] + "..."
             
-            if not is_benign_margin_error:
-                err = r.text if len(r.text) < 3800 else r.text[:3800] + "..."
-                # В случае ошибки 404, 403, 500 и т.д., возвращаем ошибку для логирования
-                await tg(f"<b>BINANCE ERROR {r.status_code}</b>\nPath: {path}\n<code>{err}</code>")
+            # Игнорируем обычную ошибку MarginType (-1102) при первичном наборе
+            if r.status_code != 400 or '{"code":-1102,' not in r.text:
+                await tg(f"<b>BINANCE ERROR {r.status_code}</b>\nPath: {path}\n<code>{err_text}</code>")
             
             return None
         
@@ -246,7 +241,7 @@ async def open_long(sym: str):
     if order and order.get("orderId"):
         active_longs.add(symbol)
         
-        # --- ПАРАМЕТРЫ ДЛЯ TRAILING STOP (v1.2.1) ---
+        # --- ПАРАМЕТРЫ ДЛЯ TRAILING STOP (v1.2.4) ---
         rate_str = f"{TRAILING_RATE:.2f}" 
         activation_price_str = f"{price:.8f}".rstrip("0").rstrip(".") 
         
@@ -254,18 +249,19 @@ async def open_long(sym: str):
         # --- КОНЕЦ ЛОГА ---
 
         # 4. Размещение TRAILING_STOP_MARKET ордера (SELL для закрытия LONG)
-        # !!! КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ v1.2.2: ИСПОЛЬЗУЕМ /fapi/v1/order !!!
-        trailing_order = await binance("POST", "/fapi/v1/order", { 
+        # !!! ИСПОЛЬЗУЕМ /fapi/v1/algoOrder ТА ДОБАВЛЯЕМ algoType !!!
+        trailing_order = await binance("POST", "/fapi/v1/algoOrder", { 
+            "algoType": "CONDITIONAL", # <--- ОБЯЗАТЕЛЬНЫЙ ПАРАМЕТР
             "symbol": symbol, 
             "side": "SELL",
             "positionSide": "LONG",
-            "type": "TRAILING_STOP_MARKET", # <--- ТИП ОРДЕРА
+            "type": "TRAILING_STOP_MARKET", 
             "quantity": qty_str,
             "callbackRate": rate_str, 
             "activationPrice": activation_price_str, 
         })
 
-        if trailing_order and (isinstance(trailing_order, dict) and trailing_order.get("orderId")):
+        if trailing_order and (isinstance(trailing_order, dict) and trailing_order.get("algoId")):
             await tg(f"<b>LONG ×{LEV} (Cross+Hedge) {symbol}</b>\n✅ TRAILING STOP ({TRAILING_RATE}%) УСТАНОВЛЕН")
         else:
             log_detail = str(trailing_order) if trailing_order else "Пустой или None ответ от Binance"
@@ -279,7 +275,7 @@ async def open_long(sym: str):
     else:
         await tg(f"<b>Ошибка открытия LONG {symbol}</b>")
 
-# НОВАЯ ФУНКЦИЯ ДЛЯ ОТКРЫТИЯ SHORT
+# ФУНКЦИЯ ДЛЯ ОТКРЫТИЯ SHORT
 async def open_short(sym: str):
     result = await get_symbol_and_qty(sym)
     if not result: return
@@ -317,7 +313,7 @@ async def open_short(sym: str):
     if order and order.get("orderId"):
         active_shorts.add(symbol)
         
-        # --- ПАРАМЕТРЫ ДЛЯ TRAILING STOP (v1.2.1) ---
+        # --- ПАРАМЕТРЫ ДЛЯ TRAILING STOP (v1.2.4) ---
         rate_str = f"{TRAILING_RATE:.2f}"
         activation_price_str = f"{price:.8f}".rstrip("0").rstrip(".") 
 
@@ -325,18 +321,19 @@ async def open_short(sym: str):
         # --- КОНЕЦ ЛОГА ---
 
         # 4. Размещение TRAILING_STOP_MARKET ордера (BUY для закрытия SHORT)
-        # !!! КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ v1.2.2: ИСПОЛЬЗУЕМ /fapi/v1/order !!!
-        trailing_order = await binance("POST", "/fapi/v1/order", { 
+        # !!! ИСПОЛЬЗУЕМ /fapi/v1/algoOrder ТА ДОБАВЛЯЕМ algoType !!!
+        trailing_order = await binance("POST", "/fapi/v1/algoOrder", { 
+            "algoType": "CONDITIONAL", # <--- ОБЯЗАТЕЛЬНЫЙ ПАРАМЕТР
             "symbol": symbol, 
             "side": "BUY",
             "positionSide": "SHORT",
-            "type": "TRAILING_STOP_MARKET", # <--- ТИП ОРДЕРА
+            "type": "TRAILING_STOP_MARKET", 
             "quantity": qty_str,
             "callbackRate": rate_str, 
             "activationPrice": activation_price_str, 
         })
 
-        if trailing_order and (isinstance(trailing_order, dict) and trailing_order.get("orderId")):
+        if trailing_order and (isinstance(trailing_order, dict) and trailing_order.get("algoId")):
             await tg(f"<b>SHORT ×{LEV} (Cross+Hedge) {symbol}</b>\n✅ TRAILING STOP ({TRAILING_RATE}%) УСТАНОВЛЕН")
         else:
             log_detail = str(trailing_order) if trailing_order else "Пустой или None ответ от Binance"
@@ -407,7 +404,7 @@ async def lifespan(app: FastAPI):
     await load_exchange_info()
     await load_active_positions()
     
-    await tg("<b>OZ BOT 2025 — ONLINE (v1.2.2)</b>\nКритическое исправление: Изменен API endpoint для Trailing Stop на /fapi/v1/order.")
+    await tg("<b>OZ BOT 2025 — ONLINE (v1.2.4)</b>\nФИНАЛЬНОЕ ИСПРАВЛЕНИЕ: Использован корректный API endpoint `/fapi/v1/algoOrder` для Trailing Stop.")
     yield
     await client.aclose() 
 
@@ -415,7 +412,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.2.2)</h1>")
+    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.2.4)</h1>")
 
 @app.post("/webhook")
 async def webhook(request: Request):
