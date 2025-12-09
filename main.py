@@ -1,6 +1,5 @@
 # =========================================================================================
-# OZ TRADING BOT 2025 v1.1 | Бот для исполнения сигналов Сканера на Binance Futures
-# ВЕРСИЯ С ПОЛНОЙ ПОДДЕРЖКОЙ LONG/SHORT И 4 ТИПОВ СИГНАЛОВ
+# OZ TRADING BOT 2025 v1.1.2 | ИСПРАВЛЕНА ТОЧНОСТЬ ДЛЯ AVAXUSDT
 # =========================================================================================
 import os
 import time
@@ -132,7 +131,7 @@ async def load_active_positions():
 def fix_qty(symbol: str, qty: float) -> str:
     """
     Округляет количество в зависимости от символа, учитывая точность Binance.
-    Обновлено: Списки содержат только монеты, предоставленные пользователем.
+    ИСПРАВЛЕНО: AVAXUSDT перенесен в группу по умолчанию (3 знака) для устранения ошибки -1111.
     """
     # Список пар, где количество должно быть ЦЕЛЫМ числом (0 знаков)
     zero_prec = [
@@ -143,7 +142,7 @@ def fix_qty(symbol: str, qty: float) -> str:
     # Список пар, где количество округляется до 2-х знаков
     two_prec = [
         "SOLUSDT", "ADAUSDT", "TRXUSDT", "MATICUSDT", "DOTUSDT", 
-        "ATOMUSDT", "BNBUSDT", "LINKUSDT", "AVAXUSDT"
+        "ATOMUSDT", "BNBUSDT", "LINKUSDT" # <--- AVAXUSDT УДАЛЕН ИЗ ЭТОГО СПИСКА
     ]
     
     if symbol.upper() in zero_prec:
@@ -153,7 +152,7 @@ def fix_qty(symbol: str, qty: float) -> str:
     if symbol.upper() in two_prec:
         return f"{qty:.2f}".rstrip("0").rstrip(".")
 
-    # Для остальных пар (ETHUSDT, MASKUSDT, PIPPINUSDT) оставляем 3 знака по умолчанию. 
+    # Для остальных пар (ETHUSDT, MASKUSDT, PIPPINUSDT, AVAXUSDT) оставляем 3 знака по умолчанию. 
     return f"{qty:.3f}".rstrip("0").rstrip(".")
 
 # ================ ФУНКЦИИ ОТКРЫТИЯ =======================
@@ -202,7 +201,8 @@ async def open_long(sym: str):
         active_longs.add(symbol)
         
         # 4. Размещение TRAILING_STOP_MARKET ордера (SELL для закрытия LONG)
-        trailing_order = await binance("POST", "/fapi/v1/order", {
+        # ИСПРАВЛЕНИЕ v1.1.1: Используем /fapi/v1/order/algo для Trailing Stop
+        trailing_order = await binance("POST", "/fapi/v1/order/algo", { 
             "symbol": symbol, 
             "side": "SELL",
             "positionSide": "LONG",
@@ -243,7 +243,8 @@ async def open_short(sym: str):
         active_shorts.add(symbol)
         
         # 4. Размещение TRAILING_STOP_MARKET ордера (BUY для закрытия SHORT)
-        trailing_order = await binance("POST", "/fapi/v1/order", {
+        # ИСПРАВЛЕНИЕ v1.1.1: Используем /fapi/v1/order/algo для Trailing Stop
+        trailing_order = await binance("POST", "/fapi/v1/order/algo", { 
             "symbol": symbol, 
             "side": "BUY", # Покупаем (закрываем SHORT позицию)
             "positionSide": "SHORT",
@@ -319,7 +320,7 @@ async def lifespan(app: FastAPI):
     # Загрузка активных позиций при старте
     await load_active_positions()
     
-    await tg("<b>OZ BOT 2025 — ONLINE (v1.1)</b>\nПОЛНАЯ ПОДДЕРЖКА LONG/SHORT АКТИВИРОВАНА.")
+    await tg("<b>OZ BOT 2025 — ONLINE (v1.1.2)</b>\nИсправлена точность AVAXUSDT.")
     yield
     await client.aclose() # Закрываем HTTP клиент при завершении работы
 
@@ -327,7 +328,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.1)</h1>")
+    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.1.2)</h1>")
 
 @app.post("/webhook")
 async def webhook(request: Request):
