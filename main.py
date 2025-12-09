@@ -1,5 +1,5 @@
 # =========================================================================================
-# OZ TRADING BOT 2025 v1.2.1 | ИСПРАВЛЕНИЕ: ПРИНУДИТЕЛЬНАЯ ТОЧНОСТЬ callbackRate
+# OZ TRADING BOT 2025 v1.2.2 | КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: ИЗМЕНЕНИЕ API ENDPOINT ДЛЯ TRAILING STOP
 # =========================================================================================
 import os
 import time
@@ -14,7 +14,6 @@ from telegram import Bot
 from contextlib import asynccontextmanager
 
 # ==================== КОНФИГУРАЦИЯ ====================
-# Проверка наличия всех необходимых переменных окружения
 required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "BINANCE_API_KEY", "BINANCE_API_SECRET", "WEBHOOK_SECRET"]
 for v in required:
     if not os.getenv(v):
@@ -35,7 +34,7 @@ TRAILING_RATE = float(os.getenv("TRAILING_RATE", "0.5")) # Процент отк
 
 # Инициализация Telegram и HTTP клиента
 bot = Bot(token=TELEGRAM_TOKEN)
-client = httpx.AsyncClient(timeout=30) # Таймаут 30 секунд
+client = httpx.AsyncClient(timeout=30)
 BASE = "https://fapi.binance.com"
 
 # ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
@@ -45,16 +44,17 @@ active_shorts: Set[str] = set()
 
 # ================= TELEGRAM УВЕДОМЛЕНИЯ =====================
 async def tg(text: str):
-    """Отправляет сообщение в Telegram, используя HTML форматирование. 
+    """Отправляет сообщение в Telegram, используя HTML форматирование.
        Если сообщение содержит ошибку HTML, оно будет отправлено без форматирования."""
     try:
         await bot.send_message(CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
-        # В случае ошибки парсинга (например, если Binance вернул HTML), отправляем как есть.
         print(f"[ERROR] Telegram send failed (HTML parse error). Sending as plain text: {e}")
         try:
              # Попытка отправить как plain text
-             await bot.send_message(CHAT_ID, text, disable_web_page_preview=True)
+             # Заменяем HTML-теги на пустые строки для очистки текста
+             clean_text = text.replace('<b>', '').replace('</b>', '').replace('<code>', '').replace('</code>', '').replace('<pre>', '\n').replace('</pre>', '\n').replace('&nbsp;', ' ')
+             await bot.send_message(CHAT_ID, clean_text, disable_web_page_preview=True)
         except Exception as plain_e:
              print(f"[CRITICAL ERROR] Telegram send failed even as plain text: {plain_e}")
 
@@ -100,6 +100,7 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
             
             if not is_benign_margin_error:
                 err = r.text if len(r.text) < 3800 else r.text[:3800] + "..."
+                # В случае ошибки 404, 403, 500 и т.д., возвращаем ошибку для логирования
                 await tg(f"<b>BINANCE ERROR {r.status_code}</b>\nPath: {path}\n<code>{err}</code>")
             
             return None
@@ -246,22 +247,21 @@ async def open_long(sym: str):
         active_longs.add(symbol)
         
         # --- ПАРАМЕТРЫ ДЛЯ TRAILING STOP (v1.2.1) ---
-        # Форматируем rate с двумя знаками после запятой (0.5 -> 0.50)
         rate_str = f"{TRAILING_RATE:.2f}" 
-        # Цена активации - текущая рыночная цена
         activation_price_str = f"{price:.8f}".rstrip("0").rstrip(".") 
         
         await tg(f"<b>LONG ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\nПопытка установить Trailing Stop. QTY: <code>{qty_str}</code>, RATE: <code>{rate_str}</code>, Activation: <code>{activation_price_str}</code>")
         # --- КОНЕЦ ЛОГА ---
 
         # 4. Размещение TRAILING_STOP_MARKET ордера (SELL для закрытия LONG)
-        trailing_order = await binance("POST", "/fapi/v1/order/algo", { 
+        # !!! КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ v1.2.2: ИСПОЛЬЗУЕМ /fapi/v1/order !!!
+        trailing_order = await binance("POST", "/fapi/v1/order", { 
             "symbol": symbol, 
             "side": "SELL",
             "positionSide": "LONG",
-            "type": "TRAILING_STOP_MARKET",
+            "type": "TRAILING_STOP_MARKET", # <--- ТИП ОРДЕРА
             "quantity": qty_str,
-            "callbackRate": rate_str, # <--- ИСПРАВЛЕНО ФОРМАТИРОВАНИЕ
+            "callbackRate": rate_str, 
             "activationPrice": activation_price_str, 
         })
 
@@ -318,7 +318,6 @@ async def open_short(sym: str):
         active_shorts.add(symbol)
         
         # --- ПАРАМЕТРЫ ДЛЯ TRAILING STOP (v1.2.1) ---
-        # Форматируем rate с двумя знаками после запятой (0.5 -> 0.50)
         rate_str = f"{TRAILING_RATE:.2f}"
         activation_price_str = f"{price:.8f}".rstrip("0").rstrip(".") 
 
@@ -326,13 +325,14 @@ async def open_short(sym: str):
         # --- КОНЕЦ ЛОГА ---
 
         # 4. Размещение TRAILING_STOP_MARKET ордера (BUY для закрытия SHORT)
-        trailing_order = await binance("POST", "/fapi/v1/order/algo", { 
+        # !!! КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ v1.2.2: ИСПОЛЬЗУЕМ /fapi/v1/order !!!
+        trailing_order = await binance("POST", "/fapi/v1/order", { 
             "symbol": symbol, 
             "side": "BUY",
             "positionSide": "SHORT",
-            "type": "TRAILING_STOP_MARKET",
+            "type": "TRAILING_STOP_MARKET", # <--- ТИП ОРДЕРА
             "quantity": qty_str,
-            "callbackRate": rate_str, # <--- ИСПРАВЛЕНО ФОРМАТИРОВАНИЕ
+            "callbackRate": rate_str, 
             "activationPrice": activation_price_str, 
         })
 
@@ -407,7 +407,7 @@ async def lifespan(app: FastAPI):
     await load_exchange_info()
     await load_active_positions()
     
-    await tg("<b>OZ BOT 2025 — ONLINE (v1.2.1)</b>\nИсправлено форматирование callbackRate для Trailing Stop и улучшена обработка ошибок Telegram.")
+    await tg("<b>OZ BOT 2025 — ONLINE (v1.2.2)</b>\nКритическое исправление: Изменен API endpoint для Trailing Stop на /fapi/v1/order.")
     yield
     await client.aclose() 
 
@@ -415,7 +415,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.2.1)</h1>")
+    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.2.2)</h1>")
 
 @app.post("/webhook")
 async def webhook(request: Request):
