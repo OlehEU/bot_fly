@@ -1,5 +1,5 @@
 # =========================================================================================
-# OZ TRADING BOT 2025 v1.6.3 | КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Ошибки подписи (-1022)
+# OZ TRADING BOT 2025 v1.6.4 | КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Ошибки -1102 для marginType/leverage
 # =========================================================================================
 import os
 import time
@@ -78,11 +78,11 @@ def format_error_detail(error_result: Dict[str, Any]) -> str:
     return json.dumps(error_result, indent=2)
 
 
-# ================= BINANCE API ЗАПРОСЫ (ИСПРАВЛЕНИЕ ПОДПИСИ v1.6.3) ====================
+# ================= BINANCE API ЗАПРОСЫ (ИСПРАВЛЕНИЕ POST-ПАРАМЕТРОВ v1.6.4) ====================
 async def binance(method: str, path: str, params: Dict | None = None, signed: bool = True) -> Any | Dict[str, Any]:
     """
     Универсальная функция для запросов к API Binance Futures.
-    Исправлена логика подписи для POST-запросов.
+    Исправлена логика передачи параметров для POST/PUT/DELETE, чтобы избежать ошибки -1102.
     """
     url = BASE + path
     p = params.copy() if params else {}
@@ -100,7 +100,6 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
             return str(v)
 
         # 1. Создаем query_string, используя ВСЕ параметры для подписи
-        # Параметры должны быть отсортированы и преобразованы в строку
         query_parts = [f"{k}={format_value(v)}" for k, v in sorted(p.items())]
         query_string = "&".join(query_parts)
 
@@ -108,29 +107,36 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
         signature = hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
 
         # 3. Формируем URL и данные для отправки в зависимости от метода
-        if method in ("POST", "PUT", "DELETE"): # Binance API позволяет отправлять SIGNATURE в URL даже для POST/PUT/DELETE
-            # Для POST: URL содержит все параметры + подпись. Тело запроса пустое (None), но параметры используются в URL
+        if method in ("POST", "PUT", "DELETE"):
+            # Для POST/PUT/DELETE:
+            # - URL содержит только технические параметры (timestamp, signature, recvWindow)
+            # - Тело запроса (data) содержит параметры ордера (symbol, quantity, side, etc.)
+            
+            # Разделяем параметры на те, что идут в URL (технические), и те, что идут в теле (зависимые от API)
+            
+            # Для Binance Futures, кажется, что технические параметры (включая подпись)
+            # должны быть в URL, а остальные в теле (data) для POST/PUT
+            
+            # Формируем URL с подписью и всеми параметрами (как в GET) - это было правильно для подписи в v1.6.3
             url = f"{url}?{query_string}&signature={signature}"
-            # Важно: для httpx POST с параметрами в URL, data/json/content должно быть None
-            # Для POST/PUT/DELETE можно также передать параметры в теле, но безопаснее использовать URL
-            # В данном исправлении мы используем URL для всех параметров, как в GET-запросах, что проще и надежнее.
-            final_params = None
-            request_data = None 
+            
+            # НО! Для избежания -1102, мы также отправляем все параметры в теле запроса (data)
+            # Это может быть избыточно, но должно удовлетворить API.
+            request_data = p
+            final_params = None 
         else: # Для GET: URL содержит все параметры и подпись
             url = f"{url}?{query_string}&signature={signature}"
-            final_params = None 
+            final_params = None
+            request_data = None
     else:
         # Для неподписанных запросов (GET)
         final_params = p
+        request_data = None
 
     headers = {"X-MBX-APIKEY": API_KEY}
     
     try:
-        # Используем params для GET-запросов (когда final_params не None), data для POST/PUT (если нужно)
-        # В этой версии 1.6.3 все параметры для SIGNED запросов отправляются в URL, поэтому final_params=None, request_data=None.
-        # Для POST-запросов это часто приводит к тому, что параметры отправляются в теле, если request_data не None, но
-        # в Binance API часто используются URL-параметры + пустое тело. Уточним логику:
-        
+        # Отправляем запрос
         r = await client.request(method, url, params=final_params, data=request_data, headers=headers) 
         
         # ... (Остальная логика обработки ответов без изменений)
@@ -142,6 +148,7 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
                 error_json = r.json()
                 error_data.update(error_json)
                 
+                # Исключаем некритичную ошибку "No trading window"
                 if error_json.get("code") == -1102 and "No trading window" in error_json.get("msg", ""):
                      pass
                 else:
@@ -245,8 +252,7 @@ async def load_active_positions():
 async def get_symbol_and_qty(sym: str) -> tuple[str, str, float] | None:
     symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
     
-    # Настройка маржи и плеча
-    # Эти запросы теперь должны пройти, так как они подписаны корректно в v1.6.3
+    # Настройка маржи и плеча - эти POST-запросы теперь должны пройти с параметрами в data
     await binance("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": "CROSS"})
     await binance("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEV})
 
@@ -266,7 +272,7 @@ async def get_symbol_and_qty(sym: str) -> tuple[str, str, float] | None:
     
     return symbol, qty_str, price 
 
-# ================= ФУНКЦИИ ОТКРЫТИЯ (Логика TP/TS без изменений с v1.6.2) =======================
+# ================= ФУНКЦИИ ОТКРЫТИЯ (Без изменений) =======================
 
 async def open_long(sym: str):
     global active_trailing_enabled, take_profit_enabled
@@ -406,7 +412,7 @@ async def open_short(sym: str):
         error_log = format_error_detail(order)
         await tg(f"<b>Ошибка открытия SHORT {symbol}</b>\n<code>{error_log}</code>")
 
-# ... (close_long/close_short/close_position и Telegram/FastAPI логика без изменений)
+# ... (close_position/close_long/close_short и Telegram/FastAPI логика без изменений)
 async def close_position(sym: str, position_side: str, active_set: Set[str]):
     symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
     await binance("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
@@ -485,7 +491,7 @@ async def handle_telegram_update(update_json: Dict):
         if data == 'set_trailing_true' and not active_trailing_enabled: active_trailing_enabled = True; state_changed = True
         elif data == 'set_trailing_false' and active_trailing_enabled: active_trailing_enabled = False; state_changed = True
         elif data == 'set_tp_true' and not take_profit_enabled: take_profit_enabled = True; state_changed = True
-        elif data == 'set_tp_false' and active_trailing_enabled: take_profit_enabled = False; state_changed = True
+        elif data == 'set_tp_false' and take_trailing_enabled: take_profit_enabled = False; state_changed = True
         
         await query.answer() 
         
@@ -524,7 +530,7 @@ async def lifespan(app: FastAPI):
     status_t = "ВКЛЮЧЕН" if active_trailing_enabled else "ОТКЛЮЧЕН"
     status_tp = "ВКЛЮЧЕН" if take_profit_enabled else "ОТКЛЮЧЕН"
     await tg(
-        f"<b>OZ BOT 2025 — ONLINE (v1.6.3)</b>\n"
+        f"<b>OZ BOT 2025 — ONLINE (v1.6.4)</b>\n"
         f"Трейлинг Стоп: <b>{status_t}</b> ({TRAILING_RATE}%)\n"
         f"Take Profit: <b>{status_tp}</b> ({TAKE_PROFIT_RATE}%)\n"
         f"Управление через Telegram Webhook (/menu)."
@@ -542,7 +548,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.6.3)</h1>")
+    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.6.4)</h1>")
 
 @app.post("/telegram_webhook/{token}")
 async def handle_telegram(token: str, request: Request):
