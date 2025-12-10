@@ -1,5 +1,7 @@
 # =========================================================================================
-# OZ TRADING BOT 2025 v1.6.1 | ИСПРАВЛЕНИЕ: Подробное Логирование Ошибок Binance
+# OZ TRADING BOT 2025 v1.6.2 | ИСПРАВЛЕННЫЙ КОД
+# - Поддержка Take Profit (1%) и Trailing Stop (через меню)
+# - Корректное использование triggerPrice и POST-параметров Binance
 # =========================================================================================
 import os
 import time
@@ -11,12 +13,11 @@ import httpx
 import asyncio
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
-# Импортируем необходимые классы для Telegram-бота
 from telegram import Bot, Update, InlineKeyboardMarkup, InlineKeyboardButton, constants
 from telegram.error import TelegramError
 from contextlib import asynccontextmanager
 
-# ==================== КОНФИГУРАЦИЯ (Без изменений) ====================
+# ==================== КОНФИГУРАЦИЯ ====================
 required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "BINANCE_API_KEY", "BINANCE_API_SECRET", "WEBHOOK_SECRET", "PUBLIC_HOST_URL"]
 for v in required:
     if not os.getenv(v):
@@ -52,7 +53,7 @@ take_profit_enabled: bool = os.getenv("TAKE_PROFIT_ENABLED", "true").lower() in 
 # Инициализация Telegram Bot
 tg_bot = Bot(token=TELEGRAM_TOKEN) 
 
-# ================= TELEGRAM УВЕДОМЛЕНИЯ (Без изменений) =====================
+# ================= TELEGRAM УВЕДОМЛЕНИЯ =====================
 async def tg(text: str):
     """Отправляет сообщение в Telegram, используя HTML форматирование."""
     try:
@@ -65,7 +66,21 @@ async def tg(text: str):
         except Exception as plain_e:
              print(f"[CRITICAL ERROR] Telegram send failed even as plain text: {plain_e}")
 
-# ================= BINANCE API ЗАПРОСЫ (ИЗМЕНЕНА ЛОГИКА ОШИБОК) ====================
+def format_error_detail(error_result: Dict[str, Any]) -> str:
+    """Форматирует словарь ошибки Binance в читаемый код для Telegram."""
+    if not error_result or not isinstance(error_result, dict):
+        return "Неизвестная ошибка или пустой ответ."
+    
+    code = error_result.get('code', 'N/A')
+    msg = error_result.get('msg', 'N/A')
+    
+    if code != 'N/A' or msg != 'N/A':
+        return f"Code: {code}\nMsg: {msg}"
+    
+    # Иначе возвращаем полный текст
+    return json.dumps(error_result, indent=2)
+
+# ================= BINANCE API ЗАПРОСЫ ====================
 async def binance(method: str, path: str, params: Dict | None = None, signed: bool = True) -> Any | Dict[str, Any]:
     """
     Универсальная функция для запросов к API Binance Futures.
@@ -74,9 +89,9 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
     url = BASE + path
     p = params.copy() if params else {}
     
-    # ... (Подготовка параметров и подпись - без изменений)
     final_params = p
-    
+    request_data = None 
+
     if signed:
         p["timestamp"] = int(time.time() * 1000)
         p["recvWindow"] = 60000
@@ -90,68 +105,68 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
 
         signature = hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
 
-        url = f"{url}?{query_string}&signature={signature}"
-        
-        final_params = None
+        # Если это POST/PUT, параметры должны быть в теле (data), а подпись в строке запроса
+        if method in ("POST", "PUT"):
+            url_query = f"{url}?{query_string}&signature={signature}"
+            request_data = final_params 
+            final_params = None        
+            url = url_query
+        else: # Для GET/DELETE
+            url = f"{url}?{query_string}&signature={signature}"
+            final_params = None
     
     headers = {"X-MBX-APIKEY": API_KEY}
     
     try:
-        r = await client.request(method, url, params=final_params, headers=headers)
+        # Теперь используем 'data' для POST/PUT
+        r = await client.request(method, url, params=final_params, data=request_data, headers=headers) 
         
         if r.status_code != 200:
             
             error_data = {"status": r.status_code, "text": r.text}
             
-            # Попытка получить структурированный JSON ошибки
             try:
                 error_json = r.json()
                 error_data.update(error_json)
                 
-                # Исключаем специфичную ошибку, которая не является критичной для повторного запроса
+                # Исключаем некритичную ошибку "No trading window" из подробного лога TG
                 if error_json.get("code") == -1102 and "No trading window" in error_json.get("msg", ""):
-                     # НЕ ОТПРАВЛЯЕМ В ТГ
                      pass
                 else:
                     err_msg = f"Code: {error_json.get('code', 'N/A')}. Msg: {error_json.get('msg', 'N/A')}"
                     await tg(f"<b>BINANCE API ERROR {r.status_code}</b>\nPath: {path}\n<code>{err_msg}</code>")
                 
-                # ВОЗВРАЩАЕМ структурированный объект ошибки
                 return error_data 
 
             except Exception:
-                # Если ответ не JSON (например, HTML/просто текст)
                 err_text = r.text if len(r.text) < 3800 else r.text[:3800] + "..."
                 
-                # Не отправляем в ТГ, если это просто 400 и нет кода ошибки
                 if r.status_code != 400:
                     await tg(f"<b>BINANCE ERROR {r.status_code} (Non-JSON)</b>\nPath: {path}\n<code>{err_text}</code>")
                 
-                # ВОЗВРАЩАЕМ базовый объект ошибки
                 return error_data
 
-        try:
-            return r.json()
-        except Exception:
-            return r.text
+        try: return r.json()
+        except Exception: return r.text
             
     except Exception as e:
         await tg(f"<b>CRITICAL HTTP ERROR</b>\n{str(e)[:3800]}")
-        # Возвращаем универсальный объект критической ошибки
         return {"status": 0, "text": str(e)}
 
-# ================ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (Без изменений) ====================
+# ================ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ: ТОЧНОСТЬ И ПОЗИЦИИ ====================
 def calculate_precision_from_stepsize(step_size: str) -> int:
+    """Вычисляет необходимое количество знаков после запятой из stepSize (или tickSize)."""
     s = step_size.rstrip('0')
     if '.' not in s: return 0
     return len(s.split('.')[-1])
 
 async def load_exchange_info():
+    """Загружает точность (precision) для количества и цены с Binance."""
     global symbol_precision, price_precision
     try:
         data = await binance("GET", "/fapi/v1/exchangeInfo", signed=False)
         
-        if isinstance(data, dict) and data.get("status"): # Если binance() вернул ошибку
+        if isinstance(data, dict) and data.get("status"):
              await tg(f"<b>Ошибка:</b> Не удалось загрузить информацию о бинарных символах. {data.get('msg', '')}")
              return
 
@@ -177,12 +192,25 @@ async def load_exchange_info():
     except Exception as e:
         await tg(f"<b>Критическая ошибка при загрузке exchangeInfo:</b> {e}")
 
+
+def fix_qty(symbol: str, qty: float) -> str:
+    """Округляет количество в зависимости от динамически загруженной точности Binance."""
+    precision = symbol_precision.get(symbol.upper(), 3)
+    if precision == 0: return str(int(qty)) 
+    return f"{qty:.{precision}f}".rstrip("0").rstrip(".")
+
+def fix_price(symbol: str, price: float) -> str:
+    """Округляет цену в зависимости от динамически загруженной точности Binance (PRICE_FILTER)."""
+    precision = price_precision.get(symbol.upper(), 8) 
+    return f"{price:.{precision}f}".rstrip("0").rstrip(".")
+
 async def load_active_positions():
+    """Загружает открытые LONG и SHORT позиции с Binance в соответствующие множества при старте."""
     global active_longs, active_shorts
     try:
         data = await binance("GET", "/fapi/v2/positionRisk", signed=True)
         
-        if isinstance(data, dict) and data.get("status"): # Если binance() вернул ошибку
+        if isinstance(data, dict) and data.get("status"): 
              await tg(f"<b>Ошибка:</b> Не удалось загрузить активные позиции. {data.get('msg', '')}")
              return
 
@@ -206,18 +234,12 @@ async def load_active_positions():
     except Exception as e:
         await tg(f"<b>Ошибка при загрузке активных позиций:</b> {e}")
 
-def fix_qty(symbol: str, qty: float) -> str:
-    precision = symbol_precision.get(symbol.upper(), 3)
-    if precision == 0: return str(int(qty)) 
-    return f"{qty:.{precision}f}".rstrip("0").rstrip(".")
-
-def fix_price(symbol: str, price: float) -> str:
-    precision = price_precision.get(symbol.upper(), 8) 
-    return f"{price:.{precision}f}".rstrip("0").rstrip(".")
 
 async def get_symbol_and_qty(sym: str) -> tuple[str, str, float] | None:
+    """Вспомогательная функция для получения символа, цены и рассчитанного количества."""
     symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
     
+    # Настройка маржи и плеча (корректный POST)
     await binance("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": "CROSS"})
     await binance("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEV})
 
@@ -237,24 +259,7 @@ async def get_symbol_and_qty(sym: str) -> tuple[str, str, float] | None:
     
     return symbol, qty_str, price 
 
-# ================= ФУНКЦИИ ОТКРЫТИЯ (ИЗМЕНЕНА ЛОГИКА ОБРАБОТКИ ОТВЕТОВ) =======================
-
-def format_error_detail(error_result: Dict[str, Any]) -> str:
-    """Форматирует словарь ошибки Binance в читаемый код для Telegram."""
-    if not error_result or not isinstance(error_result, dict):
-        return "Неизвестная ошибка или пустой ответ."
-    
-    code = error_result.get('code', 'N/A')
-    msg = error_result.get('msg', 'N/A')
-    status = error_result.get('status', 'N/A')
-    
-    # Пытаемся взять только код и сообщение, если они есть
-    if code != 'N/A' or msg != 'N/A':
-        return f"Code: {code}\nMsg: {msg}"
-    
-    # Иначе возвращаем полный текст
-    return json.dumps(error_result, indent=2)
-
+# ================= ФУНКЦИИ ОТКРЫТИЯ =======================
 
 async def open_long(sym: str):
     global active_trailing_enabled, take_profit_enabled
@@ -264,7 +269,6 @@ async def open_long(sym: str):
 
     symbol, qty_str, price = result
     
-    # ... (Проверка на уже открытую позицию - для краткости опущена)
     pos_data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     is_open_on_exchange = False
     if pos_data and isinstance(pos_data, list):
@@ -275,14 +279,12 @@ async def open_long(sym: str):
         await tg(f"<b>{symbol}</b> — LONG уже открыта на бирже. Пропуск.")
         return
     active_longs.discard(symbol) 
-    # =================================================================
 
     # 3. Открытие LONG позиции (Market)
     order = await binance("POST", "/fapi/v1/order", {
         "symbol": symbol, "side": "BUY", "positionSide": "LONG", "type": "MARKET", "quantity": qty_str
     })
 
-    # Проверка, успешно ли открыта позиция
     if isinstance(order, dict) and order.get("orderId"):
         active_longs.add(symbol)
         
@@ -298,7 +300,6 @@ async def open_long(sym: str):
                 "type": "TRAILING_STOP_MARKET", "quantity": qty_str, "callbackRate": rate_str, "activationPrice": activation_price_str, 
             })
 
-            # ПРОВЕРКА ОТВЕТА TRAILING STOP
             if isinstance(trailing_order, dict) and trailing_order.get("algoId"):
                 await tg(f"<b>LONG {symbol}</b>\n✅ TRAILING STOP ({TRAILING_RATE}%) УСТАНОВЛЕН")
             else:
@@ -314,10 +315,9 @@ async def open_long(sym: str):
 
             tp_order = await binance("POST", "/fapi/v1/algoOrder", { 
                 "algoType": "CONDITIONAL", "symbol": symbol, "side": "SELL", "positionSide": "LONG",
-                "type": "TAKE_PROFIT_MARKET", "quantity": qty_str, "stopPrice": tp_price_str, 
+                "type": "TAKE_PROFIT_MARKET", "quantity": qty_str, "triggerPrice": tp_price_str, # ИСПОЛЬЗУЕМ triggerPrice
             })
 
-            # ПРОВЕРКА ОТВЕТА TAKE PROFIT
             if isinstance(tp_order, dict) and tp_order.get("algoId"):
                 await tg(f"<b>LONG {symbol}</b>\n✅ TAKE PROFIT ({TAKE_PROFIT_RATE}%) УСТАНОВЛЕН @ {tp_price_str}")
             else:
@@ -330,7 +330,6 @@ async def open_long(sym: str):
         error_log = format_error_detail(order)
         await tg(f"<b>Ошибка открытия LONG {symbol}</b>\n<code>{error_log}</code>")
 
-
 async def open_short(sym: str):
     global active_trailing_enabled, take_profit_enabled
     
@@ -339,7 +338,6 @@ async def open_short(sym: str):
 
     symbol, qty_str, price = result
     
-    # ... (Проверка на уже открытую позицию - для краткости опущена)
     pos_data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     is_open_on_exchange = False
     if pos_data and isinstance(pos_data, list):
@@ -350,7 +348,6 @@ async def open_short(sym: str):
         await tg(f"<b>{symbol}</b> — SHORT уже открыта на бирже. Пропуск.")
         return
     active_shorts.discard(symbol) 
-    # =================================================================
 
     # 3. Открытие SHORT позиции (Market)
     order = await binance("POST", "/fapi/v1/order", {
@@ -372,7 +369,6 @@ async def open_short(sym: str):
                 "type": "TRAILING_STOP_MARKET", "quantity": qty_str, "callbackRate": rate_str, "activationPrice": activation_price_str, 
             })
 
-            # ПРОВЕРКА ОТВЕТА TRAILING STOP
             if isinstance(trailing_order, dict) and trailing_order.get("algoId"):
                 await tg(f"<b>SHORT {symbol}</b>\n✅ TRAILING STOP ({TRAILING_RATE}%) УСТАНОВЛЕН")
             else:
@@ -388,10 +384,9 @@ async def open_short(sym: str):
 
             tp_order = await binance("POST", "/fapi/v1/algoOrder", { 
                 "algoType": "CONDITIONAL", "symbol": symbol, "side": "BUY", "positionSide": "SHORT",
-                "type": "TAKE_PROFIT_MARKET", "quantity": qty_str, "stopPrice": tp_price_str, 
+                "type": "TAKE_PROFIT_MARKET", "quantity": qty_str, "triggerPrice": tp_price_str, # ИСПОЛЬЗУЕМ triggerPrice
             })
 
-            # ПРОВЕРКА ОТВЕТА TAKE PROFIT
             if isinstance(tp_order, dict) and tp_order.get("algoId"):
                 await tg(f"<b>SHORT {symbol}</b>\n✅ TAKE PROFIT ({TAKE_PROFIT_RATE}%) УСТАНОВЛЕН @ {tp_price_str}")
             else:
@@ -404,11 +399,9 @@ async def open_short(sym: str):
         error_log = format_error_detail(order)
         await tg(f"<b>Ошибка открытия SHORT {symbol}</b>\n<code>{error_log}</code>")
 
-
-# ... (close_position, close_long, close_short, Telegram Webhook Handler и FastAPI без значительных изменений)
-
+# ... (close_long/close_short/close_position - логика закрытия)
 async def close_position(sym: str, position_side: str, active_set: Set[str]):
-    # ... (логика без изменений)
+    """Универсальная функция для закрытия LONG или SHORT позиции."""
     symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
     await binance("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
     pos_data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
@@ -422,6 +415,7 @@ async def close_position(sym: str, position_side: str, active_set: Set[str]):
     if not qty_str or float(qty_str) == 0:
         active_set.discard(symbol)
         await tg(f"<b>{position_side} {symbol}</b> — позиция уже закрыта на бирже"); return
+        
     close_side = "SELL" if position_side == "LONG" else "BUY"
     qty_to_close = fix_qty(symbol, abs(float(qty_str)))
     close_order = await binance("POST", "/fapi/v1/order", {
@@ -438,8 +432,12 @@ async def close_position(sym: str, position_side: str, active_set: Set[str]):
 async def close_long(sym: str): await close_position(sym, "LONG", active_longs)
 async def close_short(sym: str): await close_position(sym, "SHORT", active_shorts)
 
+
+# ==================== TELEGRAM WEBHOOK HANDLER =====================
+
 def create_trailing_menu(trailing_status: bool, tp_status: bool):
-    # ... (логика меню без изменений)
+    """Создает клавиатуру для меню Trailing Stop и Take Profit."""
+    
     trailing_text = "ВКЛЮЧЕН" if trailing_status else "ОТКЛЮЧЕН"
     tp_text = "ВКЛЮЧЕН" if tp_status else "ОТКЛЮЧЕН"
     
@@ -466,13 +464,17 @@ def create_trailing_menu(trailing_status: bool, tp_status: bool):
     return text, reply_markup
 
 async def handle_telegram_update(update_json: Dict):
+    """Обработка всех входящих сообщений и callback-запросов от Telegram."""
     global active_trailing_enabled, take_profit_enabled
+    
     update = Update.de_json(update_json, tg_bot)
     
     # 1. Обработка команд (/start, /menu)
     if update.message and update.message.text:
         message = update.message
+        
         if message.chat.id != CHAT_ID: await tg_bot.send_message(message.chat.id, "Доступ запрещен."); return
+
         text_lower = message.text.lower()
         if text_lower == '/start' or text_lower == '/menu':
             text, reply_markup = create_trailing_menu(active_trailing_enabled, take_profit_enabled)
@@ -481,7 +483,9 @@ async def handle_telegram_update(update_json: Dict):
     # 2. Обработка нажатий на кнопки (CallbackQuery)
     elif update.callback_query:
         query = update.callback_query
+        
         if query.message.chat.id != CHAT_ID: await query.answer("Доступ запрещен.", show_alert=True); return
+
         data = query.data
         state_changed = False
         
@@ -490,7 +494,7 @@ async def handle_telegram_update(update_json: Dict):
         elif data == 'set_tp_true' and not take_profit_enabled: take_profit_enabled = True; state_changed = True
         elif data == 'set_tp_false' and take_profit_enabled: take_profit_enabled = False; state_changed = True
         
-        await query.answer()
+        await query.answer() 
         
         if state_changed:
             status_t = "ВКЛЮЧЕН" if active_trailing_enabled else "ОТКЛЮЧЕН"
@@ -502,7 +506,7 @@ async def handle_telegram_update(update_json: Dict):
 
 
 async def set_telegram_webhook(url: str):
-    # ... (логика без изменений)
+    """Регистрирует Webhook URL в Telegram при старте приложения."""
     try:
         response = await tg_bot.set_webhook(url=url)
         if response:
@@ -515,26 +519,29 @@ async def set_telegram_webhook(url: str):
         await tg(f"<b>Критическая ошибка Telegram API</b>\nНе удалось установить Webhook: <code>{e}</code>")
 
 
-# ================= FASTAPI ПРИЛОЖЕНИЕ (Без изменений) =========================
+# ================= FASTAPI ПРИЛОЖЕНИЕ =========================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Асинхронная загрузка данных о точности и позициях
     await load_exchange_info()
     await load_active_positions()
     
+    # Установка вебхука при старте
     webhook_url = f"{PUBLIC_HOST_URL}/telegram_webhook/{TELEGRAM_TOKEN}"
     await set_telegram_webhook(webhook_url)
     
     status_t = "ВКЛЮЧЕН" if active_trailing_enabled else "ОТКЛЮЧЕН"
     status_tp = "ВКЛЮЧЕН" if take_profit_enabled else "ОТКЛЮЧЕН"
     await tg(
-        f"<b>OZ BOT 2025 — ONLINE (v1.6.1)</b>\n"
+        f"<b>OZ BOT 2025 — ONLINE (v1.6.2)</b>\n"
         f"Трейлинг Стоп: <b>{status_t}</b> ({TRAILING_RATE}%)\n"
         f"Take Profit: <b>{status_tp}</b> ({TAKE_PROFIT_RATE}%)\n"
         f"Управление через Telegram Webhook (/menu)."
     )
     yield
     
+    # Очистка вебхука при завершении
     try:
         await tg_bot.delete_webhook()
         print("Telegram Webhook очищен.")
@@ -546,30 +553,46 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.6.1)</h1>")
+    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.6.2)</h1>")
 
 @app.post("/telegram_webhook/{token}")
 async def handle_telegram(token: str, request: Request):
-    if token != TELEGRAM_TOKEN: raise HTTPException(status_code=403, detail="Invalid Telegram Token")
-    try: update_data = await request.json()
-    except json.JSONDecodeError: raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    if token != TELEGRAM_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid Telegram Token")
+    
+    try:
+        update_data = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
     asyncio.create_task(handle_telegram_update(update_data))
+    
     return {"ok": True}
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    if request.headers.get("X-Webhook-Secret") != WEBHOOK_SECRET: raise HTTPException(status_code=403, detail="Invalid webhook secret")
-    try: data = await request.json()
-    except Exception: raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    if request.headers.get("X-Webhook-Secret") != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid webhook secret")
+    
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
     symbol = data.get("symbol", "").upper()
     signal = data.get("signal", "").upper()
 
-    if not symbol or not signal: raise HTTPException(status_code=400, detail="Missing symbol or signal in payload")
+    if not symbol or not signal:
+        raise HTTPException(status_code=400, detail="Missing symbol or signal in payload")
 
-    if signal == "LONG": asyncio.create_task(open_long(symbol))
-    elif signal == "CLOSE_LONG": asyncio.create_task(close_long(symbol))
-    elif signal == "SHORT": asyncio.create_task(open_short(symbol))
-    elif signal == "CLOSE_SHORT": asyncio.create_task(close_short(symbol))
+    if signal == "LONG":
+        asyncio.create_task(open_long(symbol))
+    elif signal == "CLOSE_LONG":
+        asyncio.create_task(close_long(symbol))
+    elif signal == "SHORT":
+        asyncio.create_task(open_short(symbol))
+    elif signal == "CLOSE_SHORT":
+        asyncio.create_task(close_short(symbol))
     else:
         print(f"[WARNING] Получен неизвестный сигнал: {signal} для {symbol}")
         return {"ok": False, "message": f"Unknown signal: {signal}"}
