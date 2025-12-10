@@ -1,5 +1,5 @@
 # =========================================================================================
-# OZ TRADING BOT 2025 v1.6.4 | КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Ошибки -1102 для marginType/leverage
+# OZ TRADING BOT 2025 v1.6.5 | ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ: Комбинированная отправка POST-параметров
 # =========================================================================================
 import os
 import time
@@ -78,15 +78,16 @@ def format_error_detail(error_result: Dict[str, Any]) -> str:
     return json.dumps(error_result, indent=2)
 
 
-# ================= BINANCE API ЗАПРОСЫ (ИСПРАВЛЕНИЕ POST-ПАРАМЕТРОВ v1.6.4) ====================
+# ================= BINANCE API ЗАПРОСЫ (КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ v1.6.5) ====================
 async def binance(method: str, path: str, params: Dict | None = None, signed: bool = True) -> Any | Dict[str, Any]:
     """
     Универсальная функция для запросов к API Binance Futures.
-    Исправлена логика передачи параметров для POST/PUT/DELETE, чтобы избежать ошибки -1102.
+    Исправлена логика передачи параметров для POST/PUT/DELETE, чтобы избежать ошибок -1022 и -1102.
     """
     url = BASE + path
     p = params.copy() if params else {}
     
+    # Инициализируем переменные, которые будут переданы в httpx
     final_params = None # Параметры для URL
     request_data = None # Параметры для тела запроса (data)
 
@@ -100,6 +101,7 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
             return str(v)
 
         # 1. Создаем query_string, используя ВСЕ параметры для подписи
+        # ЭТО ДОЛЖНО ВКЛЮЧАТЬ ВСЕ ПАРАМЕТРЫ, ВКЛЮЧАЯ symbol, marginType и т.д.
         query_parts = [f"{k}={format_value(v)}" for k, v in sorted(p.items())]
         query_string = "&".join(query_parts)
 
@@ -108,26 +110,28 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
 
         # 3. Формируем URL и данные для отправки в зависимости от метода
         if method in ("POST", "PUT", "DELETE"):
+            
             # Для POST/PUT/DELETE:
-            # - URL содержит только технические параметры (timestamp, signature, recvWindow)
-            # - Тело запроса (data) содержит параметры ордера (symbol, quantity, side, etc.)
+            # - В URL отправляем только технические параметры и подпись, используя ?
+            # - Все параметры (включая symbol, quantity) отправляем в теле запроса (data)
             
-            # Разделяем параметры на те, что идут в URL (технические), и те, что идут в теле (зависимые от API)
+            url_params = {
+                "timestamp": p["timestamp"],
+                "recvWindow": p["recvWindow"],
+                "signature": signature
+            }
+            # Используем `final_params` для URL-параметров httpx
+            final_params = url_params
             
-            # Для Binance Futures, кажется, что технические параметры (включая подпись)
-            # должны быть в URL, а остальные в теле (data) для POST/PUT
-            
-            # Формируем URL с подписью и всеми параметрами (как в GET) - это было правильно для подписи в v1.6.3
-            url = f"{url}?{query_string}&signature={signature}"
-            
-            # НО! Для избежания -1102, мы также отправляем все параметры в теле запроса (data)
-            # Это может быть избыточно, но должно удовлетворить API.
+            # Все остальные параметры (payload) идут в теле (data)
             request_data = p
-            final_params = None 
-        else: # Для GET: URL содержит все параметры и подпись
-            url = f"{url}?{query_string}&signature={signature}"
-            final_params = None
+            
+        else: # Для GET:
+            # URL содержит все параметры и подпись
+            p["signature"] = signature
+            final_params = p
             request_data = None
+
     else:
         # Для неподписанных запросов (GET)
         final_params = p
@@ -136,10 +140,11 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
     headers = {"X-MBX-APIKEY": API_KEY}
     
     try:
-        # Отправляем запрос
+        # Отправляем запрос. httpx сам корректно сформирует URL для GET/SIGNED_GET 
+        # и тело запроса для SIGNED_POST/PUT/DELETE, используя `params` и `data`.
         r = await client.request(method, url, params=final_params, data=request_data, headers=headers) 
         
-        # ... (Остальная логика обработки ответов без изменений)
+        # ... (Обработка ошибок 400/500 - без изменений)
         if r.status_code != 200:
             
             error_data = {"status": r.status_code, "text": r.text}
@@ -172,7 +177,7 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
         await tg(f"<b>CRITICAL HTTP ERROR</b>\n{str(e)[:3800]}")
         return {"status": 0, "text": str(e)}
 
-# ================ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (Без изменений) ====================
+# ================ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (Остальное без изменений) ====================
 def calculate_precision_from_stepsize(step_size: str) -> int:
     s = step_size.rstrip('0')
     if '.' not in s: return 0
@@ -491,7 +496,7 @@ async def handle_telegram_update(update_json: Dict):
         if data == 'set_trailing_true' and not active_trailing_enabled: active_trailing_enabled = True; state_changed = True
         elif data == 'set_trailing_false' and active_trailing_enabled: active_trailing_enabled = False; state_changed = True
         elif data == 'set_tp_true' and not take_profit_enabled: take_profit_enabled = True; state_changed = True
-        elif data == 'set_tp_false' and take_trailing_enabled: take_profit_enabled = False; state_changed = True
+        elif data == 'set_tp_false' and active_trailing_enabled: take_profit_enabled = False; state_changed = True
         
         await query.answer() 
         
@@ -530,7 +535,7 @@ async def lifespan(app: FastAPI):
     status_t = "ВКЛЮЧЕН" if active_trailing_enabled else "ОТКЛЮЧЕН"
     status_tp = "ВКЛЮЧЕН" if take_profit_enabled else "ОТКЛЮЧЕН"
     await tg(
-        f"<b>OZ BOT 2025 — ONLINE (v1.6.4)</b>\n"
+        f"<b>OZ BOT 2025 — ONLINE (v1.6.5)</b>\n"
         f"Трейлинг Стоп: <b>{status_t}</b> ({TRAILING_RATE}%)\n"
         f"Take Profit: <b>{status_tp}</b> ({TAKE_PROFIT_RATE}%)\n"
         f"Управление через Telegram Webhook (/menu)."
@@ -548,7 +553,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.6.4)</h1>")
+    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.6.5)</h1>")
 
 @app.post("/telegram_webhook/{token}")
 async def handle_telegram(token: str, request: Request):
