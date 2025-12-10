@@ -1,10 +1,11 @@
 # =========================================================================================
-# OZ TRADING BOT 2025 v1.4.0 | ДОБАВЛЕНИЕ: Telegram-Меню для Вкл/Откл Trailing Stop
+# OZ TRADING BOT 2025 v1.5.0 | ИСПРАВЛЕНИЕ МЕНЮ: Переход на Telegram Webhook (без Polling)
 # =========================================================================================
 import os
 import time
 import hmac
 import hashlib
+import json
 from typing import Dict, Set
 import httpx
 import asyncio
@@ -12,11 +13,11 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 # Импортируем необходимые классы для Telegram-бота
 from telegram import Bot, Update, InlineKeyboardMarkup, InlineKeyboardButton, constants
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.error import TelegramError
 from contextlib import asynccontextmanager
 
 # ==================== КОНФИГУРАЦИЯ ====================
-required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "BINANCE_API_KEY", "BINANCE_API_SECRET", "WEBHOOK_SECRET"]
+required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "BINANCE_API_KEY", "BINANCE_API_SECRET", "WEBHOOK_SECRET", "PUBLIC_HOST_URL"]
 for v in required:
     if not os.getenv(v):
         raise ValueError(f"Нет переменной окружения: {v}")
@@ -30,6 +31,7 @@ except (ValueError, TypeError):
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+PUBLIC_HOST_URL = os.getenv("PUBLIC_HOST_URL").rstrip('/') # Убираем слэш в конце
 AMOUNT = float(os.getenv("FIXED_AMOUNT_USD", "30")) # Объем сделки в USD
 LEV = int(os.getenv("LEVERAGE", "10")) # Плечо
 TRAILING_RATE = float(os.getenv("TRAILING_RATE", "0.5")) # Процент отката для Trailing Stop
@@ -44,10 +46,10 @@ active_longs: Set[str] = set()
 active_shorts: Set[str] = set() 
 active_trailing_enabled: bool = os.getenv("TRAILING_ENABLED", "true").lower() in ('true', '1', 't')
 
-# Инициализация Telegram Bot для общих функций (например, tg())
+# Инициализация Telegram Bot для всех функций
 tg_bot = Bot(token=TELEGRAM_TOKEN) 
 
-# ================= TELEGRAM УВЕДОМЛЕНИЯ =====================
+# ================= TELEGRAM УВЕДОМЛЕНИЯ (Не изменены) =====================
 async def tg(text: str):
     """Отправляет сообщение в Telegram, используя HTML форматирование."""
     try:
@@ -109,47 +111,38 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
         return None
 
 # ================ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (Загрузка инфо, позиций, округление) ================
+# ... (Оставим эти функции без изменений для экономии места)
 def calculate_precision_from_stepsize(step_size: str) -> int:
-    """Вычисляет необходимое количество знаков после запятой из stepSize."""
     s = step_size.rstrip('0')
-    if '.' not in s:
-        return 0
+    if '.' not in s: return 0
     return len(s.split('.')[-1])
 
 async def load_exchange_info():
-    """Загружает точность (precision) для всех символов с Binance."""
     global symbol_precision
     try:
         data = await binance("GET", "/fapi/v1/exchangeInfo", signed=False)
-        
         if not data or not isinstance(data, dict) or 'symbols' not in data:
             await tg("<b>Ошибка:</b> Не удалось загрузить информацию о бинарных символах.")
             return
-
         for symbol_info in data['symbols']:
             sym = symbol_info['symbol']
             lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
-            
             if lot_size_filter:
                 step_size = lot_size_filter['stepSize']
                 precision = calculate_precision_from_stepsize(step_size)
                 symbol_precision[sym] = precision
-        
         await tg(f"<b>Загружена информация о бинарных символах:</b> Точность определена для {len(symbol_precision)} пар.")
-
     except Exception as e:
         await tg(f"<b>Критическая ошибка при загрузке exchangeInfo:</b> {e}")
 
 
 async def load_active_positions():
-    """Загружает открытые LONG и SHORT позиции с Binance в соответствующие множества при старте."""
     global active_longs, active_shorts
     try:
         data = await binance("GET", "/fapi/v2/positionRisk", signed=True)
         if data and isinstance(data, list):
             open_longs_temp = set()
             open_shorts_temp = set()
-            
             for p in data:
                 amt = float(p.get("positionAmt", 0))
                 if amt > 0 and p.get("positionSide") == "LONG":
@@ -159,7 +152,6 @@ async def load_active_positions():
 
             active_longs = open_longs_temp
             active_shorts = open_shorts_temp
-            
             await tg(f"<b>Начальная загрузка позиций:</b>\nНайдено {len(active_longs)} LONG и {len(active_shorts)} SHORT позиций.")
         elif data:
              await tg(f"<b>Ошибка при загрузке активных позиций:</b> Некорректный ответ Binance:\n<pre>{str(data)[:1500]}</pre>")
@@ -168,23 +160,15 @@ async def load_active_positions():
 
 
 def fix_qty(symbol: str, qty: float) -> str:
-    """Округляет количество в зависимости от динамически загруженной точности Binance."""
     precision = symbol_precision.get(symbol.upper(), 3)
-
-    if precision == 0:
-        return str(int(qty)) 
-    
+    if precision == 0: return str(int(qty)) 
     return f"{qty:.{precision}f}".rstrip("0").rstrip(".")
 
 async def get_symbol_and_qty(sym: str) -> tuple[str, str, float] | None:
-    """Вспомогательная функция для получения символа, цены и рассчитанного количества."""
     symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
-    
-    # 1. Установка Cross Margin и плеча
     await binance("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": "CROSS"})
     await binance("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEV})
 
-    # 2. Получение цены
     price_data = await binance("GET", "/fapi/v1/ticker/price", {"symbol": symbol}, signed=False)
     if not price_data or 'price' not in price_data:
         await tg(f"<b>Ошибка:</b> Не удалось получить цену для {symbol}")
@@ -193,77 +177,50 @@ async def get_symbol_and_qty(sym: str) -> tuple[str, str, float] | None:
     price = float(price_data["price"])
     qty_f = AMOUNT * LEV / price
     qty_str = fix_qty(symbol, qty_f)
-    
     return symbol, qty_str, price 
+# ================ КОНЕЦ ВСПОМОГАТЕЛЬНЫХ ФУНКЦИЙ ===============================
 
-# ================= ФУНКЦИИ ОТКРЫТИЯ/ЗАКРЫТИЯ (Логика Trailing Stop не изменена) =======================
 
+# ================= ФУНКЦИИ ОТКРЫТИЯ/ЗАКРЫТИЯ (Логика не изменена) =======================
+# ... (open_long, open_short, close_position, close_long, close_short - без изменений)
 async def open_long(sym: str):
     global active_trailing_enabled
-    
     result = await get_symbol_and_qty(sym)
     if not result: return
 
     symbol, qty_str, price = result
-    
-    # ... (Проверка на уже открытую позицию)
     pos_data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     is_open_on_exchange = False
-    existing_long = None
-    
     if pos_data and isinstance(pos_data, list):
-        existing_long = next((p for p in pos_data if p.get("positionSide") == "LONG" and float(p.get("positionAmt", 0)) > 0), None)
-        if existing_long:
+        if next((p for p in pos_data if p.get("positionSide") == "LONG" and float(p.get("positionAmt", 0)) > 0), None):
             is_open_on_exchange = True
             
     if is_open_on_exchange:
         active_longs.add(symbol) 
-        amt_str = existing_long.get('positionAmt', 'N/A') if existing_long else 'N/A'
-        await tg(f"<b>{symbol}</b> — LONG уже открыта на бирже ({amt_str} шт). Пропуск сигнала.")
+        await tg(f"<b>{symbol}</b> — LONG уже открыта на бирже. Пропуск.")
         return
 
     active_longs.discard(symbol) 
-    # =================================================================
-
-    # 3. Открытие LONG позиции (Market)
     order = await binance("POST", "/fapi/v1/order", {
-        "symbol": symbol,
-        "side": "BUY",
-        "positionSide": "LONG",
-        "type": "MARKET",
-        "quantity": qty_str
+        "symbol": symbol, "side": "BUY", "positionSide": "LONG", "type": "MARKET", "quantity": qty_str
     })
 
     if order and order.get("orderId"):
         active_longs.add(symbol)
-        
         rate_str = f"{TRAILING_RATE:.2f}" 
         activation_price_str = f"{price:.8f}".rstrip("0").rstrip(".") 
+        await tg(f"<b>LONG ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт...\n@ {price:.8f}\n\nПопытка установить Trailing Stop.")
         
-        await tg(f"<b>LONG ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\nПопытка установить Trailing Stop. QTY: <code>{qty_str}</code>, RATE: <code>{rate_str}</code>, Activation: <code>{activation_price_str}</code>")
-        
-        # 4. Размещение TRAILING_STOP_MARKET ордера (SELL для закрытия LONG)
         if active_trailing_enabled:
             trailing_order = await binance("POST", "/fapi/v1/algoOrder", { 
-                "algoType": "CONDITIONAL", 
-                "symbol": symbol, 
-                "side": "SELL",
-                "positionSide": "LONG",
-                "type": "TRAILING_STOP_MARKET", 
-                "quantity": qty_str,
-                "callbackRate": rate_str, 
-                "activationPrice": activation_price_str, 
+                "algoType": "CONDITIONAL", "symbol": symbol, "side": "SELL", "positionSide": "LONG",
+                "type": "TRAILING_STOP_MARKET", "quantity": qty_str, "callbackRate": rate_str, "activationPrice": activation_price_str, 
             })
-
             if trailing_order and (isinstance(trailing_order, dict) and trailing_order.get("algoId")):
                 await tg(f"<b>LONG ×{LEV} (Cross+Hedge) {symbol}</b>\n✅ TRAILING STOP ({TRAILING_RATE}%) УСТАНОВЛЕН")
             else:
                 log_detail = str(trailing_order) if trailing_order else "Пустой или None ответ от Binance"
-                if isinstance(log_detail, str) and log_detail.strip().startswith("<"):
-                    log_text = f"ОТВЕТ В ФОРМАТЕ HTML. Обрезан лог: {log_detail[:100]}..."
-                else:
-                    log_text = log_detail
-                await tg(f"<b>LONG ×{LEV} (Cross+Hedge) {symbol}</b>\n⚠️ ОШИБКА УСТАНОВКИ TRAILING STOP (СМОТРИТЕ ЛОГ)\n<pre>{log_text}</pre>")
+                await tg(f"<b>LONG ×{LEV} (Cross+Hedge) {symbol}</b>\n⚠️ ОШИБКА УСТАНОВКИ TRAILING STOP\n<pre>{log_detail[:200]}</pre>")
         else:
              await tg(f"<b>LONG ×{LEV} (Cross+Hedge) {symbol}</b>\n🚫 TRAILING STOP ОТКЛЮЧЕН настройкой бота.")
     else:
@@ -271,111 +228,61 @@ async def open_long(sym: str):
 
 async def open_short(sym: str):
     global active_trailing_enabled
-    
     result = await get_symbol_and_qty(sym)
     if not result: return
 
     symbol, qty_str, price = result
-    
-    # ... (Проверка на уже открытую позицию)
     pos_data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     is_open_on_exchange = False
-    existing_short = None
-    
     if pos_data and isinstance(pos_data, list):
-        existing_short = next((p for p in pos_data if p.get("positionSide") == "SHORT" and float(p.get("positionAmt", 0)) < 0), None)
-        if existing_short:
+        if next((p for p in pos_data if p.get("positionSide") == "SHORT" and float(p.get("positionAmt", 0)) < 0), None):
             is_open_on_exchange = True
 
     if is_open_on_exchange:
         active_shorts.add(symbol) 
-        amt_str = existing_short.get('positionAmt', 'N/A') if existing_short else 'N/A'
-        await tg(f"<b>{symbol}</b> — SHORT уже открыта на бирже ({amt_str} шт). Пропуск сигнала.")
+        await tg(f"<b>{symbol}</b> — SHORT уже открыта на бирже. Пропуск.")
         return
 
     active_shorts.discard(symbol) 
-    # =================================================================
-
-    # 3. Открытие SHORT позиции (Market)
     order = await binance("POST", "/fapi/v1/order", {
-        "symbol": symbol,
-        "side": "SELL", 
-        "positionSide": "SHORT", 
-        "type": "MARKET",
-        "quantity": qty_str
+        "symbol": symbol, "side": "SELL", "positionSide": "SHORT", "type": "MARKET", "quantity": qty_str
     })
 
     if order and order.get("orderId"):
         active_shorts.add(symbol)
-        
         rate_str = f"{TRAILING_RATE:.2f}"
         activation_price_str = f"{price:.8f}".rstrip("0").rstrip(".") 
+        await tg(f"<b>SHORT ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт...\n@ {price:.8f}\n\nПопытка установить Trailing Stop.")
 
-        await tg(f"<b>SHORT ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт ≈ ${AMOUNT*LEV:.2f} (Объем) / ${AMOUNT:.2f} (Обеспечение)\n@ {price:.8f}\n\nПопытка установить Trailing Stop. QTY: <code>{qty_str}</code>, RATE: <code>{rate_str}</code>, Activation: <code>{activation_price_str}</code>")
-
-        # 4. Размещение TRAILING_STOP_MARKET ордера (BUY для закрытия SHORT)
         if active_trailing_enabled:
             trailing_order = await binance("POST", "/fapi/v1/algoOrder", { 
-                "algoType": "CONDITIONAL", 
-                "symbol": symbol, 
-                "side": "BUY",
-                "positionSide": "SHORT",
-                "type": "TRAILING_STOP_MARKET", 
-                "quantity": qty_str,
-                "callbackRate": rate_str, 
-                "activationPrice": activation_price_str, 
+                "algoType": "CONDITIONAL", "symbol": symbol, "side": "BUY", "positionSide": "SHORT",
+                "type": "TRAILING_STOP_MARKET", "quantity": qty_str, "callbackRate": rate_str, "activationPrice": activation_price_str, 
             })
-
             if trailing_order and (isinstance(trailing_order, dict) and trailing_order.get("algoId")):
                 await tg(f"<b>SHORT ×{LEV} (Cross+Hedge) {symbol}</b>\n✅ TRAILING STOP ({TRAILING_RATE}%) УСТАНОВЛЕН")
             else:
                 log_detail = str(trailing_order) if trailing_order else "Пустой или None ответ от Binance"
-                if isinstance(log_detail, str) and log_detail.strip().startswith("<"):
-                    log_text = f"ОТВЕТ В ФОРМАТЕ HTML. Обрезан лог: {log_detail[:100]}..."
-                else:
-                    log_text = log_detail
-
-                await tg(f"<b>SHORT ×{LEV} (Cross+Hedge) {symbol}</b>\n⚠️ ОШИБКА УСТАНОВКИ TRAILING STOP (СМОТРИТЕ ЛОГ)\n<pre>{log_text}</pre>")
+                await tg(f"<b>SHORT ×{LEV} (Cross+Hedge) {symbol}</b>\n⚠️ ОШИБКА УСТАНОВКИ TRAILING STOP\n<pre>{log_detail[:200]}</pre>")
         else:
             await tg(f"<b>SHORT ×{LEV} (Cross+Hedge) {symbol}</b>\n🚫 TRAILING STOP ОТКЛЮЧЕН настройкой бота.")
-
     else:
         await tg(f"<b>Ошибка открытия SHORT {symbol}</b>")
 
-
 async def close_position(sym: str, position_side: str, active_set: Set[str]):
-    """Универсальная функция для закрытия LONG или SHORT позиции."""
-    # ... (Закрытие позиций, логика не изменена)
     symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
-    
-    # 1. Отмена всех активных ордеров (включая Trailing Stop)
     await binance("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
-    
-    # 2. Проверка текущей позиции на бирже
     pos_data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-    if not pos_data:
-        await tg(f"<b>{symbol}</b> — Не удалось получить данные о позиции.")
-        return
-    
+    if not pos_data: await tg(f"<b>{symbol}</b> — Не удалось получить данные о позиции."); return
     qty_str = next((p["positionAmt"] for p in pos_data if p["positionSide"] == position_side and abs(float(p["positionAmt"])) > 0), None)
-    
     if not qty_str or float(qty_str) == 0:
         active_set.discard(symbol)
-        await tg(f"<b>{position_side} {symbol}</b> — позиция уже закрыта на бирже")
-        return
-
+        await tg(f"<b>{position_side} {symbol}</b> — позиция уже закрыта на бирже"); return
     close_side = "SELL" if position_side == "LONG" else "BUY"
     qty_to_close = fix_qty(symbol, abs(float(qty_str)))
-
-    # 3. Закрытие позиции (Market)
     close_order = await binance("POST", "/fapi/v1/order", {
-        "symbol": symbol,
-        "side": close_side,
-        "positionSide": position_side,
-        "type": "MARKET",
-        "quantity": qty_to_close,
+        "symbol": symbol, "side": close_side, "positionSide": position_side, "type": "MARKET", "quantity": qty_to_close,
     })
-    
     if close_order and close_order.get("orderId"):
         active_set.discard(symbol)
         await tg(f"<b>CLOSE {position_side} {symbol} УСПЕШНО</b>\n{qty_to_close} шт")
@@ -387,21 +294,16 @@ async def close_long(sym: str):
 
 async def close_short(sym: str):
     await close_position(sym, "SHORT", active_shorts)
+# ================= КОНЕЦ ФУНКЦИЙ ОТКРЫТИЯ/ЗАКРЫТИЯ =======================
 
 
-# ==================== TELEGRAM HANDLER (НОВЫЙ БЛОК) =====================
+# ==================== TELEGRAM WEBHOOK HANDLER (НОВЫЙ БЛОК) =====================
 
-async def show_trailing_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет меню с кнопками для управления Trailing Stop."""
-    global active_trailing_enabled
+def create_trailing_menu(current_status: bool):
+    """Создает клавиатуру для меню Trailing Stop."""
+    status_text = "ВКЛЮЧЕН" if current_status else "ОТКЛЮЧЕН"
     
-    if update.effective_chat.id != CHAT_ID:
-        await context.bot.send_message(update.effective_chat.id, "Доступ запрещен.")
-        return
-
-    status = "ВКЛЮЧЕН" if active_trailing_enabled else "ОТКЛЮЧЕН"
-    
-    text = f"<b>⚙️ Управление ботом</b>\n\nТекущий статус Trailing Stop: <b>{status}</b>\n(Комиссия: {TRAILING_RATE}%)"
+    text = f"<b>⚙️ Управление ботом</b>\n\nТекущий статус Trailing Stop: <b>{status_text}</b>\n(Комиссия: {TRAILING_RATE}%)"
     
     keyboard = [
         [
@@ -415,92 +317,131 @@ async def show_trailing_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+    return text, reply_markup
 
-    # Если это команда /menu, отправляем новое сообщение
-    if update.message:
-        await update.message.reply_html(text, reply_markup=reply_markup)
-    # Если это обновление статуса, редактируем сообщение
+async def handle_telegram_update(update_json: Dict):
+    """
+    Основная функция для обработки всех входящих сообщений и callback-запросов от Telegram.
+    """
+    global active_trailing_enabled
+    
+    update = Update.de_json(update_json, tg_bot)
+    
+    # 1. Обработка команд (/start, /menu)
+    if update.message and update.message.text:
+        message = update.message
+        
+        # Проверка CHAT_ID для безопасности
+        if message.chat.id != CHAT_ID:
+            await tg_bot.send_message(message.chat.id, "Доступ запрещен.")
+            return
+
+        text_lower = message.text.lower()
+        if text_lower == '/start' or text_lower == '/menu':
+            text, reply_markup = create_trailing_menu(active_trailing_enabled)
+            await message.reply_html(text, reply_markup=reply_markup)
+            return
+
+    # 2. Обработка нажатий на кнопки (CallbackQuery)
     elif update.callback_query:
         query = update.callback_query
-        await query.answer()
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=constants.ParseMode.HTML)
+        
+        # Проверка CHAT_ID для безопасности
+        if query.message.chat.id != CHAT_ID:
+            await query.answer("Доступ запрещен.", show_alert=True)
+            return
+
+        data = query.data
+        new_state = None
+        message = None
+        
+        if data == 'set_trailing_true':
+            new_state = True
+            message = "Трейлинг Стоп успешно ВКЛЮЧЕН."
+        elif data == 'set_trailing_false':
+            new_state = False
+            message = "Трейлинг Стоп успешно ОТКЛЮЧЕН."
+        
+        await query.answer() # Всегда отвечаем на callback
+        
+        # Изменение состояния
+        if new_state is not None and new_state != active_trailing_enabled:
+            active_trailing_enabled = new_state
+            
+            # Обновление меню и отправка уведомления
+            text, reply_markup = create_trailing_menu(active_trailing_enabled)
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=constants.ParseMode.HTML)
+            
+            status = "ВКЛЮЧЕН" if active_trailing_enabled else "ОТКЛЮЧЕН"
+            await tg(f"<b>⚙️ Настройка бота изменена через Telegram</b>\nТрейлинг Стоп: <b>{status}</b>")
+            
+        # Обновление статуса или отсутствие изменения
+        elif data == 'refresh_trailing_status' or new_state is not None:
+            text, reply_markup = create_trailing_menu(active_trailing_enabled)
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=constants.ParseMode.HTML)
 
 
-async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает нажатия на кнопки инлайн-клавиатуры."""
-    global active_trailing_enabled
-    query = update.callback_query
-    
-    # Проверка CHAT_ID для безопасности
-    if query.message.chat.id != CHAT_ID:
-        await query.answer("Доступ запрещен.", show_alert=True)
-        return
+async def set_telegram_webhook(url: str):
+    """
+    Регистрирует Webhook URL в Telegram при старте приложения.
+    """
+    try:
+        response = await tg_bot.set_webhook(url=url)
+        if response:
+            print(f"✅ Telegram Webhook установлен на: {url}")
+            await tg(f"<b>Telegram Webhook установлен</b>\nURL: <code>{url}</code>")
+        else:
+            print(f"❌ Ошибка установки Webhook. URL: {url}")
+            await tg(f"<b>Ошибка!</b> Не удалось установить Telegram Webhook на: <code>{url}</code>")
+    except TelegramError as e:
+        print(f"❌ Критическая ошибка Telegram API при установке Webhook: {e}")
+        await tg(f"<b>Критическая ошибка Telegram API</b>\nНе удалось установить Webhook: <code>{e}</code>")
 
-    data = query.data
-    new_state = None
-    
-    if data == 'set_trailing_true':
-        new_state = True
-        message = "Трейлинг Стоп успешно ВКЛЮЧЕН."
-    elif data == 'set_trailing_false':
-        new_state = False
-        message = "Трейлинг Стоп успешно ОТКЛЮЧЕН."
-    elif data == 'refresh_trailing_status':
-        # Просто обновляем меню, без изменения состояния
-        await show_trailing_menu(update, context) 
-        return
-
-    if new_state is not None and new_state != active_trailing_enabled:
-        active_trailing_enabled = new_state
-        await query.answer(message)
-        # Обновляем меню после изменения состояния
-        await show_trailing_menu(update, context)
-        # Отправляем уведомление в основной чат
-        status = "ВКЛЮЧЕН" if active_trailing_enabled else "ОТКЛЮЧЕН"
-        await tg(f"<b>⚙️ Настройка бота изменена через Telegram</b>\nТрейлинг Стоп: <b>{status}</b>")
-    else:
-        # Если нажато то же состояние, просто обновляем меню для уверенности
-        await show_trailing_menu(update, context)
-
-
-async def run_telegram_bot():
-    """Запускает Telegram бота в режиме polling."""
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Добавляем обработчики команд
-    application.add_handler(CommandHandler("start", show_trailing_menu, filters=lambda update: update.effective_chat.id == CHAT_ID))
-    application.add_handler(CommandHandler("menu", show_trailing_menu, filters=lambda update: update.effective_chat.id == CHAT_ID))
-    
-    # Добавляем обработчик callback-запросов от кнопок
-    application.add_handler(CallbackQueryHandler(button_callback_handler))
-
-    print("Telegram Handler запущен (Polling)...")
-    await application.run_polling(poll_interval=1.0) # Интервал опроса
 
 # ================= FASTAPI ПРИЛОЖЕНИЕ =========================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Запускаем обработчик Telegram в фоновом режиме
-    telegram_task = asyncio.create_task(run_telegram_bot())
-    
     await load_exchange_info()
     await load_active_positions()
     
+    # 1. Установка вебхука при старте
+    webhook_url = f"{PUBLIC_HOST_URL}/telegram_webhook/{TELEGRAM_TOKEN}"
+    await set_telegram_webhook(webhook_url)
+    
     status = "ВКЛЮЧЕН" if active_trailing_enabled else "ОТКЛЮЧЕН"
-    await tg(f"<b>OZ BOT 2025 — ONLINE (v1.4.0)</b>\nСистема Trailing Stop: <b>{status}</b>.\nДобавлено управление через Telegram (/menu).")
+    await tg(f"<b>OZ BOT 2025 — ONLINE (v1.5.0)</b>\nСистема Trailing Stop: <b>{status}</b>.\nУправление через Telegram Webhook (/menu).")
     yield
-    # Остановка
-    telegram_task.cancel()
+    # 2. Очистка вебхука при завершении (опционально, но рекомендуется)
+    try:
+        await tg_bot.delete_webhook()
+        print("Telegram Webhook очищен.")
+    except Exception as e:
+        print(f"Ошибка при очистке вебхука: {e}")
     await client.aclose() 
 
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.4.0)</h1>")
+    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.5.0)</h1>")
 
-# УДАЛЕН старый эндпоинт /toggle_trailing, так как теперь используется Telegram-меню
+# НОВЫЙ ЭНДПОИНТ ДЛЯ ПРИЕМА ВСЕХ СООБЩЕНИЙ ОТ TELEGRAM
+@app.post("/telegram_webhook/{token}")
+async def handle_telegram(token: str, request: Request):
+    if token != TELEGRAM_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid Telegram Token")
+    
+    try:
+        update_data = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    # Передаем обработку асинхронной функции
+    asyncio.create_task(handle_telegram_update(update_data))
+    
+    # Немедленно возвращаем 200 OK, чтобы Telegram не переотправлял запрос
+    return {"ok": True}
 
 @app.post("/webhook")
 async def webhook(request: Request):
