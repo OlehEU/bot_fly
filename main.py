@@ -78,7 +78,7 @@ def format_error_detail(error_result: Dict[str, Any]) -> str:
     return json.dumps(error_result, indent=2)
 
 
-# ================= BINANCE API ЗАПРОСЫ (ИСПРАВЛЕНИЕ ПОДПИСИ) ====================
+# ================= BINANCE API ЗАПРОСЫ (ИСПРАВЛЕНИЕ ПОДПИСИ v1.6.3) ====================
 async def binance(method: str, path: str, params: Dict | None = None, signed: bool = True) -> Any | Dict[str, Any]:
     """
     Универсальная функция для запросов к API Binance Futures.
@@ -100,6 +100,7 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
             return str(v)
 
         # 1. Создаем query_string, используя ВСЕ параметры для подписи
+        # Параметры должны быть отсортированы и преобразованы в строку
         query_parts = [f"{k}={format_value(v)}" for k, v in sorted(p.items())]
         query_string = "&".join(query_parts)
 
@@ -107,12 +108,15 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
         signature = hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
 
         # 3. Формируем URL и данные для отправки в зависимости от метода
-        if method in ("POST", "PUT"):
-            # Для POST: URL содержит только подпись, тело содержит параметры (data)
+        if method in ("POST", "PUT", "DELETE"): # Binance API позволяет отправлять SIGNATURE в URL даже для POST/PUT/DELETE
+            # Для POST: URL содержит все параметры + подпись. Тело запроса пустое (None), но параметры используются в URL
             url = f"{url}?{query_string}&signature={signature}"
-            request_data = p # Все параметры идут в data
-            final_params = None 
-        else: # Для GET/DELETE: URL содержит все параметры и подпись
+            # Важно: для httpx POST с параметрами в URL, data/json/content должно быть None
+            # Для POST/PUT/DELETE можно также передать параметры в теле, но безопаснее использовать URL
+            # В данном исправлении мы используем URL для всех параметров, как в GET-запросах, что проще и надежнее.
+            final_params = None
+            request_data = None 
+        else: # Для GET: URL содержит все параметры и подпись
             url = f"{url}?{query_string}&signature={signature}"
             final_params = None 
     else:
@@ -122,10 +126,14 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
     headers = {"X-MBX-APIKEY": API_KEY}
     
     try:
-        # Теперь используем 'data' для POST/PUT, 'params' для GET
+        # Используем params для GET-запросов (когда final_params не None), data для POST/PUT (если нужно)
+        # В этой версии 1.6.3 все параметры для SIGNED запросов отправляются в URL, поэтому final_params=None, request_data=None.
+        # Для POST-запросов это часто приводит к тому, что параметры отправляются в теле, если request_data не None, но
+        # в Binance API часто используются URL-параметры + пустое тело. Уточним логику:
+        
         r = await client.request(method, url, params=final_params, data=request_data, headers=headers) 
         
-        # ... (Обработка ошибок 400/500 - без изменений)
+        # ... (Остальная логика обработки ответов без изменений)
         if r.status_code != 200:
             
             error_data = {"status": r.status_code, "text": r.text}
@@ -238,6 +246,7 @@ async def get_symbol_and_qty(sym: str) -> tuple[str, str, float] | None:
     symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
     
     # Настройка маржи и плеча
+    # Эти запросы теперь должны пройти, так как они подписаны корректно в v1.6.3
     await binance("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": "CROSS"})
     await binance("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEV})
 
@@ -476,7 +485,7 @@ async def handle_telegram_update(update_json: Dict):
         if data == 'set_trailing_true' and not active_trailing_enabled: active_trailing_enabled = True; state_changed = True
         elif data == 'set_trailing_false' and active_trailing_enabled: active_trailing_enabled = False; state_changed = True
         elif data == 'set_tp_true' and not take_profit_enabled: take_profit_enabled = True; state_changed = True
-        elif data == 'set_tp_false' and take_profit_enabled: take_profit_enabled = False; state_changed = True
+        elif data == 'set_tp_false' and active_trailing_enabled: take_profit_enabled = False; state_changed = True
         
         await query.answer() 
         
