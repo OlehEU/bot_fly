@@ -1,5 +1,5 @@
 # =========================================================================================
-# OZ TRADING BOT 2025 v1.5.2 | ИСПРАВЛЕНА ОШИБКА TP/TS -2021 (ДОБАВЛЕНА ЗАДЕРЖКА)
+# OZ TRADING BOT 2025 v1.5.3 | УЛУЧШЕНО ФОРМАТИРОВАНИЕ TELEGRAM
 # =========================================================================================
 import os
 import time
@@ -219,7 +219,7 @@ async def get_symbol_and_qty(sym: str) -> tuple[str, str, float] | None:
     return symbol, qty_str, price 
 
 
-# ================= ФУНКЦИИ ОТКРЫТИЯ (ИЗМЕНЕНЫ - ДОБАВЛЕНА ЗАДЕРЖКА) =======================
+# ================= ФУНКЦИИ ОТКРЫТИЯ (ОБНОВЛЕНО ФОРМАТИРОВАНИЕ TELEGRAM) =======================
 
 async def open_long(sym: str):
     global active_trailing_enabled, take_profit_enabled
@@ -252,10 +252,26 @@ async def open_long(sym: str):
         ts_activation_price_f = price * (1 + TAKE_PROFIT_RATE / 100)
         ts_activation_price_str = fix_price(symbol, ts_activation_price_f) 
 
-        await tg(f"<b>LONG ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт...\n@ {fix_price(symbol, price)}\n")
+        # НОВЫЙ БЛОК TELEGRAM: ОТЧЕТ ОБ ОТКРЫТИИ (Вариант 1)
+        usd_amount = float(qty_str) * price 
         
-        # НОВОЕ: Задержка 1.5 сек, чтобы цена успела отойти от триггера TP/TS
+        main_message = (
+            f"<b>🚀 LONG | {symbol.replace('USDT', '/USDT')} (x{LEV})</b>\n"
+            f"---"
+        )
+        await tg(main_message)
+        
+        detail_message = (
+            f"📈 Цена входа: <code>{fix_price(symbol, price)}</code>\n"
+            f"💵 Объем: {qty_str} шт (~${usd_amount:.0f})"
+        )
+        await tg(detail_message)
+        # КОНЕЦ НОВОГО БЛОКА
+
+        # Задержка 1.5 сек, чтобы цена успела отойти от триггера TP/TS
         await asyncio.sleep(1.5) 
+        
+        tp_ok, ts_ok = False, False # Флаги для проверки установки ордеров
         
         # 5. Размещение TRAILING_STOP_MARKET
         if active_trailing_enabled:
@@ -267,13 +283,11 @@ async def open_long(sym: str):
             })
 
             if isinstance(trailing_order, dict) and trailing_order.get("algoId"):
-                await tg(f"<b>LONG {symbol}</b>\n✅ TRAILING STOP ({TRAILING_RATE}%) УСТАНОВЛЕН\n(Активация @ {ts_activation_price_str})")
+                ts_ok = True
             else:
                 error_log = format_error_detail(trailing_order)
                 await tg(f"<b>LONG {symbol}</b>\n⚠️ ОШИБКА УСТАНОВКИ TRAILING STOP\n<code>{error_log}</code>")
-        else:
-             await tg(f"<b>LONG {symbol}</b>\n🚫 TRAILING STOP ОТКЛЮЧЕН")
-
+        
         # 6. Размещение TAKE_PROFIT_MARKET
         if take_profit_enabled:
             tp_price_f = price * (1 + TAKE_PROFIT_RATE / 100)
@@ -285,12 +299,21 @@ async def open_long(sym: str):
             })
 
             if isinstance(tp_order, dict) and tp_order.get("algoId"):
-                await tg(f"<b>LONG {symbol}</b>\n✅ TAKE PROFIT ({TAKE_PROFIT_RATE}%) УСТАНОВЛЕН @ {tp_price_str}")
+                tp_ok = True
             else:
                 error_log = format_error_detail(tp_order)
                 await tg(f"<b>LONG {symbol}</b>\n⚠️ ОШИБКА УСТАНОВКИ TAKE PROFIT\n<code>{error_log}</code>")
-        else:
-            await tg(f"<b>LONG {symbol}</b>\n🚫 TAKE PROFIT ОТКЛЮЧЕН")
+        
+        # НОВЫЙ БЛОК: Единое сообщение о результатах установки (Вариант 1)
+        if tp_ok or ts_ok:
+             tp_price_str = fix_price(symbol, price * (1 + TAKE_PROFIT_RATE / 100))
+             status_message = (
+                f"🎯 TP ({TAKE_PROFIT_RATE}%): <code>{tp_price_str}</code> {'✅' if tp_ok else '❌'}\n"
+                f"🛡️ TS ({TRAILING_RATE}%) Активация: <code>{ts_activation_price_str}</code> {'✅' if ts_ok else '❌'}\n"
+                f"\n✅ **Ордера установлены.**"
+             )
+             await tg(status_message)
+        # КОНЕЦ НОВОГО БЛОКА О РЕЗУЛЬТАТАХ
 
     else:
         error_log = format_error_detail(order)
@@ -328,10 +351,26 @@ async def open_short(sym: str):
         ts_activation_price_f = price * (1 - TAKE_PROFIT_RATE / 100)
         ts_activation_price_str = fix_price(symbol, ts_activation_price_f) 
 
-        await tg(f"<b>SHORT ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт...\n@ {fix_price(symbol, price)}\n")
+        # НОВЫЙ БЛОК TELEGRAM: ОТЧЕТ ОБ ОТКРЫТИИ (Вариант 1)
+        usd_amount = float(qty_str) * price
+        
+        main_message = (
+            f"<b>⬇️ SHORT | {symbol.replace('USDT', '/USDT')} (x{LEV})</b>\n"
+            f"---"
+        )
+        await tg(main_message)
+        
+        detail_message = (
+            f"📉 Цена входа: <code>{fix_price(symbol, price)}</code>\n"
+            f"💵 Объем: {qty_str} шт (~${usd_amount:.0f})"
+        )
+        await tg(detail_message)
+        # КОНЕЦ НОВОГО БЛОКА
 
-        # НОВОЕ: Задержка 1.5 сек, чтобы цена успела отойти от триггера TP/TS
+        # Задержка 1.5 сек, чтобы цена успела отойти от триггера TP/TS
         await asyncio.sleep(1.5) 
+
+        tp_ok, ts_ok = False, False # Флаги для проверки установки ордеров
 
         # 5. Размещение TRAILING_STOP_MARKET
         if active_trailing_enabled:
@@ -343,13 +382,11 @@ async def open_short(sym: str):
             })
 
             if isinstance(trailing_order, dict) and trailing_order.get("algoId"):
-                await tg(f"<b>SHORT {symbol}</b>\n✅ TRAILING STOP ({TRAILING_RATE}%) УСТАНОВЛЕН\n(Активация @ {ts_activation_price_str})")
+                ts_ok = True
             else:
                 error_log = format_error_detail(trailing_order)
                 await tg(f"<b>SHORT {symbol}</b>\n⚠️ ОШИБКА УСТАНОВКИ TRAILING STOP\n<code>{error_log}</code>")
-        else:
-            await tg(f"<b>SHORT {symbol}</b>\n🚫 TRAILING STOP ОТКЛЮЧЕН")
-
+        
         # 6. Размещение TAKE_PROFIT_MARKET
         if take_profit_enabled:
             tp_price_f = price * (1 - TAKE_PROFIT_RATE / 100)
@@ -361,12 +398,21 @@ async def open_short(sym: str):
             })
 
             if isinstance(tp_order, dict) and tp_order.get("algoId"):
-                await tg(f"<b>SHORT {symbol}</b>\n✅ TAKE PROFIT ({TAKE_PROFIT_RATE}%) УСТАНОВЛЕН @ {tp_price_str}")
+                tp_ok = True
             else:
                 error_log = format_error_detail(tp_order)
                 await tg(f"<b>SHORT {symbol}</b>\n⚠️ ОШИБКА УСТАНОВКИ TAKE PROFIT\n<code>{error_log}</code>")
-        else:
-            await tg(f"<b>SHORT {symbol}</b>\n🚫 TAKE PROFIT ОТКЛЮЧЕН")
+
+        # НОВЫЙ БЛОК: Единое сообщение о результатах установки (Вариант 1)
+        if tp_ok or ts_ok:
+             tp_price_str = fix_price(symbol, price * (1 - TAKE_PROFIT_RATE / 100))
+             status_message = (
+                f"🎯 TP ({TAKE_PROFIT_RATE}%): <code>{tp_price_str}</code> {'✅' if tp_ok else '❌'}\n"
+                f"🛡️ TS ({TRAILING_RATE}%) Активация: <code>{ts_activation_price_str}</code> {'✅' if ts_ok else '❌'}\n"
+                f"\n✅ **Ордера установлены.**"
+             )
+             await tg(status_message)
+        # КОНЕЦ НОВОГО БЛОКА О РЕЗУЛЬТАТАХ
 
     else:
         error_log = format_error_detail(order)
@@ -374,8 +420,8 @@ async def open_short(sym: str):
 
 
 async def close_position(sym: str, position_side: str, active_set: Set[str]):
+    # ... (код для закрытия позиции без изменений)
     symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
-    # Отмена всех ордеров (TP/TS/Limit)
     await binance("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}) 
     pos_data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     
@@ -397,7 +443,7 @@ async def close_position(sym: str, position_side: str, active_set: Set[str]):
     
     if close_order and close_order.get("orderId"):
         active_set.discard(symbol)
-        await tg(f"<b>CLOSE {position_side} {symbol} УСПЕШНО</b>\n{qty_to_close} шт")
+        await tg(f"<b>✅ ЗАКРЫТИЕ {position_side} {symbol} УСПЕШНО</b>\n{qty_to_close} шт")
     else:
         error_log = format_error_detail(close_order)
         await tg(f"<b>CRITICAL ERROR: Не удалось закрыть {position_side} {symbol}</b>\n<code>{error_log}</code>")
@@ -544,7 +590,7 @@ async def lifespan(app: FastAPI):
     status_t = "ВКЛЮЧЕН" if active_trailing_enabled else "ОТКЛЮЧЕН"
     status_tp = "ВКЛЮЧЕН" if take_profit_enabled else "ОТКЛЮЧЕН"
     await tg(
-        f"<b>OZ BOT 2025 — ONLINE (v1.5.2)</b>\n" # ИЗМЕНЕНИЕ: Метка версии
+        f"<b>OZ BOT 2025 — ONLINE (v1.5.3)</b>\n" 
         f"Трейлинг Стоп: <b>{status_t}</b> ({TRAILING_RATE}%)\n"
         f"Take Profit: <b>{status_tp}</b> ({TAKE_PROFIT_RATE}%)\n"
         f"---"
@@ -565,7 +611,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.5.2)</h1>")
+    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.5.3)</h1>")
 
 @app.post("/telegram_webhook/{token}")
 async def handle_telegram(token: str, request: Request):
