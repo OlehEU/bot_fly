@@ -1,5 +1,5 @@
 # =========================================================================================
-# OZ TRADING BOT 2025 v1.5.1 | TRAILING START ПОСЛЕ TP_RATE% ПРИБЫЛИ
+# OZ TRADING BOT 2025 v1.5.2 | ИСПРАВЛЕНА ОШИБКА TP/TS -2021 (ДОБАВЛЕНА ЗАДЕРЖКА)
 # =========================================================================================
 import os
 import time
@@ -35,7 +35,6 @@ PUBLIC_HOST_URL = os.getenv("PUBLIC_HOST_URL").rstrip('/')
 AMOUNT = float(os.getenv("FIXED_AMOUNT_USD", "30"))
 LEV = int(os.getenv("LEVERAGE", "10"))
 TRAILING_RATE = float(os.getenv("TRAILING_RATE", "0.5"))
-# НОВОЕ: Переменная для установки Take Profit
 TAKE_PROFIT_RATE = float(os.getenv("TAKE_PROFIT_RATE", "1.0")) 
 
 # Инициализация HTTP клиента
@@ -44,11 +43,11 @@ BASE = "https://fapi.binance.com"
 
 # ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
 symbol_precision: Dict[str, int] = {}
-price_precision: Dict[str, int] = {} # НОВОЕ: Для точности цены
+price_precision: Dict[str, int] = {}
 active_longs: Set[str] = set() 
 active_shorts: Set[str] = set() 
 active_trailing_enabled: bool = os.getenv("TRAILING_ENABLED", "true").lower() in ('true', '1', 't')
-take_profit_enabled: bool = os.getenv("TAKE_PROFIT_ENABLED", "true").lower() in ('true', '1', 't') # НОВОЕ
+take_profit_enabled: bool = os.getenv("TAKE_PROFIT_ENABLED", "true").lower() in ('true', '1', 't')
 
 # Инициализация Telegram Bot
 tg_bot = Bot(token=TELEGRAM_TOKEN) 
@@ -99,7 +98,6 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
 
         signature = hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
 
-        # Логика v1.5.0: подпись всегда добавляется в URL
         url = f"{url}?{query_string}&signature={signature}"
         final_params = None
     
@@ -111,7 +109,6 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
         if r.status_code != 200:
             err_text = r.text if len(r.text) < 3800 else r.text[:3800] + "..."
             
-            # Пропускаем только -1102, остальные ошибки логируем
             if r.status_code != 400 or '{"code":-1102,' not in r.text:
                 error_info = {}
                 try:
@@ -122,7 +119,6 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
                     
                 await tg(f"<b>BINANCE ERROR {r.status_code}</b>\nPath: {path}\n<code>{err_msg}</code>")
             
-            # Попытка вернуть JSON ошибки, если доступно
             try: return r.json()
             except Exception: return None
         
@@ -133,7 +129,7 @@ async def binance(method: str, path: str, params: Dict | None = None, signed: bo
         await tg(f"<b>CRITICAL ERROR</b>\n{str(e)[:3800]}")
         return None
 
-# ================ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ================================
+# ================ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (Без изменений) ================
 def calculate_precision_from_stepsize(step_size: str) -> int:
     s = step_size.rstrip('0')
     if '.' not in s: return 0
@@ -157,7 +153,7 @@ async def load_exchange_info():
                 step_size = lot_size_filter['stepSize']
                 symbol_precision[sym] = calculate_precision_from_stepsize(step_size)
             
-            # Точность для цены (PRICE_FILTER) - НОВОЕ
+            # Точность для цены (PRICE_FILTER)
             price_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'PRICE_FILTER'), None)
             if price_filter:
                 tick_size = price_filter['tickSize']
@@ -173,7 +169,6 @@ async def load_active_positions():
     global active_longs, active_shorts
     try:
         data = await binance("GET", "/fapi/v2/positionRisk", signed=True)
-        # Обработка ошибки
         if isinstance(data, dict) and data.get("code"): 
              await tg(f"<b>Ошибка:</b> Не удалось загрузить активные позиции. {data.get('msg', '')}")
              return
@@ -203,10 +198,8 @@ def fix_qty(symbol: str, qty: float) -> str:
     if precision == 0: return str(int(qty)) 
     return f"{qty:.{precision}f}".rstrip("0").rstrip(".")
 
-def fix_price(symbol: str, price: float) -> str: # НОВОЕ
+def fix_price(symbol: str, price: float) -> str:
     precision = price_precision.get(symbol.upper(), 8) 
-    # Используем f-string для форматирования с нужной точностью
-    # Затем .rstrip("0").rstrip(".") для удаления лишних нулей и точки, если они есть
     return f"{price:.{precision}f}".rstrip("0").rstrip(".")
 
 
@@ -226,7 +219,7 @@ async def get_symbol_and_qty(sym: str) -> tuple[str, str, float] | None:
     return symbol, qty_str, price 
 
 
-# ================= ФУНКЦИИ ОТКРЫТИЯ (ИЗМЕНЕНЫ) =======================
+# ================= ФУНКЦИИ ОТКРЫТИЯ (ИЗМЕНЕНЫ - ДОБАВЛЕНА ЗАДЕРЖКА) =======================
 
 async def open_long(sym: str):
     global active_trailing_enabled, take_profit_enabled
@@ -256,13 +249,13 @@ async def open_long(sym: str):
         active_longs.add(symbol)
         
         rate_str = f"{TRAILING_RATE:.2f}" 
-        
-        # 4. Расчет активационной цены Trailing Stop: Цена открытия + TAKE_PROFIT_RATE%
-        # Трейлинг включится, только когда будет получена прибыль
         ts_activation_price_f = price * (1 + TAKE_PROFIT_RATE / 100)
         ts_activation_price_str = fix_price(symbol, ts_activation_price_f) 
 
         await tg(f"<b>LONG ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт...\n@ {fix_price(symbol, price)}\n")
+        
+        # НОВОЕ: Задержка 1.5 сек, чтобы цена успела отойти от триггера TP/TS
+        await asyncio.sleep(1.5) 
         
         # 5. Размещение TRAILING_STOP_MARKET
         if active_trailing_enabled:
@@ -270,7 +263,7 @@ async def open_long(sym: str):
                 "algoType": "CONDITIONAL", "symbol": symbol, "side": "SELL", "positionSide": "LONG",
                 "type": "TRAILING_STOP_MARKET", "quantity": qty_str, 
                 "callbackRate": rate_str, 
-                "activationPrice": ts_activation_price_str, # НОВАЯ АКТИВАЦИОННАЯ ЦЕНА
+                "activationPrice": ts_activation_price_str,
             })
 
             if isinstance(trailing_order, dict) and trailing_order.get("algoId"):
@@ -281,7 +274,7 @@ async def open_long(sym: str):
         else:
              await tg(f"<b>LONG {symbol}</b>\n🚫 TRAILING STOP ОТКЛЮЧЕН")
 
-        # 6. Размещение TAKE_PROFIT_MARKET (НОВОЕ)
+        # 6. Размещение TAKE_PROFIT_MARKET
         if take_profit_enabled:
             tp_price_f = price * (1 + TAKE_PROFIT_RATE / 100)
             tp_price_str = fix_price(symbol, tp_price_f) 
@@ -332,13 +325,13 @@ async def open_short(sym: str):
         active_shorts.add(symbol)
         
         rate_str = f"{TRAILING_RATE:.2f}"
-        
-        # 4. Расчет активационной цены Trailing Stop: Цена открытия - TAKE_PROFIT_RATE%
-        # Трейлинг включится, только когда будет получена прибыль
         ts_activation_price_f = price * (1 - TAKE_PROFIT_RATE / 100)
         ts_activation_price_str = fix_price(symbol, ts_activation_price_f) 
 
         await tg(f"<b>SHORT ×{LEV} (Cross+Hedge)</b>\n<code>{symbol}</code>\n{qty_str} шт...\n@ {fix_price(symbol, price)}\n")
+
+        # НОВОЕ: Задержка 1.5 сек, чтобы цена успела отойти от триггера TP/TS
+        await asyncio.sleep(1.5) 
 
         # 5. Размещение TRAILING_STOP_MARKET
         if active_trailing_enabled:
@@ -346,7 +339,7 @@ async def open_short(sym: str):
                 "algoType": "CONDITIONAL", "symbol": symbol, "side": "BUY", "positionSide": "SHORT",
                 "type": "TRAILING_STOP_MARKET", "quantity": qty_str, 
                 "callbackRate": rate_str, 
-                "activationPrice": ts_activation_price_str, # НОВАЯ АКТИВАЦИОННАЯ ЦЕНА
+                "activationPrice": ts_activation_price_str, 
             })
 
             if isinstance(trailing_order, dict) and trailing_order.get("algoId"):
@@ -357,7 +350,7 @@ async def open_short(sym: str):
         else:
             await tg(f"<b>SHORT {symbol}</b>\n🚫 TRAILING STOP ОТКЛЮЧЕН")
 
-        # 6. Размещение TAKE_PROFIT_MARKET (НОВОЕ)
+        # 6. Размещение TAKE_PROFIT_MARKET
         if take_profit_enabled:
             tp_price_f = price * (1 - TAKE_PROFIT_RATE / 100)
             tp_price_str = fix_price(symbol, tp_price_f) 
@@ -382,10 +375,10 @@ async def open_short(sym: str):
 
 async def close_position(sym: str, position_side: str, active_set: Set[str]):
     symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
-    await binance("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
+    # Отмена всех ордеров (TP/TS/Limit)
+    await binance("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}) 
     pos_data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     
-    # Обработка ошибки
     if isinstance(pos_data, dict) and pos_data.get("code"): 
         await tg(f"<b>{symbol}</b> — Не удалось получить данные о позиции. {pos_data.get('msg', '')}"); return
     
@@ -417,9 +410,9 @@ async def close_short(sym: str):
 # ================= КОНЕЦ ФУНКЦИЙ ОТКРЫТИЯ/ЗАКРЫТИЯ =======================
 
 
-# ==================== TELEGRAM WEBHOOK HANDLER (ИЗМЕНЕНЫ) =====================
+# ==================== TELEGRAM WEBHOOK HANDLER (Без изменений) =====================
 
-def create_trailing_menu(trailing_status: bool, tp_status: bool): # ИЗМЕНЕНО: Добавлен tp_status
+def create_trailing_menu(trailing_status: bool, tp_status: bool):
     """Создает клавиатуру для меню Trailing Stop и Take Profit."""
     trailing_text = "ВКЛЮЧЕН" if trailing_status else "ОТКЛЮЧЕН"
     tp_text = "ВКЛЮЧЕН" if tp_status else "ОТКЛЮЧЕН"
@@ -436,7 +429,7 @@ def create_trailing_menu(trailing_status: bool, tp_status: bool): # ИЗМЕНЕ
                                  callback_data='set_trailing_false' if trailing_status else 'set_trailing_true'),
         ],
         [
-            InlineKeyboardButton(f"Take Profit: {'✅ ВКЛ' if tp_status else '❌ ВЫКЛ'}", # НОВОЕ: Кнопка TP
+            InlineKeyboardButton(f"Take Profit: {'✅ ВКЛ' if tp_status else '❌ ВЫКЛ'}",
                                  callback_data='set_tp_false' if tp_status else 'set_tp_true'),
         ],
         [
@@ -450,7 +443,7 @@ async def handle_telegram_update(update_json: Dict):
     """
     Основная функция для обработки всех входящих сообщений и callback-запросов от Telegram.
     """
-    global active_trailing_enabled, take_profit_enabled # ИЗМЕНЕНО: Добавлен take_profit_enabled
+    global active_trailing_enabled, take_profit_enabled
     
     update = Update.de_json(update_json, tg_bot)
     
@@ -474,7 +467,7 @@ async def handle_telegram_update(update_json: Dict):
         if data == 'set_trailing_true' and not active_trailing_enabled: active_trailing_enabled = True; state_changed = True
         elif data == 'set_trailing_false' and active_trailing_enabled: active_trailing_enabled = False; state_changed = True
         
-        # Обработка Take Profit (НОВОЕ)
+        # Обработка Take Profit
         elif data == 'set_tp_true' and not take_profit_enabled: take_profit_enabled = True; state_changed = True
         elif data == 'set_tp_false' and take_profit_enabled: take_profit_enabled = False; state_changed = True
         
@@ -498,7 +491,6 @@ async def set_telegram_webhook(url: str):
         response = await tg_bot.set_webhook(url=url)
         if response:
             print(f"✅ Telegram Webhook установлен на: {url}")
-            # Убрано дублирующееся сообщение в tg
         else:
             print(f"❌ Ошибка установки Webhook. URL: {url}")
             await tg(f"<b>Ошибка!</b> Не удалось установить Telegram Webhook на: <code>{url}</code>")
@@ -507,9 +499,9 @@ async def set_telegram_webhook(url: str):
         await tg(f"<b>Критическая ошибка Telegram API</b>\nНе удалось установить Webhook: <code>{e}</code>")
 
 
-# ================= FASTAPI ПРИЛОЖЕНИЕ (ИЗМЕНЕНО) =========================
+# ================= FASTAPI ПРИЛОЖЕНИЕ (Изменена только метка версии) =========================
 
-async def get_binance_server_time(): # НОВОЕ
+async def get_binance_server_time():
     """Получает и возвращает текущее время сервера Binance."""
     try:
         data = await binance("GET", "/fapi/v1/time", signed=False) 
@@ -523,7 +515,7 @@ async def get_binance_server_time(): # НОВОЕ
 async def lifespan(app: FastAPI):
     await load_exchange_info()
     
-    # 1. Диагностика времени (НОВОЕ)
+    # 1. Диагностика времени
     server_time = await get_binance_server_time()
     bot_time_ms = int(time.time() * 1000)
     time_info = ""
@@ -550,13 +542,13 @@ async def lifespan(app: FastAPI):
     await set_telegram_webhook(webhook_url)
     
     status_t = "ВКЛЮЧЕН" if active_trailing_enabled else "ОТКЛЮЧЕН"
-    status_tp = "ВКЛЮЧЕН" if take_profit_enabled else "ОТКЛЮЧЕН" # НОВОЕ
+    status_tp = "ВКЛЮЧЕН" if take_profit_enabled else "ОТКЛЮЧЕН"
     await tg(
-        f"<b>OZ BOT 2025 — ONLINE (v1.5.1)</b>\n"
+        f"<b>OZ BOT 2025 — ONLINE (v1.5.2)</b>\n" # ИЗМЕНЕНИЕ: Метка версии
         f"Трейлинг Стоп: <b>{status_t}</b> ({TRAILING_RATE}%)\n"
         f"Take Profit: <b>{status_tp}</b> ({TAKE_PROFIT_RATE}%)\n"
         f"---"
-        f"\n{time_info}\n" # НОВОЕ
+        f"\n{time_info}\n"
         f"---"
         f"\nУправление через Telegram Webhook (/menu)."
     )
@@ -573,7 +565,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.5.1)</h1>")
+    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.5.2)</h1>")
 
 @app.post("/telegram_webhook/{token}")
 async def handle_telegram(token: str, request: Request):
