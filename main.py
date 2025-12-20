@@ -1,20 +1,21 @@
 # =========================================================================================
-# OZ TRADING BOT 2025 v1.5.6 | PnL Monitoring & Entry Price Fix for Trailing Stop
+# OZ TRADING BOT 2025 v1.6.0 | FULL INTEGRATED VERSION (SQLite + Reply Menu)
 # =========================================================================================
 import os
 import time
 import hmac
 import hashlib
 import json
+import sqlite3
 from typing import Dict, Set, Any, List
 import httpx
 import asyncio
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
-from telegram import Bot, Update, InlineKeyboardMarkup, InlineKeyboardButton, constants
+from telegram import Bot, Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, constants
 from telegram.error import TelegramError
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # ==================== КОНФИГУРАЦИЯ & ПЕРЕМЕННЫЕ ====================
 required = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "BINANCE_API_KEY", "BINANCE_API_SECRET", "WEBHOOK_SECRET", "PUBLIC_HOST_URL"]
@@ -39,10 +40,9 @@ TAKE_PROFIT_RATE = float(os.getenv("TAKE_PROFIT_RATE", "1.0"))
 TS_START_RATE = float(os.getenv("TS_START_RATE", "0.2")) 
 PNL_MONITOR_INTERVAL = int(os.getenv("PNL_MONITOR_INTERVAL_SEC", "20")) 
 
-# Инициализация HTTP клиента
 client = httpx.AsyncClient(timeout=30)
 BASE = "https://fapi.binance.com"
-STATS_FILE = "stats.json" # Файл для хранения статистики
+DB_PATH = "trades_history.db"
 
 # ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
 symbol_precision: Dict[str, int] = {}
@@ -52,807 +52,278 @@ active_shorts: Set[str] = set()
 active_trailing_enabled: bool = os.getenv("TRAILING_ENABLED", "true").lower() in ('true', '1', 't')
 take_profit_enabled: bool = os.getenv("TAKE_PROFIT_ENABLED", "true").lower() in ('true', '1', 't')
 
-# Инициализация Telegram Bot
 tg_bot = Bot(token=TELEGRAM_TOKEN) 
 
-# ==================== МОДУЛЬ СТАТИСТИКИ ====================
+# ==================== МОДУЛЬ СТАТИСТИКИ (SQLITE) ====================
 
-def load_stats() -> List[Dict]:
-    """Загружает статистику из JSON файла."""
-    if not os.path.exists(STATS_FILE):
-        return []
-    try:
-        with open(STATS_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError) as e:
-        print(f"[ERROR] Не удалось загрузить статистику из {STATS_FILE}: {e}")
-        return []
-
-def save_stats(stats: List[Dict]):
-    """Сохраняет статистику в JSON файл."""
-    try:
-        with open(STATS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(stats, f, indent=4)
-    except IOError as e:
-        print(f"[ERROR] Не удалось сохранить статистику в {STATS_FILE}: {e}")
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS trades 
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                      symbol TEXT, side TEXT, pnl REAL, timestamp DATETIME)''')
+        conn.commit()
 
 def log_trade_result(symbol: str, position_side: str, pnl_usd: float):
-    """Добавляет результат сделки в статистику."""
-    stats = load_stats()
-    stats.append({
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "symbol": symbol,
-        "side": position_side,
-        "pnl_usd": round(pnl_usd, 3),
-        "is_profitable": pnl_usd > 0
-    })
-    save_stats(stats)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT INTO trades (symbol, side, pnl, timestamp) VALUES (?, ?, ?, ?)",
+                     (symbol, position_side, round(pnl_usd, 3), datetime.now()))
+        conn.commit()
 
-def get_daily_stats() -> Dict:
-    """Рассчитывает сводную статистику за текущий день."""
-    stats = load_stats()
-    
-    # Находим начало сегодняшнего дня в UTC (для соответствия времени Binance/сервера)
-    now_utc = datetime.now(timezone.utc)
-    today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-    
-    daily_stats = {
-        "profitable_count": 0,
-        "profitable_usd": 0.0,
-        "losing_count": 0,
-        "losing_usd": 0.0,
-        "net_pnl": 0.0
-    }
-    
-    for trade in stats:
-        try:
-            trade_time = datetime.strptime(trade["time"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            if trade_time >= today_start:
-                pnl = trade.get("pnl_usd", 0.0)
-                if trade.get("is_profitable"):
-                    daily_stats["profitable_count"] += 1
-                    daily_stats["profitable_usd"] += pnl
-                else:
-                    daily_stats["losing_count"] += 1
-                    daily_stats["losing_usd"] += pnl # pnl уже отрицательный
-                daily_stats["net_pnl"] += pnl
-        except ValueError:
-            continue
-            
-    # Форматирование
-    daily_stats["profitable_usd"] = round(daily_stats["profitable_usd"], 2)
-    daily_stats["losing_usd"] = round(abs(daily_stats["losing_usd"]), 2)
-    daily_stats["net_pnl"] = round(daily_stats["net_pnl"], 2)
-    
-    return daily_stats
+def get_stats_report(days: int) -> str:
+    with sqlite3.connect(DB_PATH) as conn:
+        since = datetime.now() - timedelta(days=days)
+        cursor = conn.execute("""SELECT symbol, SUM(pnl), COUNT(id) FROM trades 
+                                 WHERE timestamp >= ? GROUP BY symbol ORDER BY SUM(pnl) DESC""", (since,))
+        rows = cursor.fetchall()
+        if not rows: return "📭 Сделок за этот период не найдено."
+        total_pnl = sum(r[1] for r in rows)
+        report = f"📊 <b>ОТЧЕТ ЗА {days} ДН.</b>\n💰 Итого: <code>{total_pnl:+.2f} USDT</code>\n"
+        report += "----------------------------\n"
+        for sym, pnl, count in rows:
+            icon = "🟢" if pnl >= 0 else "🔴"
+            report += f"{icon} {sym}: <code>{pnl:+.2f}</code> ({count} шт)\n"
+        return report
 
-# ================= BINANCE API & ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
+# ==================== BINANCE API ВСПОМОГАТЕЛЬНЫЕ ====================
 
 async def tg(text: str):
-    """Отправляет сообщение в Telegram, используя HTML форматирование."""
     try:
         await tg_bot.send_message(CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
-        print(f"[ERROR] Telegram send failed (HTML parse error). Sending as plain text: {e}")
-        try:
-             clean_text = text.replace('<b>', '').replace('</b>', '').replace('<code>', '').replace('</code>', '').replace('<pre>', '\n').replace('</pre>', '\n').replace('&nbsp;', ' ')
-             await tg_bot.send_message(CHAT_ID, clean_text, disable_web_page_preview=True)
-        except Exception as plain_e:
-             print(f"[CRITICAL ERROR] Telegram send failed even as plain text: {plain_e}")
-
-def format_error_detail(error_result: Any) -> str:
-    """Форматирует словарь ошибки Binance в читаемый код для Telegram."""
-    if not error_result or not isinstance(error_result, dict):
-        return str(error_result) if error_result else "Пустой или None ответ от Binance"
-    
-    code = error_result.get('code', 'N/A')
-    msg = error_result.get('msg', 'N/A')
-    
-    if code != 'N/A' or msg != 'N/A':
-        return f"Code: {code}\nMsg: {msg}"
-    
-    return json.dumps(error_result, indent=2)
+        print(f"[ERROR] Telegram failed: {e}")
 
 async def binance(method: str, path: str, params: Dict | None = None, signed: bool = True):
-    """Универсальная функция для запросов к API Binance Futures."""
     url = BASE + path
     p = params.copy() if params else {}
-    final_params = p
-    
     if signed:
         p["timestamp"] = int(time.time() * 1000)
         p["recvWindow"] = 60000
-
-        def format_value(v):
-            if isinstance(v, bool): return str(v).lower()
-            return str(v)
-
-        query_parts = [f"{k}={format_value(v)}" for k, v in sorted(p.items())]
-        query_string = "&".join(query_parts)
-
+        query_string = "&".join([f"{k}={str(v).lower() if isinstance(v, bool) else v}" for k, v in sorted(p.items())])
         signature = hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
-
         url = f"{url}?{query_string}&signature={signature}"
-        final_params = None
-    
+        p = None
     headers = {"X-MBX-APIKEY": API_KEY}
-    
     try:
-        r = await client.request(method, url, params=final_params, headers=headers)
-        
+        r = await client.request(method, url, params=p, headers=headers)
         if r.status_code != 200:
-            err_text = r.text if len(r.text) < 3800 else r.text[:3800] + "..."
-            
-            if r.status_code != 400 or '{"code":-1102,' not in r.text:
-                error_info = {}
-                try:
-                    error_info = r.json()
-                    err_msg = f"Code: {error_info.get('code', 'N/A')}. Msg: {error_info.get('msg', 'N/A')}"
-                except Exception:
-                    err_msg = err_text
-                    
-                await tg(f"<b>BINANCE ERROR {r.status_code}</b>\nPath: {path}\n<code>{err_msg}</code>")
-            
-            try: return r.json()
-            except Exception: return None
-        
-        try: return r.json()
-        except Exception: return r.text
-            
+            await tg(f"<b>BINANCE ERROR {r.status_code}</b>\n<code>{r.text[:500]}</code>")
+        return r.json()
     except Exception as e:
-        await tg(f"<b>CRITICAL ERROR</b>\n{str(e)[:3800]}")
+        await tg(f"<b>CRITICAL ERROR</b>\n{str(e)}")
         return None
 
 def calculate_precision_from_stepsize(step_size: str) -> int:
     s = step_size.rstrip('0')
-    if '.' not in s: return 0
-    return len(s.split('.')[-1])
+    return len(s.split('.')[-1]) if '.' in s else 0
 
 async def load_exchange_info():
     global symbol_precision, price_precision
-    try:
-        data = await binance("GET", "/fapi/v1/exchangeInfo", signed=False)
-        
-        if not data or not isinstance(data, dict) or 'symbols' not in data:
-            await tg("<b>Ошибка:</b> Не удалось загрузить информацию о бинарных символах.")
-            return
-
-        for symbol_info in data['symbols']:
-            sym = symbol_info['symbol']
-            
-            # Точность для количества (LOT_SIZE)
-            lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
-            if lot_size_filter:
-                step_size = lot_size_filter['stepSize']
-                symbol_precision[sym] = calculate_precision_from_stepsize(step_size)
-            
-            # Точность для цены (PRICE_FILTER)
-            price_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'PRICE_FILTER'), None)
-            if price_filter:
-                tick_size = price_filter['tickSize']
-                price_precision[sym] = calculate_precision_from_stepsize(tick_size)
-
-        await tg(f"<b>Загружена информация о бинарных символах:</b> Точность QTY для {len(symbol_precision)} пар, PRICE для {len(price_precision)} пар.")
-
-    except Exception as e:
-        await tg(f"<b>Критическая ошибка при загрузке exchangeInfo:</b> {e}")
-
+    data = await binance("GET", "/fapi/v1/exchangeInfo", signed=False)
+    if data and 'symbols' in data:
+        for s in data['symbols']:
+            sym = s['symbol']
+            lot = next(f for f in s['filters'] if f['filterType'] == 'LOT_SIZE')
+            prc = next(f for f in s['filters'] if f['filterType'] == 'PRICE_FILTER')
+            symbol_precision[sym] = calculate_precision_from_stepsize(lot['stepSize'])
+            price_precision[sym] = calculate_precision_from_stepsize(prc['tickSize'])
+        await tg(f"✅ ExchangeInfo загружен. Пар: {len(symbol_precision)}")
 
 async def load_active_positions():
     global active_longs, active_shorts
-    try:
-        data = await binance("GET", "/fapi/v2/positionRisk", signed=True)
-        if isinstance(data, dict) and data.get("code"): 
-             await tg(f"<b>Ошибка:</b> Не удалось загрузить активные позиции. {data.get('msg', '')}")
-             return
-
-        if data and isinstance(data, list):
-            open_longs_temp = set()
-            open_shorts_temp = set()
-            
-            for p in data:
-                amt = float(p.get("positionAmt", 0))
-                if abs(amt) > 0 and p.get("symbol") in symbol_precision:
-                    if amt > 0 and p.get("positionSide") == "LONG":
-                        open_longs_temp.add(p["symbol"])
-                    elif amt < 0 and p.get("positionSide") == "SHORT":
-                        open_shorts_temp.add(p["symbol"])
-
-            active_longs = open_longs_temp
-            active_shorts = open_shorts_temp
-            await tg(f"<b>Начальная загрузка позиций:</b>\nНайдено {len(active_longs)} LONG и {len(active_shorts)} SHORT позиций.")
-        elif data:
-             await tg(f"<b>Ошибка при загрузке активных позиций:</b> Некорректный ответ Binance:\n<pre>{str(data)[:1500]}</pre>")
-    except Exception as e:
-        await tg(f"<b>Ошибка при загрузке активных позиций:</b> {e}")
+    data = await binance("GET", "/fapi/v2/positionRisk")
+    if isinstance(data, list):
+        active_longs = {p["symbol"] for p in data if float(p["positionAmt"]) > 0 and p["positionSide"] == "LONG"}
+        active_shorts = {p["symbol"] for p in data if float(p["positionAmt"]) < 0 and p["positionSide"] == "SHORT"}
+        await tg(f"📋 Позиции: LONG: {len(active_longs)}, SHORT: {len(active_shorts)}")
 
 def fix_qty(symbol: str, qty: float) -> str:
-    precision = symbol_precision.get(symbol.upper(), 3)
-    if precision == 0: return str(int(qty)) 
-    return f"{qty:.{precision}f}".rstrip("0").rstrip(".")
+    prec = symbol_precision.get(symbol.upper(), 3)
+    return f"{qty:.{prec}f}".rstrip("0").rstrip(".") if prec > 0 else str(int(qty))
 
 def fix_price(symbol: str, price: float) -> str:
-    precision = price_precision.get(symbol.upper(), 8) 
-    return f"{price:.{precision}f}".rstrip("0").rstrip(".")
+    prec = price_precision.get(symbol.upper(), 8)
+    return f"{price:.{prec}f}".rstrip("0").rstrip(".")
 
-async def get_symbol_and_qty(sym: str) -> tuple[str, str, float] | None:
+async def get_symbol_and_qty(sym: str):
     symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
     await binance("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": "CROSS"})
     await binance("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEV})
+    p_data = await binance("GET", "/fapi/v1/ticker/price", {"symbol": symbol}, signed=False)
+    if not p_data or 'price' not in p_data: return None
+    price = float(p_data["price"])
+    qty = fix_qty(symbol, (AMOUNT * LEV) / price)
+    return symbol, qty, price
 
-    price_data = await binance("GET", "/fapi/v1/ticker/price", {"symbol": symbol}, signed=False)
-    if not price_data or 'price' not in price_data:
-        await tg(f"<b>Ошибка:</b> Не удалось получить цену для {symbol}")
-        return None
-        
-    price = float(price_data["price"]) # Текущая рыночная цена
-    qty_f = AMOUNT * LEV / price
-    qty_str = fix_qty(symbol, qty_f)
-    return symbol, qty_str, price 
+# ==================== МОНИТОРИНГ PNL И ЗАКРЫТИЕ ====================
 
-# ================= ФУНКЦИИ PNL МОНИТОРИНГА И ОТЧЕТНОСТИ =======================
-
-async def get_pnl_from_closed_trades(symbol: str, position_side: str) -> float | None:
-    """Извлекает Realized PnL и комиссии из последних UserTrades."""
-    end_time = int(time.time() * 1000)
-    # Ищем сделки за последние 1.5 часа, чтобы найти закрытие
-    start_time = end_time - (90 * 60 * 1000) 
-
-    trades = await binance("GET", "/fapi/v1/userTrades", {
-        "symbol": symbol, "startTime": start_time
-    })
-
-    if not trades or not isinstance(trades, list):
-        print(f"[ERROR] Не удалось получить UserTrades для {symbol}")
-        return None
-
-    net_pnl = 0.0
-    found_closing = False
-    
-    for trade in reversed(trades): # Начинаем с самых новых
-        # PnL и commission приходят в tradeHistory, не только в ордерах
-        pnl = float(trade.get('realizedPnl', 0))
-        commission = float(trade.get('commission', 0))
-        
-        if pnl != 0.0 or commission != 0.0:
-            net_pnl += pnl - commission
-            found_closing = True
-
-    if found_closing:
-        return net_pnl
+async def get_pnl_from_closed_trades(symbol: str):
+    end = int(time.time() * 1000)
+    start = end - (90 * 60 * 1000)
+    trades = await binance("GET", "/fapi/v1/userTrades", {"symbol": symbol, "startTime": start})
+    if trades and isinstance(trades, list):
+        net = sum(float(t.get('realizedPnl', 0)) - float(t.get('commission', 0)) for t in trades)
+        return net if any(float(t.get('realizedPnl', 0)) != 0 for t in trades) else None
     return None
 
-async def calculate_and_report_pnl(symbol: str, position_side: str):
-    """Рассчитывает PnL для закрытой позиции и отправляет отчет."""
-    
-    # 1. Получение PnL
-    net_pnl = await get_pnl_from_closed_trades(symbol, position_side)
-    
-    if net_pnl is None:
-        await tg(f"<b>❌ ЗАКРЫТИЕ {position_side} {symbol}</b>\nНе удалось рассчитать PnL. Возможно, позиция закрылась давно или нет PnL в последних трейдах.")
-        return
-    
-    # 2. Логирование и форматирование
-    log_trade_result(symbol, position_side, net_pnl)
-    
-    pnl_str = f"{net_pnl:+.2f}"
-    status_icon = "✅" if net_pnl > 0 else "🛑"
-    status_color = "🟢" if net_pnl >= 0 else "🔴"
-    
-    # 3. Отправка отчета в Telegram
-    report_message = (
-        f"<b>{status_icon} ЗАКРЫТИЕ {position_side} | {symbol.replace('USDT', '/USDT')}</b>\n"
-        f"---"
-        f"\n{status_color} **ЧИСТЫЙ PnL (USD):** <code>{pnl_str} USDT</code>\n"
-    )
-    await tg(report_message)
+async def calculate_and_report_pnl(symbol: str, side: str):
+    await asyncio.sleep(5) # Ждем синхронизации Binance
+    pnl = await get_pnl_from_closed_trades(symbol)
+    if pnl is not None:
+        log_trade_result(symbol, side, pnl)
+        icon = "✅" if pnl > 0 else "🛑"
+        await tg(f"{icon} <b>ЗАКРЫТИЕ {side} {symbol}</b>\nЧИСТЫЙ PnL: <code>{pnl:+.2f} USDT</code>")
+    else:
+        await tg(f"❌ <b>ЗАКРЫТИЕ {side} {symbol}</b>\nPnL не определен.")
 
 async def pnl_monitor_task():
-    """Асинхронный цикл для мониторинга закрытых позиций."""
     global active_longs, active_shorts
-    
     while True:
         await asyncio.sleep(PNL_MONITOR_INTERVAL)
-        
         try:
-            # 1. Получаем текущие открытые позиции с биржи
-            current_data = await binance("GET", "/fapi/v2/positionRisk", signed=True)
-            if not current_data or not isinstance(current_data, list):
-                continue
+            data = await binance("GET", "/fapi/v2/positionRisk")
+            if not isinstance(data, list): continue
+            current = {p['symbol'] + p['positionSide'] for p in data if abs(float(p['positionAmt'])) > 0}
             
-            current_open_symbols = set()
-            for p in current_data:
-                if abs(float(p.get("positionAmt", 0))) > 0 and p.get("symbol") in symbol_precision:
-                     current_open_symbols.add(p["symbol"])
+            for s in list(active_longs):
+                if (s + "LONG") not in current:
+                    active_longs.discard(s)
+                    asyncio.create_task(calculate_and_report_pnl(s, "LONG"))
+            for s in list(active_shorts):
+                if (s + "SHORT") not in current:
+                    active_shorts.discard(s)
+                    asyncio.create_task(calculate_and_report_pnl(s, "SHORT"))
+        except Exception as e: print(f"Monitor error: {e}")
 
-            # 2. Определяем, какие позиции были закрыты
-            closed_longs = active_longs - current_open_symbols
-            closed_shorts = active_shorts - current_open_symbols
+# ==================== ОТКРЫТИЕ ПОЗИЦИЙ ====================
 
-            # 3. Отчетность и обновление сетов
-            for symbol in closed_longs:
-                active_longs.discard(symbol)
-                print(f"[MONITOR] Обнаружено закрытие LONG: {symbol}")
-                asyncio.create_task(calculate_and_report_pnl(symbol, "LONG"))
-            
-            for symbol in closed_shorts:
-                active_shorts.discard(symbol)
-                print(f"[MONITOR] Обнаружено закрытие SHORT: {symbol}")
-                asyncio.create_task(calculate_and_report_pnl(symbol, "SHORT"))
-
-        except Exception as e:
-            print(f"[CRITICAL ERROR] PNL Monitor task failed: {e}")
-            await asyncio.sleep(PNL_MONITOR_INTERVAL * 2) 
-
-
-# ================= ФУНКЦИИ ОТКРЫТИЯ/ЗАКРЫТИЯ (v1.5.6) =======================
-
-async def get_entry_price_from_position(symbol: str, position_side: str) -> float | None:
-    """Получает фактическую цену входа (Entry Price) для открытой позиции."""
-    # Ждем, пока биржа обновит информацию о позиции
-    for _ in range(3): 
+async def get_entry_price_from_position(symbol: str, side: str):
+    for _ in range(3):
         data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-        if data and isinstance(data, list):
+        if isinstance(data, list):
             for p in data:
-                if p.get("positionSide") == position_side and abs(float(p.get("positionAmt", 0))) > 0:
+                if p["positionSide"] == side and abs(float(p["positionAmt"])) > 0:
                     return float(p["entryPrice"])
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.7)
     return None
 
 async def open_long(sym: str):
-    global active_trailing_enabled, take_profit_enabled
+    res = await get_symbol_and_qty(sym)
+    if not res: return
+    symbol, qty, _ = res
+    order = await binance("POST", "/fapi/v1/order", {"symbol": symbol, "side": "BUY", "positionSide": "LONG", "type": "MARKET", "quantity": qty})
     
-    result = await get_symbol_and_qty(sym) 
-    if not result: return
-
-    symbol, qty_str, _ = result 
-    
-    # Проверка, открыта ли уже позиция
-    pos_data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-    is_open_on_exchange = False
-    if pos_data and isinstance(pos_data, list):
-        if next((p for p in pos_data if p.get("positionSide") == "LONG" and float(p.get("positionAmt", 0)) > 0), None):
-            is_open_on_exchange = True
-    if is_open_on_exchange:
-        active_longs.add(symbol) 
-        await tg(f"<b>{symbol}</b> — LONG уже открыта на бирже. Пропуск.")
-        return
-    active_longs.discard(symbol) 
-
-    # 3. Открытие LONG позиции (Market)
-    order = await binance("POST", "/fapi/v1/order", {
-        "symbol": symbol, "side": "BUY", "positionSide": "LONG", "type": "MARKET", "quantity": qty_str
-    })
-
-    if isinstance(order, dict) and order.get("orderId"):
+    if order and order.get("orderId"):
         active_longs.add(symbol)
+        entry = await get_entry_price_from_position(symbol, "LONG")
+        if not entry: return await tg(f"⚠️ {symbol} LONG: Нет Entry Price!")
         
-        # --- НОВАЯ ЛОГИКА Entry Price (v1.5.6) ---
-        entry_price = await get_entry_price_from_position(symbol, "LONG")
-        if not entry_price or entry_price == 0.0:
-            await tg(f"<b>LONG {symbol}</b>: ⚠️ Не удалось получить Entry Price. Ордера TP/TS не установлены.")
-            return
-        # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
-
-        rate_str = f"{TRAILING_RATE:.2f}" 
-        
-        # РАСЧЕТ TS АКТИВАЦИИ: Используем Entry Price!
-        ts_activation_price_f = entry_price * (1 + TS_START_RATE / 100) 
-        ts_activation_price_str = fix_price(symbol, ts_activation_price_f) 
-
-        # ОТЧЕТ ОБ ОТКРЫТИИ
-        usd_amount = float(qty_str) * entry_price 
-        
-        main_message = (
-            f"<b>🚀 LONG | {symbol.replace('USDT', '/USDT')} (x{LEV})</b>\n"
-            f"---"
-        )
-        await tg(main_message)
-        
-        detail_message = (
-            f"📈 Цена входа (Entry): <code>{fix_price(symbol, entry_price)}</code>\n"
-            f"💵 Объем: {qty_str} шт (~${usd_amount:.0f})"
-        )
-        await tg(detail_message)
-        
-        # 5. Размещение TRAILING_STOP_MARKET
-        tp_ok, ts_ok = False, False 
-        tp_price_str = "N/A"
+        await tg(f"🚀 <b>LONG {symbol}</b> (x{LEV})\nEntry: <code>{fix_price(symbol, entry)}</code>")
         
         if active_trailing_enabled:
-            trailing_order = await binance("POST", "/fapi/v1/algoOrder", { 
-                "algoType": "CONDITIONAL", "symbol": symbol, "side": "SELL", "positionSide": "LONG",
-                "type": "TRAILING_STOP_MARKET", "quantity": qty_str, 
-                "callbackRate": rate_str, 
-                "activationPrice": ts_activation_price_str,
-            })
-            if isinstance(trailing_order, dict) and trailing_order.get("algoId"): ts_ok = True
-            else: await tg(f"<b>LONG {symbol}</b>\n⚠️ ОШИБКА УСТАНОВКИ TRAILING STOP\n<code>{format_error_detail(trailing_order)}</code>")
-        
-        # 6. Размещение TAKE_PROFIT_MARKET
+            act_p = fix_price(symbol, entry * (1 + TS_START_RATE/100))
+            await binance("POST", "/fapi/v1/algoOrder", {"algoType": "CONDITIONAL", "symbol": symbol, "side": "SELL", "positionSide": "LONG", "type": "TRAILING_STOP_MARKET", "quantity": qty, "callbackRate": f"{TRAILING_RATE:.2f}", "activationPrice": act_p})
         if take_profit_enabled:
-            tp_price_f = entry_price * (1 + TAKE_PROFIT_RATE / 100)
-            tp_price_str = fix_price(symbol, tp_price_f) 
-
-            tp_order = await binance("POST", "/fapi/v1/algoOrder", { 
-                "algoType": "CONDITIONAL", "symbol": symbol, "side": "SELL", "positionSide": "LONG",
-                "type": "TAKE_PROFIT_MARKET", "quantity": qty_str, "triggerPrice": tp_price_str, 
-            })
-            if isinstance(tp_order, dict) and tp_order.get("algoId"): tp_ok = True
-            else: await tg(f"<b>LONG {symbol}</b>\n⚠️ ОШИБКА УСТАНОВКИ TAKE PROFIT\n<code>{format_error_detail(tp_order)}</code>")
-
-        # Сообщение о статусе
-        if tp_ok or ts_ok or (not take_profit_enabled and active_trailing_enabled):
-             
-             tp_line = f"🎯 TP ({TAKE_PROFIT_RATE}%): <code>{tp_price_str}</code> {'✅' if tp_ok else '❌'}\n" if take_profit_enabled else f"🎯 TP: {'Отключен'}\n"
-             ts_line = f"🛡️ TS ({TRAILING_RATE}%, Активация {TS_START_RATE}%): <code>{ts_activation_price_str}</code> {'✅' if ts_ok else '❌'}\n"
-
-             status_message = (
-                f"{tp_line}{ts_line}"
-                f"\n✅ **Ордера установлены.**"
-             )
-             await tg(status_message)
-    else:
-        await tg(f"<b>Ошибка открытия LONG {symbol}</b>\n<code>{format_error_detail(order)}</code>")
-
+            tp_p = fix_price(symbol, entry * (1 + TAKE_PROFIT_RATE/100))
+            await binance("POST", "/fapi/v1/algoOrder", {"algoType": "CONDITIONAL", "symbol": symbol, "side": "SELL", "positionSide": "LONG", "type": "TAKE_PROFIT_MARKET", "quantity": qty, "triggerPrice": tp_p})
 
 async def open_short(sym: str):
-    global active_trailing_enabled, take_profit_enabled
+    res = await get_symbol_and_qty(sym)
+    if not res: return
+    symbol, qty, _ = res
+    order = await binance("POST", "/fapi/v1/order", {"symbol": symbol, "side": "SELL", "positionSide": "SHORT", "type": "MARKET", "quantity": qty})
     
-    result = await get_symbol_and_qty(sym)
-    if not result: return
-
-    symbol, qty_str, _ = result 
-    
-    # Проверка, открыта ли уже позиция
-    pos_data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-    is_open_on_exchange = False
-    if pos_data and isinstance(pos_data, list):
-        if next((p for p in pos_data if p.get("positionSide") == "SHORT" and float(p.get("positionAmt", 0)) < 0), None):
-            is_open_on_exchange = True
-    if is_open_on_exchange:
-        active_shorts.add(symbol) 
-        await tg(f"<b>{symbol}</b> — SHORT уже открыта на бирже. Пропуск.")
-        return
-    active_shorts.discard(symbol) 
-
-    # 3. Открытие SHORT позиции (Market)
-    order = await binance("POST", "/fapi/v1/order", {
-        "symbol": symbol, "side": "SELL", "positionSide": "SHORT", "type": "MARKET", "quantity": qty_str
-    })
-
-    if isinstance(order, dict) and order.get("orderId"):
+    if order and order.get("orderId"):
         active_shorts.add(symbol)
+        entry = await get_entry_price_from_position(symbol, "SHORT")
+        if not entry: return await tg(f"⚠️ {symbol} SHORT: Нет Entry Price!")
         
-        # --- НОВАЯ ЛОГИКА Entry Price (v1.5.6) ---
-        entry_price = await get_entry_price_from_position(symbol, "SHORT")
-        if not entry_price or entry_price == 0.0:
-            await tg(f"<b>SHORT {symbol}</b>: ⚠️ Не удалось получить Entry Price. Ордера TP/TS не установлены.")
-            return
-        # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
-
-        rate_str = f"{TRAILING_RATE:.2f}"
+        await tg(f"⬇️ <b>SHORT {symbol}</b> (x{LEV})\nEntry: <code>{fix_price(symbol, entry)}</code>")
         
-        # РАСЧЕТ TS АКТИВАЦИИ: Используем Entry Price!
-        ts_activation_price_f = entry_price * (1 - TS_START_RATE / 100) # (1 - RATE) для SHORT
-        ts_activation_price_str = fix_price(symbol, ts_activation_price_f) 
-
-        # ОТЧЕТ ОБ ОТКРЫТИИ
-        usd_amount = float(qty_str) * entry_price
-        
-        main_message = (
-            f"<b>⬇️ SHORT | {symbol.replace('USDT', '/USDT')} (x{LEV})</b>\n"
-            f"---"
-        )
-        await tg(main_message)
-        
-        detail_message = (
-            f"📉 Цена входа (Entry): <code>{fix_price(symbol, entry_price)}</code>\n"
-            f"💵 Объем: {qty_str} шт (~${usd_amount:.0f})"
-        )
-        await tg(detail_message)
-
-        # 5. Размещение TRAILING_STOP_MARKET
-        tp_ok, ts_ok = False, False 
-        tp_price_str = "N/A"
-
         if active_trailing_enabled:
-            trailing_order = await binance("POST", "/fapi/v1/algoOrder", { 
-                "algoType": "CONDITIONAL", "symbol": symbol, "side": "BUY", "positionSide": "SHORT",
-                "type": "TRAILING_STOP_MARKET", "quantity": qty_str, 
-                "callbackRate": rate_str, 
-                "activationPrice": ts_activation_price_str, 
-            })
-            if isinstance(trailing_order, dict) and trailing_order.get("algoId"): ts_ok = True
-            else: await tg(f"<b>SHORT {symbol}</b>\n⚠️ ОШИБКА УСТАНОВКИ TRAILING STOP\n<code>{format_error_detail(trailing_order)}</code>")
-        
-        # 6. Размещение TAKE_PROFIT_MARKET
+            act_p = fix_price(symbol, entry * (1 - TS_START_RATE/100))
+            await binance("POST", "/fapi/v1/algoOrder", {"algoType": "CONDITIONAL", "symbol": symbol, "side": "BUY", "positionSide": "SHORT", "type": "TRAILING_STOP_MARKET", "quantity": qty, "callbackRate": f"{TRAILING_RATE:.2f}", "activationPrice": act_p})
         if take_profit_enabled:
-            tp_price_f = entry_price * (1 - TAKE_PROFIT_RATE / 100)
-            tp_price_str = fix_price(symbol, tp_price_f) 
-
-            tp_order = await binance("POST", "/fapi/v1/algoOrder", { 
-                "algoType": "CONDITIONAL", "symbol": symbol, "side": "BUY", "positionSide": "SHORT",
-                "type": "TAKE_PROFIT_MARKET", "quantity": qty_str, "triggerPrice": tp_price_str, 
-            })
-            if isinstance(tp_order, dict) and tp_order.get("algoId"): tp_ok = True
-            else: await tg(f"<b>SHORT {symbol}</b>\n⚠️ ОШИБКА УСТАНОВКИ TAKE PROFIT\n<code>{format_error_detail(tp_order)}</code>")
-
-        # Сообщение о статусе
-        if tp_ok or ts_ok or (not take_profit_enabled and active_trailing_enabled):
-             tp_line = f"🎯 TP ({TAKE_PROFIT_RATE}%): <code>{tp_price_str}</code> {'✅' if tp_ok else '❌'}\n" if take_profit_enabled else f"🎯 TP: {'Отключен'}\n"
-             ts_line = f"🛡️ TS ({TRAILING_RATE}%, Активация {TS_START_RATE}%): <code>{ts_activation_price_str}</code> {'✅' if ts_ok else '❌'}\n"
-
-             status_message = (
-                f"{tp_line}{ts_line}"
-                f"\n✅ **Ордера установлены.**"
-             )
-             await tg(status_message)
-    else:
-        await tg(f"<b>Ошибка открытия SHORT {symbol}</b>\n<code>{format_error_detail(order)}</code>")
-
-
-async def close_position(sym: str, position_side: str, active_set: Set[str]):
-    symbol = sym.upper().replace("/", "").replace("USDT", "") + "USDT"
-    await binance("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}) 
-    pos_data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-    
-    if isinstance(pos_data, dict) and pos_data.get("code"): 
-        await tg(f"<b>{symbol}</b> — Не удалось получить данные о позиции. {pos_data.get('msg', '')}"); return
-    
-    if not pos_data: await tg(f"<b>{symbol}</b> — Не удалось получить данные о позиции."); return
-    
-    qty_str = next((p["positionAmt"] for p in pos_data if p["positionSide"] == position_side and abs(float(p["positionAmt"])) > 0), None)
-    if not qty_str or float(qty_str) == 0:
-        active_set.discard(symbol)
-        # Закрытие произошло, запускаем PnL отчет
-        print(f"[{position_side} {symbol}] Позиция уже закрыта. Запускаем PnL отчет.")
-        asyncio.create_task(calculate_and_report_pnl(symbol, position_side))
-        await tg(f"<b>{position_side} {symbol}</b> — позиция уже закрыта на бирже (закрыто вручную/другим способом)."); return
-        
-    close_side = "SELL" if position_side == "LONG" else "BUY"
-    qty_to_close = fix_qty(symbol, abs(float(qty_str)))
-    close_order = await binance("POST", "/fapi/v1/order", {
-        "symbol": symbol, "side": close_side, "positionSide": position_side, "type": "MARKET", "quantity": qty_to_close,
-    })
-    
-    if close_order and close_order.get("orderId"):
-        active_set.discard(symbol)
-        await tg(f"<b>✅ ЗАКРЫТИЕ {position_side} {symbol} УСПЕШНО</b>\n{qty_to_close} шт. PnL отчет будет отправлен через {PNL_MONITOR_INTERVAL} сек.")
-    else:
-        error_log = format_error_detail(close_order)
-        await tg(f"<b>CRITICAL ERROR: Не удалось закрыть {position_side} {symbol}</b>\n<code>{error_log}</code>")
+            tp_p = fix_price(symbol, entry * (1 - TAKE_PROFIT_RATE/100))
+            await binance("POST", "/fapi/v1/algoOrder", {"algoType": "CONDITIONAL", "symbol": symbol, "side": "BUY", "positionSide": "SHORT", "type": "TAKE_PROFIT_MARKET", "quantity": qty, "triggerPrice": tp_p})
 
 async def close_long(sym: str):
-    await close_position(sym, "LONG", active_longs)
+    symbol = sym.upper() + "USDT"
+    await binance("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
+    data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+    qty = next((p["positionAmt"] for p in data if p["positionSide"] == "LONG" and float(p["positionAmt"]) > 0), 0)
+    if float(qty) > 0:
+        await binance("POST", "/fapi/v1/order", {"symbol": symbol, "side": "SELL", "positionSide": "LONG", "type": "MARKET", "quantity": fix_qty(symbol, abs(float(qty)))})
+    active_longs.discard(symbol)
 
 async def close_short(sym: str):
-    await close_position(sym, "SHORT", active_shorts)
-# ================= КОНЕЦ ФУНКЦИЙ ОТКРЫТИЯ/ЗАКРЫТИЯ =======================
+    symbol = sym.upper() + "USDT"
+    await binance("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
+    data = await binance("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+    qty = next((p["positionAmt"] for p in data if p["positionSide"] == "SHORT" and float(p["positionAmt"]) < 0), 0)
+    if abs(float(qty)) > 0:
+        await binance("POST", "/fapi/v1/order", {"symbol": symbol, "side": "BUY", "positionSide": "SHORT", "type": "MARKET", "quantity": fix_qty(symbol, abs(float(qty)))})
+    active_shorts.discard(symbol)
 
+# ==================== ТЕЛЕГРАМ ОБРАБОТКА ====================
 
-# ==================== TELEGRAM WEBHOOK HANDLER =====================
+def get_main_keyboard():
+    return ReplyKeyboardMarkup([[KeyboardButton("📊 Статистика"), KeyboardButton("⚙️ Настройки")], [KeyboardButton("🔄 Обновить данные")]], resize_keyboard=True)
 
-def create_trailing_menu(trailing_status: bool, tp_status: bool):
-    """Создает клавиатуру для меню Trailing Stop, Take Profit и статистики."""
-    stats = get_daily_stats() 
-    
-    trailing_text = "ВКЛЮЧЕН" if trailing_status else "ОТКЛЮЧЕН"
-    tp_text = "ВКЛЮЧЕН" if tp_status else "ОТКЛЮЧЕН"
-    
-    # Форматирование PnL для отображения
-    net_pnl_str = f"{stats['net_pnl']:+.2f} USDT"
-    pnl_color = "🟢" if stats['net_pnl'] >= 0 else "🔴"
-    
-    text = (
-        "<b>⚙️ Управление ботом</b>\n\n"
-        f"Трейлинг Стоп (Откат <b>{TRAILING_RATE}%</b> / Активация <b>{TS_START_RATE}%</b>): <b>{trailing_text}</b>\n"
-        f"Take Profit (Фикс. <b>{TAKE_PROFIT_RATE}%</b>): <b>{tp_text}</b>\n"
-        f"---"
-        f"\n<b>📊 СТАТИСТИКА ЗА СЕГОДНЯ:</b>\n"
-        f"  ✅ Прибыльные: {stats['profitable_count']} (+{stats['profitable_usd']:.2f} USDT)\n"
-        f"  ❌ Убыточные: {stats['losing_count']} (-{stats['losing_usd']:.2f} USDT)\n"
-        f"  {pnl_color} **ИТОГО ПРОФИТ:** <b>{net_pnl_str}</b>"
-    )
-
-    keyboard = [
-        [
-            InlineKeyboardButton(f"Трейлинг: {'✅ ВКЛ' if trailing_status else '❌ ВЫКЛ'}", 
-                                 callback_data='set_trailing_false' if trailing_status else 'set_trailing_true'),
-        ],
-        [
-            InlineKeyboardButton(f"Take Profit: {'✅ ВКЛ' if tp_status else '❌ ВЫКЛ'}",
-                                 callback_data='set_tp_false' if tp_status else 'set_tp_true'),
-        ],
-        [
-            InlineKeyboardButton("🔄 Обновить статус", callback_data='refresh_status'),
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    return text, reply_markup
+def create_trailing_menu(ts, tp):
+    t = f"<b>⚙️ Настройки</b>\nТрейлинг: {'✅' if ts else '❌'}\nTake Profit: {'✅' if tp else '❌'}"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"TS: {'✅' if ts else '❌'}", callback_data=f"set_ts_{not ts}"),
+                                 InlineKeyboardButton(f"TP: {'✅' if tp else '❌'}", callback_data=f"set_tp_{not tp}")]])
+    return t, kb
 
 async def handle_telegram_update(update_json: Dict):
-    """
-    Основная функция для обработки всех входящих сообщений и callback-запросов от Telegram.
-    """
     global active_trailing_enabled, take_profit_enabled
-    
-    update = Update.de_json(update_json, tg_bot)
-    
-    # 1. Обработка команд (/start, /menu)
-    if update.message and update.message.text:
-        message = update.message
-        if message.chat.id != CHAT_ID: await tg_bot.send_message(message.chat.id, "Доступ запрещен."); return
-        text_lower = message.text.lower()
-        if text_lower == '/start' or text_lower == '/menu':
-            text, reply_markup = create_trailing_menu(active_trailing_enabled, take_profit_enabled)
-            await message.reply_html(text, reply_markup=reply_markup); return
+    upd = Update.de_json(update_json, tg_bot)
+    if upd.message and upd.message.text:
+        txt = upd.message.text
+        if txt in ["/start", "🔙 Назад"]: await upd.message.reply_html("🤖 Бот готов", reply_markup=get_main_keyboard())
+        elif txt == "📊 Статистика": await upd.message.reply_html(get_stats_report(1))
+        elif txt == "⚙️ Настройки":
+            t, kb = create_trailing_menu(active_trailing_enabled, take_profit_enabled)
+            await upd.message.reply_html(t, reply_markup=kb)
+        elif txt == "🔄 Обновить данные":
+            await load_exchange_info()
+            await load_active_positions()
+            await upd.message.reply_text("✅ Обновлено")
+    elif upd.callback_query:
+        d = upd.callback_query.data
+        if "set_ts" in d: active_trailing_enabled = "True" in d
+        if "set_tp" in d: take_profit_enabled = "True" in d
+        await upd.callback_query.answer("Сохранено")
+        t, kb = create_trailing_menu(active_trailing_enabled, take_profit_enabled)
+        await upd.callback_query.edit_message_text(t, reply_markup=kb, parse_mode="HTML")
 
-    # 2. Обработка нажатий на кнопки (CallbackQuery)
-    elif update.callback_query:
-        query = update.callback_query
-        if query.message.chat.id != CHAT_ID: await query.answer("Доступ запрещен.", show_alert=True); return
-        data = query.data
-        state_changed = False
-        
-        # Обработка Trailing Stop
-        if data == 'set_trailing_true' and not active_trailing_enabled: active_trailing_enabled = True; state_changed = True
-        elif data == 'set_trailing_false' and active_trailing_enabled: active_trailing_enabled = False; state_changed = True
-        
-        # Обработка Take Profit
-        elif data == 'set_tp_true' and not take_profit_enabled: take_profit_enabled = True; state_changed = True
-        elif data == 'set_tp_false' and take_profit_enabled: take_profit_enabled = False; state_changed = True
-        
-        await query.answer() 
-        
-        if state_changed:
-            status_t = "ВКЛЮЧЕН" if active_trailing_enabled else "ОТКЛЮЧЕН"
-            status_tp = "ВКЛЮЧЕН" if take_profit_enabled else "ОТКЛЮЧЕН"
-            await tg(f"<b>⚙️ Настройки бота изменены через Telegram</b>\nТрейлинг: <b>{status_t}</b>\nTP: <b>{status_tp}</b>")
-            
-        # Обновление меню
-        text, reply_markup = create_trailing_menu(active_trailing_enabled, take_profit_enabled)
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=constants.ParseMode.HTML)
-
-
-async def set_telegram_webhook(url: str):
-    """
-    Регистрирует Webhook URL в Telegram при старте приложения.
-    """
-    try:
-        response = await tg_bot.set_webhook(url=url)
-        if response:
-            print(f"✅ Telegram Webhook установлен на: {url}")
-        else:
-            print(f"❌ Ошибка установки Webhook. URL: {url}")
-            await tg(f"<b>Ошибка!</b> Не удалось установить Telegram Webhook на: <code>{url}</code>")
-    except TelegramError as e:
-        print(f"❌ Критическая ошибка Telegram API при установке Webhook: {e}")
-        await tg(f"<b>Критическая ошибка Telegram API</b>\nНе удалось установить Webhook: <code>{e}</code>")
-
-
-# ================= FASTAPI ПРИЛОЖЕНИЕ =========================
-
-async def get_binance_server_time():
-    """Получает и возвращает текущее время сервера Binance."""
-    try:
-        data = await binance("GET", "/fapi/v1/time", signed=False) 
-        if isinstance(data, dict) and data.get('serverTime'):
-            return int(data['serverTime'])
-    except Exception as e:
-        print(f"Ошибка получения времени Binance: {e}")
-    return None
+# ==================== FASTAPI И ЗАПУСК ====================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Запуск инициализации
+    init_db()
     await load_exchange_info()
     await load_active_positions()
-    
-    # 2. Запуск монитора PnL
     asyncio.create_task(pnl_monitor_task())
-    print(f"✅ Запущена задача PnL мониторинга (интервал: {PNL_MONITOR_INTERVAL}с)")
-
-    # 3. Диагностика времени
-    server_time = await get_binance_server_time()
-    bot_time_ms = int(time.time() * 1000)
-    time_info = ""
-    if server_time:
-        time_diff = abs(server_time - bot_time_ms)
-        diff_sec = time_diff / 1000
-        
-        server_time_str = datetime.fromtimestamp(server_time / 1000, timezone.utc).strftime("%H:%M:%S UTC")
-        bot_time_str = datetime.fromtimestamp(bot_time_ms / 1000, timezone.utc).strftime("%H:%M:%S UTC")
-
-        time_info = (
-            f"🕒 Время бота: <b>{bot_time_str}</b>\n"
-            f"🕒 Время Binance: <b>{server_time_str}</b>\n"
-            f"Разница: <b>{diff_sec:.3f} сек</b>"
-        )
-        if diff_sec > 5: 
-             time_info += " ⚠️ **ВНИМАНИЕ!** Отклонение времени значительное."
-    else:
-        time_info = "🕒 Не удалось получить время Binance."
-
-    # 4. Установка Webhook
-    webhook_url = f"{PUBLIC_HOST_URL}/telegram_webhook/{TELEGRAM_TOKEN}"
-    await set_telegram_webhook(webhook_url)
-    
-    # 5. Приветственное сообщение
-    stats = get_daily_stats()
-    pnl_summary = f"{stats['net_pnl']:+.2f} USDT"
-    
-    status_t = "ВКЛЮЧЕН" if active_trailing_enabled else "ОТКЛЮЧЕН"
-    status_tp = "ВКЛЮЧЕН" if take_profit_enabled else "ОТКЛЮЧЕН"
-    await tg(
-        f"<b>OZ BOT 2025 — ONLINE (v1.5.6)</b>\n" 
-        f"Трейлинг Стоп: <b>{status_t}</b> (Откат {TRAILING_RATE}%, Активация {TS_START_RATE}%)\n"
-        f"Take Profit: <b>{status_tp}</b> ({TAKE_PROFIT_RATE}%)\n"
-        f"---"
-        f"\n{time_info}\n"
-        f"---"
-        f"\n📊 Дневной PnL: <b>{pnl_summary}</b>. Управление через Telegram Webhook (/menu)."
-    )
+    await tg_bot.set_webhook(f"{PUBLIC_HOST_URL}/tg_hook")
     yield
-    
-    # ... (Очистка)
-    try:
-        await tg_bot.delete_webhook()
-        print("Telegram Webhook очищен.")
-    except Exception as e:
-        print(f"Ошибка при очистке вебхука: {e}")
-    await client.aclose() 
 
 app = FastAPI(lifespan=lifespan)
 
-@app.get("/")
-async def root():
-    return HTMLResponse("<h1>OZ BOT 2025 — ONLINE (v1.5.6)</h1>")
-
-@app.post("/telegram_webhook/{token}")
-async def handle_telegram(token: str, request: Request):
-    if token != TELEGRAM_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid Telegram Token")
-    
-    try:
-        update_data = await request.json()
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-
-    asyncio.create_task(handle_telegram_update(update_data))
-    
+@app.post("/tg_hook")
+async def tg_hook(request: Request):
+    asyncio.create_task(handle_telegram_update(await request.json()))
     return {"ok": True}
 
 @app.post("/webhook")
-async def webhook(request: Request):
-    if request.headers.get("X-Webhook-Secret") != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid webhook secret")
-    
-    try:
-        data = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-
-    symbol = data.get("symbol", "").upper()
-    signal = data.get("signal", "").upper()
-
-    if not symbol or not signal:
-        raise HTTPException(status_code=400, detail="Missing symbol or signal in payload")
-
-    # ================== ЛОГИКА ОБРАБОТКИ СИГНАЛОВ ==================
-    if signal == "LONG":
-        asyncio.create_task(open_long(symbol))
-    elif signal == "CLOSE_LONG":
-        asyncio.create_task(close_long(symbol))
-    elif signal == "SHORT":
-        asyncio.create_task(open_short(symbol))
-    elif signal == "CLOSE_SHORT":
-        asyncio.create_task(close_short(symbol))
-    else:
-        print(f"[WARNING] Получен неизвестный сигнал: {signal} для {symbol}")
-        return {"ok": False, "message": f"Unknown signal: {signal}"}
-    # ============================================================================
-
+async def signal_hook(request: Request):
+    if request.headers.get("X-Webhook-Secret") != WEBHOOK_SECRET: return {"error": "auth"}
+    data = await request.json()
+    sym, sig = data.get("symbol", "").upper(), data.get("signal", "").upper()
+    if sig == "LONG": asyncio.create_task(open_long(sym))
+    elif sig == "SHORT": asyncio.create_task(open_short(sym))
+    elif sig == "CLOSE_LONG": asyncio.create_task(close_long(sym))
+    elif sig == "CLOSE_SHORT": asyncio.create_task(close_short(sym))
     return {"ok": True}
 
 if __name__ == "__main__":
