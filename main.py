@@ -1,14 +1,14 @@
 # =========================================================================================
-# OZ TRADING BOT 2026 v1.6.7 | FIXED TAKE PROFIT & STABILITY
+# OZ TRADING BOT 2026 v1.6.8 | CLEAN LOGS & FLY.IO COMPATIBILITY
 # =========================================================================================
 import os, time, hmac, hashlib, sqlite3, logging, asyncio
 import httpx
 from fastapi import FastAPI, Request
 from telegram import Bot, Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime
 
-# Настройка логирования
+# Настройка логирования (убираем лишний спам)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 # --- КОНФИГУРАЦИЯ ---
@@ -31,7 +31,6 @@ BASE = "https://fapi.binance.com"
 DB_PATH = "trades_history.db"
 trade_lock = asyncio.Lock()
 
-# Состояние
 symbol_precision, price_precision = {}, {}
 active_longs, active_shorts = set(), set()
 active_trailing_enabled, take_profit_enabled = True, True
@@ -62,7 +61,6 @@ async def binance(method, path, params=None, signed=True):
         p = None
     try:
         r = await client.request(method, url, params=p, headers={"X-MBX-APIKEY": API_KEY})
-        if r.status_code == 451: return {"error": "GEO_BLOCK_451"}
         return r.json()
     except Exception as e:
         return {"error": str(e)}
@@ -115,11 +113,9 @@ async def open_pos(sym, side):
             else: active_shorts.add(symbol)
             await tg_bot.send_message(CHAT_ID, f"🚀 <b>ВХОД {side} {symbol}</b>\nЦена: {price}", parse_mode="HTML")
             
-            # --- ПАУЗА ДЛЯ СИНХРОНИЗАЦИИ ---
             await asyncio.sleep(1.5)
             close_side = "SELL" if side == "LONG" else "BUY"
 
-            # TAKE PROFIT
             if take_profit_enabled:
                 tp_p = price * (1 + TAKE_PROFIT_RATE/100) if side == "LONG" else price * (1 - TAKE_PROFIT_RATE/100)
                 tp_res = await binance("POST", "/fapi/v1/order", {
@@ -128,10 +124,7 @@ async def open_pos(sym, side):
                 })
                 if tp_res.get("orderId"):
                     await tg_bot.send_message(CHAT_ID, f"🎯 TP: <code>{fix_price(symbol, tp_p)}</code>", parse_mode="HTML")
-                else:
-                    await tg_bot.send_message(CHAT_ID, f"⚠️ TP Error: {tp_res.get('msg')}")
 
-            # TRAILING STOP
             if active_trailing_enabled:
                 await asyncio.sleep(0.5)
                 act = price * (1 + TS_START_RATE/100) if side == "LONG" else price * (1 - TS_START_RATE/100)
@@ -141,8 +134,6 @@ async def open_pos(sym, side):
                 })
                 if "orderId" in str(ts_res) or "algoOrderId" in str(ts_res):
                     await tg_bot.send_message(CHAT_ID, f"📉 Trailing: {TRAILING_RATE}%", parse_mode="HTML")
-        else:
-            await tg_bot.send_message(CHAT_ID, f"❌ Ошибка входа: {res.get('msg')}")
 
 # --- МОНИТОРИНГ ---
 async def pnl_monitor():
@@ -168,16 +159,21 @@ async def report_pnl(symbol, side):
         log_trade(symbol, side, pnl)
         await tg_bot.send_message(CHAT_ID, f"{'✅' if pnl > 0 else '🛑'} <b>ЗАКРЫТО: {symbol}</b>\nPnL: {pnl:+.2f} USDT", parse_mode="HTML")
 
-# --- WEB & TG ---
+# --- WEB APP ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db(); await load_exchange_info(); await sync_positions()
     asyncio.create_task(pnl_monitor())
     await tg_bot.set_webhook(f"{PUBLIC_HOST_URL}/tg")
-    await tg_bot.send_message(CHAT_ID, "🟢 Бот v1.6.7 запущен")
+    await tg_bot.send_message(CHAT_ID, "🟢 Бот v1.6.8 запущен и готов")
     yield
 
 app = FastAPI(lifespan=lifespan)
+
+# ЭТОТ ЭНДПОИНТ УБИРАЕТ ОШИБКИ 404 В ЛОГАХ FLY.IO
+@app.get("/")
+async def health_check():
+    return {"status": "ok", "bot": "OZ v1.6.8"}
 
 @app.post("/tg")
 async def tg_webhook(request: Request):
@@ -191,7 +187,6 @@ async def tg_webhook(request: Request):
             if isinstance(res, list):
                 msg = "\n".join([f"<b>{p['symbol']}</b> {p['positionSide']}: {round(float(p['unRealizedProfit']), 2)} USDT" for p in res if float(p['positionAmt']) != 0])
                 await tg_bot.send_message(CHAT_ID, msg or "Нет позиций", parse_mode="HTML")
-            else: await tg_bot.send_message(CHAT_ID, "Ошибка API или блок 451")
         elif t == "/start":
             await tg_bot.send_message(CHAT_ID, "Меню:", reply_markup=ReplyKeyboardMarkup([[KeyboardButton("📦 Позиции"), KeyboardButton("⚙️ Настройки")]], resize_keyboard=True))
         elif t == "⚙️ Настройки":
