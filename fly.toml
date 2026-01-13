@@ -1,5 +1,5 @@
 app = "bot-fly-oz"
-primary_region = "fra"
+primary_region = "ams"
 
 [build]
   dockerfile = "Dockerfile"
