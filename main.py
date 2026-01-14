@@ -1,5 +1,5 @@
 # =========================================================================================
-# OZ TRADING BOT 2026 v1.7.6 | DYNAMIC PRECISION & STABLE CORE
+# OZ TRADING BOT 2026 v1.7.7 | ALGO-TP & DB SETTINGS
 # =========================================================================================
 import os, time, hmac, hashlib, sqlite3, logging, asyncio, math
 import httpx
@@ -29,23 +29,34 @@ BASE = "https://fapi.binance.com"
 DB_PATH = "trades_history.db"
 trade_lock = asyncio.Lock()
 
-# Хранилище точности (количество знаков после запятой)
-prec_qty = {}   
-prec_price = {} 
+prec_qty, prec_price = {}, {}
 active_longs, active_shorts = set(), set()
-active_trailing_enabled, take_profit_enabled = True, True
+
+# Глобальные настройки (будут загружены из БД)
+config = {"tp": True, "ts": True}
 
 tg_bot = Bot(token=TELEGRAM_TOKEN)
 
-# ==================== DATABASE ====================
+# ==================== DATABASE & SETTINGS ====================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute('CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, side TEXT, pnl REAL, timestamp DATETIME)')
+        conn.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value INTEGER)')
+        # Начальные значения
+        conn.execute('INSERT OR IGNORE INTO settings VALUES ("tp", 1)')
+        conn.execute('INSERT OR IGNORE INTO settings VALUES ("ts", 1)')
         conn.commit()
 
-def log_trade(symbol, side, pnl):
+def load_settings():
+    global config
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("INSERT INTO trades (symbol, side, pnl, timestamp) VALUES (?, ?, ?, ?)", (symbol, side, round(pnl, 3), datetime.now()))
+        for key in ["tp", "ts"]:
+            val = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            config[key] = bool(val[0]) if val else True
+
+def save_setting(key, val):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, int(val)))
         conn.commit()
 
 def get_stats():
@@ -55,7 +66,7 @@ def get_stats():
         daily = conn.execute("SELECT SUM(pnl), COUNT(*) FROM trades WHERE date(timestamp) = ?", (today,)).fetchone()
         return {"total_pnl": total[0] or 0, "total_count": total[1] or 0, "daily_pnl": daily[0] or 0, "daily_count": daily[1] or 0}
 
-# ==================== BINANCE API & PRECISION ====================
+# ==================== BINANCE API ====================
 async def binance(method, path, params=None, signed=True):
     url = BASE + path
     p = params.copy() if params else {}
@@ -72,27 +83,15 @@ async def binance(method, path, params=None, signed=True):
     except Exception as e: return {"error": str(e)}
 
 async def load_exchange_info():
-    """Загружает точность для всех монет с биржи"""
     global prec_qty, prec_price
-    try:
-        data = await binance("GET", "/fapi/v1/exchangeInfo", signed=False)
-        if isinstance(data, dict) and 'symbols' in data:
-            for s in data['symbols']:
-                sym = s['symbol']
-                # Определяем точность количества (LOT_SIZE)
-                lot_filter = next((f for f in s['filters'] if f['filterType'] == 'LOT_SIZE'), None)
-                if lot_filter:
-                    step = lot_filter['stepSize']
-                    prec_qty[sym] = int(round(-math.log10(float(step))))
-                
-                # Определяем точность цены (PRICE_FILTER)
-                price_filter = next((f for f in s['filters'] if f['filterType'] == 'PRICE_FILTER'), None)
-                if price_filter:
-                    tick = price_filter['tickSize']
-                    prec_price[sym] = int(round(-math.log10(float(tick))))
-            logging.info(f"Синхронизировано монет: {len(prec_qty)}")
-    except Exception as e:
-        logging.error(f"Ошибка загрузки ExchangeInfo: {e}")
+    data = await binance("GET", "/fapi/v1/exchangeInfo", signed=False)
+    if isinstance(data, dict) and 'symbols' in data:
+        for s in data['symbols']:
+            sym = s['symbol']
+            lot = next((f for f in s['filters'] if f['filterType'] == 'LOT_SIZE'), None)
+            tick = next((f for f in s['filters'] if f['filterType'] == 'PRICE_FILTER'), None)
+            if lot: prec_qty[sym] = int(round(-math.log10(float(lot['stepSize']))))
+            if tick: prec_price[sym] = int(round(-math.log10(float(tick['tickSize']))))
 
 async def sync_positions():
     global active_longs, active_shorts
@@ -101,16 +100,15 @@ async def sync_positions():
         active_longs = {p['symbol'] for p in data if float(p['positionAmt']) > 0}
         active_shorts = {p['symbol'] for p in data if float(p['positionAmt']) < 0}
 
-# Функции форматирования с защитой от ошибок
 def fix_qty(s, q):
-    p = prec_qty.get(s, 3) # по умолчанию 3 знака, если монета не найдена
+    p = prec_qty.get(s, 3)
     return f"{math.floor(q * 10**p) / 10**p:.{p}f}"
 
 def fix_price(s, pr):
-    p = prec_price.get(s, 2) # по умолчанию 2 знака
+    p = prec_price.get(s, 2)
     return f"{round(pr, p):.{p}f}"
 
-# ==================== TRADE LOGIC ====================
+# ==================== TRADE LOGIC (ALGO FIX) ====================
 async def open_pos(sym, side):
     symbol = sym.upper().replace("/", "")
     if "USDT" not in symbol: symbol += "USDT"
@@ -127,40 +125,35 @@ async def open_pos(sym, side):
         price = float(p_data["price"])
         qty = fix_qty(symbol, (AMOUNT * LEV) / price)
         
-        # Вход в позицию
-        res = await binance("POST", "/fapi/v1/order", {
-            "symbol": symbol, 
-            "side": "BUY" if side == "LONG" else "SELL", 
-            "positionSide": side, 
-            "type": "MARKET", 
-            "quantity": qty
-        })
+        res = await binance("POST", "/fapi/v1/order", {"symbol": symbol, "side": "BUY" if side == "LONG" else "SELL", "positionSide": side, "type": "MARKET", "quantity": qty})
         
         if res.get("orderId"):
             if side == "LONG": active_longs.add(symbol)
             else: active_shorts.add(symbol)
             await tg_bot.send_message(CHAT_ID, f"🚀 <b>ВХОД {side} {symbol}</b>\nЦена: {price}", parse_mode="HTML")
             
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.2)
             close_side = "SELL" if side == "LONG" else "BUY"
             
-            if take_profit_enabled:
+            # НОВЫЙ TAKE PROFIT ЧЕРЕЗ ALGO API
+            if config["tp"]:
                 tp_p = price * (1 + TAKE_PROFIT_RATE/100) if side == "LONG" else price * (1 - TAKE_PROFIT_RATE/100)
-                tp_res = await binance("POST", "/fapi/v1/order", {
-                    "symbol": symbol, "side": close_side, "positionSide": side, "type": "TAKE_PROFIT_MARKET", 
-                    "stopPrice": fix_price(symbol, tp_p), "closePosition": "true", "workingType": "MARK_PRICE"
+                tp_res = await binance("POST", "/fapi/v1/algoOrder", {
+                    "algoType": "CONDITIONAL", "symbol": symbol, "side": close_side, "positionSide": side,
+                    "type": "TAKE_PROFIT_MARKET", "quantity": qty, "stopPrice": fix_price(symbol, tp_p)
                 })
-                if tp_res.get("orderId"):
+                if "orderId" in str(tp_res) or "algoOrderId" in str(tp_res):
                     await tg_bot.send_message(CHAT_ID, f"🎯 TP установлен: <code>{fix_price(symbol, tp_p)}</code>", parse_mode="HTML")
                 else:
-                    await tg_bot.send_message(CHAT_ID, f"⚠️ Ошибка TP: {tp_res.get('msg')}")
+                    await tg_bot.send_message(CHAT_ID, f"⚠️ Ошибка TP: {tp_res.get('msg', 'Algo Error')}")
 
-            if active_trailing_enabled:
+            # TRAILING STOP (ALGO)
+            if config["ts"]:
                 await asyncio.sleep(0.5)
                 act = price * (1 + TS_START_RATE/100) if side == "LONG" else price * (1 - TS_START_RATE/100)
                 ts_res = await binance("POST", "/fapi/v1/algoOrder", {
-                    "algoType":"CONDITIONAL", "symbol":symbol, "side":close_side, "positionSide":side,
-                    "type":"TRAILING_STOP_MARKET", "quantity":qty, "callbackRate":TRAILING_RATE, "activationPrice":fix_price(symbol, act)
+                    "algoType": "CONDITIONAL", "symbol": symbol, "side": close_side, "positionSide": side,
+                    "type": "TRAILING_STOP_MARKET", "quantity": qty, "callbackRate": TRAILING_RATE, "activationPrice": fix_price(symbol, act)
                 })
                 if "orderId" in str(ts_res) or "algoOrderId" in str(ts_res):
                     await tg_bot.send_message(CHAT_ID, f"📉 Trailing активен: {TRAILING_RATE}%", parse_mode="HTML")
@@ -169,42 +162,39 @@ async def open_pos(sym, side):
 
 # ==================== TG HANDLER ====================
 async def handle_tg_logic(update_json):
-    global active_trailing_enabled, take_profit_enabled
+    global config
     try:
         upd = Update.de_json(update_json, tg_bot)
         if upd.callback_query:
             q = upd.callback_query
-            if q.data == "t_ts": active_trailing_enabled = not active_trailing_enabled
-            if q.data == "t_tp": take_profit_enabled = not take_profit_enabled
-            new_kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"TS: {'✅' if active_trailing_enabled else '❌'}", callback_data="t_ts")], [InlineKeyboardButton(f"TP: {'✅' if take_profit_enabled else '❌'}", callback_data="t_tp")]])
-            await q.edit_message_reply_markup(reply_markup=new_kb)
-            await q.answer("Обновлено")
+            key = "ts" if q.data == "t_ts" else "tp"
+            config[key] = not config[key]
+            save_setting(key, config[key])
+            ikb = InlineKeyboardMarkup([[InlineKeyboardButton(f"TS: {'✅' if config['ts'] else '❌'}", callback_data="t_ts")], [InlineKeyboardButton(f"TP: {'✅' if config['tp'] else '❌'}", callback_data="t_tp")]])
+            await q.edit_message_reply_markup(reply_markup=ikb)
+            await q.answer("Настройка сохранена")
             return
 
         if not upd.message or not upd.message.text: return
         t, cid = upd.message.text, upd.message.chat_id
         main_kb = ReplyKeyboardMarkup([[KeyboardButton("📦 Позиции"), KeyboardButton("📈 Статистика")], [KeyboardButton("⚙️ Настройки"), KeyboardButton("🔄 Обновить")]], resize_keyboard=True)
 
-        if t == "/start": await tg_bot.send_message(cid, "OZ Bot v1.7.6", reply_markup=main_kb)
-        elif t == "📦 Позиции":
-            data = await binance("GET", "/fapi/v2/positionRisk")
-            msg = "\n".join([f"<b>{p['symbol']}</b>: {float(p['unRealizedProfit']):+.2f}" for p in data if float(p['positionAmt']) != 0])
-            await tg_bot.send_message(cid, msg or "Нет позиций", parse_mode="HTML")
+        if t == "/start": await tg_bot.send_message(cid, "OZ Bot v1.7.7 Online", reply_markup=main_kb)
         elif t == "📈 Статистика":
             s = get_stats()
             await tg_bot.send_message(cid, f"📊 <b>Сегодня:</b> {s['daily_pnl']:.2f} USDT\n<b>Всего:</b> {s['total_pnl']:.2f} USDT", parse_mode="HTML")
         elif t == "🔄 Обновить":
             await load_exchange_info(); await sync_positions()
-            await tg_bot.send_message(cid, "✅ Данные биржи обновлены")
+            await tg_bot.send_message(cid, "✅ Данные обновлены")
         elif t == "⚙️ Настройки":
-            ikb = InlineKeyboardMarkup([[InlineKeyboardButton(f"TS: {'✅' if active_trailing_enabled else '❌'}", callback_data="t_ts")], [InlineKeyboardButton(f"TP: {'✅' if take_profit_enabled else '❌'}", callback_data="t_tp")]])
-            await tg_bot.send_message(cid, "Настройки:", reply_markup=ikb)
-    except: pass
+            ikb = InlineKeyboardMarkup([[InlineKeyboardButton(f"TS: {'✅' if config['ts'] else '❌'}", callback_data="t_ts")], [InlineKeyboardButton(f"TP: {'✅' if config['tp'] else '❌'}", callback_data="t_tp")]])
+            await tg_bot.send_message(cid, "Настройки (сохраняются в БД):", reply_markup=ikb)
+    except Exception as e: logging.error(f"TG Error: {e}")
 
 # ==================== WEB APP ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db(); await load_exchange_info(); await sync_positions()
+    init_db(); load_settings(); await load_exchange_info(); await sync_positions()
     await tg_bot.set_webhook(f"{PUBLIC_HOST_URL}/tg")
     yield
 
